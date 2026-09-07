@@ -40,6 +40,8 @@ NGS_BASE_DIR_TEMPLATE = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/{avt_run}"
 
 HUMAN_GENOME_PATH = "/home/gecf/references/cellranger_references/current_human_arc_ATAC/refdata-cellranger-arc-GRCh38-2024-A"
 MOUSE_GENOME_PATH = "/home/gecf/references/cellranger_references/current_mouse_arc_ATAC/refdata-cellranger-arc-GRCm39-2024-A"
+# Central archive destination for cellranger-atac runs (fixed target).
+NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/atac"
 
 AVT_PATTERN = re.compile(r"AVT0?\d{3,5}", re.IGNORECASE)
 
@@ -423,6 +425,7 @@ def build_script_full(reference_genome, pairs):
 
     lines.append("#!/bin/bash")
     lines.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
+    lines.append("reference_genome_used=" + reference_genome)
     lines.append("")
 
     # Group fastq IDs per sample name so each unique sample gets ONE count call
@@ -474,10 +477,11 @@ def build_script_full(reference_genome, pairs):
     lines.append(f"Server_folder=$PWD/{server_folder_name}")
     lines.append('mkdir -vp "$Server_folder"')
     lines.append("")
-    lines.append("# Final archive destination (set this to the permanent NGS runs path)")
-    example_base_dir = NGS_BASE_DIR_TEMPLATE.format(avt_run=main_avt or "AVTXXXX")
-    lines.append(f"# example: {example_base_dir}/CRatac_${{TIMESTAMP}}")
-    lines.append("NGSruns_folder=")
+    # Final archive destination (fixed central archive for all cellranger-atac runs)
+    lines.append("# Central archive for cellranger-atac runs (fixed destination)")
+    lines.append("NGSruns_archive=" + NGSruns_ARCHIVE_DIR)
+    lines.append("mkdir -p \"${NGSruns_archive}/${server_folder_name}\"")
+    lines.append("NGSruns_folder=${NGSruns_archive}/${server_folder_name}")
     lines.append("")
     lines.append("# Check that the reference genome directory exists")
     lines.append('if [[ ! -d "${reference_genome_used}" ]]; then')
