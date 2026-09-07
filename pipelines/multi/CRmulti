@@ -95,8 +95,10 @@ datasheet_exp_var_def () {		#parse the datasheet file and define experiment vari
 
 	run_name=$(awk 'BEGIN {FS="\t"}; /run_name/{print $3}' $1)
 	run_name=$(echo $run_name | tr -d ' ')	#remove white spaces
-	username=$(awk 'BEGIN {FS="\t"}; /username/{print $3}' $1)
-	username=$(echo $username | tr -d ' ')	#remove white spaces
+	# username = first word of the sheet value; user_tag = "_<user>" or "" when blank
+	username=$(awk 'BEGIN {FS="	"}; /user/{print $3; exit}' $1)
+	username=${username%% *}
+	user_tag=$([ -n "$username" ] && printf '_%s' "$username" || true)
 	commandoutputonly=$(awk 'BEGIN {FS="\t"}; /commandoutputonly/{print $3}' $1)
 	commandoutputonly=$(echo $commandoutputonly | tr -d ' ')	#remove white spaces
 	commandoutputonlyfirstletter=${commandoutputonly:0:1}	#first letter of yes or no
@@ -601,7 +603,7 @@ CR_multi () {
 
 		#md5 checksum
 		find ${pathcount}/${2}_${1} -type f | sort | xargs md5sum | sed "s|$pathcount||" > ${pathcount}/md5_checksum/${2}_${1}_md5_checksum.txt
-		rsync -avh ${pathcount}/md5_checksum/${2}_${1}_md5_checksum.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}/md5_checksum
+		rsync -avh ${pathcount}/md5_checksum/${2}_${1}_md5_checksum.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}/md5_checksum
 
 
 
@@ -612,18 +614,18 @@ CR_multi () {
 		cp ${pathcount}/${2}_${1}/outs/qc_library_metrics.csv ${pathcount}/Summary_multi/${2}_${1}_qc/${2}_${1}_qc_library_metrics.csv		
 
 		
-		rsync -avh ${pathcount}/${2}_${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${current_datasheet} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/multi-config_${1}.csv ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${1}_script_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${1}_error_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp} 2> /dev/null
+		rsync -avh ${pathcount}/${2}_${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${current_datasheet} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/multi-config_${1}.csv ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${1}_script_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${1}_error_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp} 2> /dev/null
  
 
 	else
-		echo "cellranger multi --id=${1} --csv=multi-config_${1}.csv --localcores=30 --localmem=100 && rm -r ${pathcount}/${1}/SC_MULTI_CS && rsync -avh ${pathcount}/${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}"
-		echo "cellranger multi --id=${1} --csv=multi-config_${1}.csv --localcores=30 --localmem=100 && rm -r ${pathcount}/${1}/SC_MULTI_CS && rsync -avh ${pathcount}/${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}"  >> ${1}_script_log.txt
-		mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
+		echo "cellranger multi --id=${1} --csv=multi-config_${1}.csv --localcores=30 --localmem=100 && rm -r ${pathcount}/${1}/SC_MULTI_CS && rsync -avh ${pathcount}/${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}"
+		echo "cellranger multi --id=${1} --csv=multi-config_${1}.csv --localcores=30 --localmem=100 && rm -r ${pathcount}/${1}/SC_MULTI_CS && rsync -avh ${pathcount}/${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}"  >> ${1}_script_log.txt
+		mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
 	fi
 
 }
@@ -742,8 +744,8 @@ multi_summary () {
 	
 	rm -rf ${modified_metrics_folder}
 
-	rsync -avh ${pathcount}/Summary_multi ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-	rsync -avh ${pathcount}/Summary_metrics_multi.csv ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
+	rsync -avh ${pathcount}/Summary_multi ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+	rsync -avh ${pathcount}/Summary_metrics_multi.csv ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
 
 	
 }
@@ -793,13 +795,13 @@ do
 	datasheet_exp_var_def $current_datasheet	#experiment variables 
 	datasheet_CR_var_def $current_datasheet		#count/multi variables
 
-	timestamp=$(date +"%a_%d_%m_%Y-%H_%M_%S_%N")
-	mkdir ${pathc}/${run_name}_${username}_${timestamp}
-	mkdir ${pathc}/${run_name}_${username}_${timestamp}/md5_checksum
-	pathcount=(${pathc}/${run_name}_${username}_${timestamp})
+	timestamp=$(date +"%Y%m%d-%H%M%S")
+	mkdir ${pathc}/${run_name}${user_tag}_${timestamp}
+	mkdir ${pathc}/${run_name}${user_tag}_${timestamp}/md5_checksum
+	pathcount=(${pathc}/${run_name}${user_tag}_${timestamp})
 	
-	mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}
-	mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}_${username}_${timestamp}/md5_checksum
+	mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}
+	mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/multi/${run_name}${user_tag}_${timestamp}/md5_checksum
 	
 
 	cp ${current_datasheet} ${pathcount}/

@@ -275,6 +275,35 @@ def parse_xlsx(path):
     return pairs, avt_found
 
 
+def read_user_field(path):
+    """
+    Scan every sheet for a ``User:`` label in the first column and return
+    the first whitespace-delimited word of the first non-empty cell to its
+    right. Returns "" when the label is missing or its value is blank.
+    The GECF submission sheet carries the requester on row 2 (label
+    col 1, value col 2) but the exact row can move, so a full scan is
+    used rather than a hard-coded row.
+    """
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+    except Exception:
+        return ""
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is None:
+                    continue
+                norm = re.sub(r"[^a-z]", "", str(cell.value).lower())
+                if norm != "user":
+                    continue
+                for c in range(cell.column + 1, ws.max_column + 1):
+                    v = ws.cell(row=cell.row, column=c).value
+                    if v is not None and str(v).strip():
+                        return str(v).strip().split()[0]
+                return ""
+    return ""
+
+
 def print_pairs_table(pairs):
     """
     Print a simple aligned table of (sample_name, fastq_id, avt_run) triples,
@@ -413,8 +442,13 @@ def find_fastq_path(avt_run, fastq_id):
     return None
 
 
-def build_script_full(reference_genome, pairs):
-    """Build complete cellranger-atac shell script."""
+def build_script_full(reference_genome, pairs, user=""):
+    """Build complete cellranger-atac shell script.
+
+    user is the requester read from the workbook (first word). Woven into
+    the per-sample output folder; empty leaves the folder without a user
+    segment (no placeholder).
+    """
     global lines
     lines = []
 
@@ -424,7 +458,7 @@ def build_script_full(reference_genome, pairs):
     main_avt = avt_counts.most_common(1)[0][0] if avt_counts else "MIXED_runs"
 
     lines.append("#!/bin/bash")
-    lines.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
+    lines.append("TIMESTAMP=$(date +%Y%m%d-%H%M%S)")
     lines.append("reference_genome_used=" + reference_genome)
     lines.append("")
 
@@ -469,8 +503,11 @@ def build_script_full(reference_genome, pairs):
     lines.append("CUSTOM_OPTIONS=")
     lines.append("")
 
-    # Generate working folder name with timestamp (expanded in Python, not bash)
-    server_folder_name = f"{main_avt}_CRatac_${{TIMESTAMP}}"
+    # Working folder name: <AVT>[_<user>]_<YYYYmmdd-HHMMSS>. Timestamp
+    # expands at run time (bash, same slot as arc/multi do it); user is
+    # baked in here because the workbook already told us who runs this.
+    user_tag = "_" + user if user else ""
+    server_folder_name = f"{main_avt}{user_tag}_${{TIMESTAMP}}"
     
     lines.append("")
     lines.append("# Working directory: cellranger-atac output and post-processing live here")
@@ -646,7 +683,10 @@ def main():
 
     reference_genome = ask_reference_genome()
 
-    script_content = build_script_full(reference_genome, all_pairs)
+    # Read the requester from the workbook (first word, "" if absent)
+    user = read_user_field(xlsx_files[0])
+
+    script_content = build_script_full(reference_genome, all_pairs, user)
 
     out_script = f"cellranger-atac_{main_avt}.sh"
     with open(out_script, "w") as f:

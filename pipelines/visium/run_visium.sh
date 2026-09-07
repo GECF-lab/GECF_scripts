@@ -149,9 +149,40 @@ PY="$(pick_python)" || {
 
 mkdir -p "$OUT"
 RUN_NAME="$(basename "${WORKBOOK%.*}")"
-TS="$(date +%Y%m%d_%H%M%S)"
-LAUNCH_LOG="$OUT/run_${TS}.log"
-GEN_SCRIPT="$OUT/run_${TS}.sh"
+# Compact timestamp slot, uniform with arc/multi/atac.
+TS="$(date +%Y%m%d-%H%M%S)"
+
+# Leaf folder convention (shared across all four 10xG pipelines):
+#   <AVT>[_<user>]_<YYYYmmdd-HH%M%S>
+# AVT is read from the workbook filename; user is the first word of the
+# "User:" field in the workbook ("" when blank — no placeholder).
+AVT_RUN="$(printf '%s' "$RUN_NAME" | grep -oE 'AVT0[0-9]{3,5}' | head -n 1)"
+[ -n "$AVT_RUN" ] || { echo "ERROR: no AVT0xxxx in workbook filename: $WORKBOOK" >&2; exit 2; }
+USER_WORD="$(
+    "$PY" - "$WORKBOOK" <<'PY' 2>/dev/null
+import re, sys
+import openpyxl
+try:
+    wb = openpyxl.load_workbook(sys.argv[1], data_only=True)
+except Exception:
+    sys.exit(0)
+for ws in wb.worksheets:
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None: continue
+            if re.sub(r"[^a-z]", "", str(cell.value).lower()) != "user": continue
+            for c in range(cell.column + 1, ws.max_column + 1):
+                v = ws.cell(row=cell.row, column=c).value
+                if v is not None and str(v).strip():
+                    print(str(v).strip().split()[0])
+                    sys.exit(0)
+            sys.exit(0)
+PY
+)"
+[ -n "$USER_WORD" ] && LEAF="${AVT_RUN}_${USER_WORD}_${TS}" || LEAF="${AVT_RUN}_${TS}"
+
+LAUNCH_LOG="$OUT/$LEAF.log"
+GEN_SCRIPT="$OUT/$LEAF.sh"
 
 echo
 echo "======================================================================"
@@ -168,7 +199,7 @@ echo
 echo ">> 1/3  Checking the samples (validates workbook, images, references)"
 set +e
 PREVIEW_OUT="$( "$PY" "$GENERATOR" "$WORKBOOK" --output-dir "$OUT" \
-    --output-name "run_${TS}" "${GEN_ARGS[@]+${GEN_ARGS[@]}}" \
+    --output-name "$LEAF" "${GEN_ARGS[@]+${GEN_ARGS[@]}}" \
     --print-commands 2>&1 )"
 PREVIEW_RC=$?
 [ -n "$PREVIEW_OUT" ] && echo "$PREVIEW_OUT"
@@ -211,7 +242,7 @@ echo
 echo ">> 3/3  Writing the run script"
 set +e
 "$PY" "$GENERATOR" "$WORKBOOK" --output-dir "$OUT" \
-    --output-name "run_${TS}" "${GEN_ARGS[@]+${GEN_ARGS[@]}}" > "$LAUNCH_LOG" 2>&1
+    --output-name "$LEAF" "${GEN_ARGS[@]+${GEN_ARGS[@]}}" > "$LAUNCH_LOG" 2>&1
 GEN_RC=$?
 if [ "$GEN_RC" -ne 0 ] || [ ! -f "$GEN_SCRIPT" ]; then
     cat <<EOF

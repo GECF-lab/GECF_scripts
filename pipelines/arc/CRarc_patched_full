@@ -24,7 +24,7 @@
 #Version 1.0 intial
 #Version 1.1 removed the SC_ATAC_GEX_COUNTER_CS folder from the output November 2025
 #Version 1.2 added timestamp and md5 checksum
-#Version 1.3 fixed merging summaries function (Daniel + Alfred)
+#Version 1.3 fixed merging summaries function
 #Version 1.4 fixed empty GEX_only/ATAC_only: SC_ATAC_GEX_COUNTER_CS is now deleted only
 #            AFTER extract_summary_metrics reads its per-modality web summaries (was deleted
 #            inside CRarc() before the copy ran).
@@ -70,8 +70,10 @@ datasheet_exp_var_def () {		#parse the datasheet file and define experiment vari
 
 	run_name=$(awk 'BEGIN {FS="\t"}; /run_name/{print $3}' $1)
 	run_name=$(echo $run_name | tr -d ' ')	#remove white spaces
-	username=$(awk 'BEGIN {FS="\t"}; /username/{print $3}' $1)
-	username=$(echo $username | tr -d ' ')	#remove white spaces
+	# username = first word of the sheet value; user_tag = "_<user>" or "" when blank
+	username=$(awk 'BEGIN {FS="	"}; /user/{print $3; exit}' $1)
+	username=${username%% *}
+	user_tag=$([ -n "$username" ] && printf '_%s' "$username" || true)
 	restrictions=$(awk 'BEGIN {FS="\t"}; /restrictions/{print $3}' $1)
 	commandoutputonly=$(awk 'BEGIN {FS="\t"}; /commandoutputonly/{print $3}' $1)
 	commandoutputonly=$(echo $commandoutputonly | tr -d ' ')	#remove white spaces
@@ -547,10 +549,10 @@ CRarc () {
 
 	if test "$commandoutputonlyfirstletter" = 'y';	
 	then
-		echo "cellranger-arc count --id=${1} --description=${GEXnxid},${ATACnxid} --reference=${transcriptomepath} --libraries=libraries_${1}.csv --create-bam=${bam_settings} ${numberofthreads} ${numberofRAM} --cell-annotation-model=auto --tenx-cloud-token-path=/home/gecf/.config/txg/credentials ${optional_argument} && rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}"
-		echo "cellranger-arc count --id=${1} --description=${GEXnxid},${ATACnxid} --reference=${transcriptomepath} --libraries=libraries_${1}.csv --create-bam=${bam_settings} ${numberofthreads} ${numberofRAM} --cell-annotation-model=auto --tenx-cloud-token-path=/home/gecf/.config/txg/credentials ${optional_argument} && rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}" >> ${1}_script_log.txt
-		mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
+		echo "cellranger-arc count --id=${1} --description=${GEXnxid},${ATACnxid} --reference=${transcriptomepath} --libraries=libraries_${1}.csv --create-bam=${bam_settings} ${numberofthreads} ${numberofRAM} --cell-annotation-model=auto --tenx-cloud-token-path=/home/gecf/.config/txg/credentials ${optional_argument} && rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}"
+		echo "cellranger-arc count --id=${1} --description=${GEXnxid},${ATACnxid} --reference=${transcriptomepath} --libraries=libraries_${1}.csv --create-bam=${bam_settings} ${numberofthreads} ${numberofRAM} --cell-annotation-model=auto --tenx-cloud-token-path=/home/gecf/.config/txg/credentials ${optional_argument} && rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}" >> ${1}_script_log.txt
+		mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/ ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
 
 	else
 		echo "cellranger-arc count --id=${1} --description=${GEXnxid},${ATACnxid} --reference=${transcriptomepath} --libraries=libraries_${1}.csv --create-bam=${bam_settings} ${numberofthreads} ${numberofRAM} --cell-annotation-model=auto --tenx-cloud-token-path=/home/gecf/.config/txg/credentials ${optional_argument}" >> ${1}_script_log.txt
@@ -570,16 +572,16 @@ CRarc () {
 			rm ${pathcount}/${1}_error_log.txt
 		fi
 
-		mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${current_datasheet} ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/libraries_${1}.csv ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${1}_script_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
-		rsync -avh ${pathcount}/${1}_error_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp} 2> /dev/null
+		mkdir ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${1} ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${current_datasheet} ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/libraries_${1}.csv ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${1}_script_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
+		rsync -avh ${pathcount}/${1}_error_log.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp} 2> /dev/null
 
 		#md5 checksum
 		find ${pathcount}/${1} -type f | sort | xargs md5sum | sed "s|$pathcount||" > ${pathcount}/${1}_md5_checksums.txt
-		rsync -avh ${pathcount}/${1}_md5_checksums.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}
+		rsync -avh ${pathcount}/${1}_md5_checksums.txt ${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}
 
 		
 	fi
@@ -654,7 +656,7 @@ extract_summary_metrics () {
 
 	done
 
-	rsync -avh "${metrics_folder}" "${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}_${username}_${timestamp}"
+	rsync -avh "${metrics_folder}" "${sv1files}/${nxtorhsq}/ZZ_10XG/arc/${run_name}${user_tag}_${timestamp}"
 
 
 }
@@ -705,9 +707,9 @@ do
 	datasheet_exp_var_def $current_datasheet	#experiment variables 
 	datasheet_CR_var_def $current_datasheet		#nr of samples
 
-	timestamp=$(date +"%a_%d_%m_%Y-%H_%M_%S_%N")
-	mkdir ${pathc}/${run_name}_${username}_${timestamp}
-	pathcount=(${pathc}/${run_name}_${username}_${timestamp})
+	timestamp=$(date +"%Y%m%d-%H%M%S")
+	mkdir ${pathc}/${run_name}${user_tag}_${timestamp}
+	pathcount=(${pathc}/${run_name}${user_tag}_${timestamp})
 
 	cp ${current_datasheet} ${pathcount}/
 
