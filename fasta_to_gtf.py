@@ -21,11 +21,19 @@ Notes:
     - Also writes a cleaned FASTA (same basename + ".clean.fasta") with
       headers sanitized to match the GTF contig names exactly, since the
       FASTA and GTF must use identical contig names.
+    - Contig names longer than MAX_NAME_LENGTH (32) abort the script with
+      a clear error. cellranger-arc's ATAC signal-track stage parses
+      bedgraph rows with a 35-char numpy field, so any name over 35
+      characters is silently truncated and the stage then crashes with a
+      misleading "invalid contig name" error. Keep names at or below 32
+      to stay safely under that vendor cap.
 """
 
 import sys
 import re
 from pathlib import Path
+
+MAX_NAME_LENGTH = 32
 
 
 def sanitize_name(name: str) -> str:
@@ -95,6 +103,14 @@ def main():
             if name != raw_name:
                 print(f"Renamed '{raw_name}' -> '{name}' (removed underscores/invalid chars)")
 
+            if len(name) > MAX_NAME_LENGTH:
+                print(f"ERROR: contig name '{name}' is {len(name)} characters, exceeds the "
+                      f"{MAX_NAME_LENGTH}-character limit. cellranger-arc truncates contig names "
+                      f"longer than 35 characters in the ATAC signal-track stage, which crashes "
+                      f"the run with a misleading 'invalid contig name' error. "
+                      f"Use a shorter name and rerun. Aborting.")
+                sys.exit(1)
+
             if name in seen_names:
                 print(f"ERROR: duplicate contig name '{name}' after sanitization. Aborting.")
                 sys.exit(1)
@@ -114,7 +130,7 @@ def main():
             for i in range(0, length, 60):
                 fasta_out.write(seq[i:i + 60] + "\n")
 
-    print(f"\nDone. {len(seen_names)} genes written.")
+    print(f"\nDone. {len(seen_names)} genes written (all contig names within {MAX_NAME_LENGTH} chars).")
     print(f"GTF:   {out_gtf}")
     print(f"FASTA: {out_fasta}  (headers sanitized to match GTF contig names)")
 
