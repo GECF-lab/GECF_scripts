@@ -16,6 +16,7 @@ Scripts developed at the **Gene Expression Core Facility (GECF)** for Oxford Nan
 - [adaptive_sampling_filter.sh](#filter_adaptive_samplingsh)
 - [mapping_bams.sh](#mapping_bamssh)
 - [update_dorado.sh](#update_doradosh)
+- [pipelines/ — 10x Genomics CellRanger & SpaceRanger](#pipelines--10x-genomics-cellranger--spaceranger)
 - [generate_cellranger_template_atac.py](#generate_cellranger_template_atacpy)
 - [fasta_to_gtf.py](#fasta_to_gtfpy)
 - [qpcr-template-validator.py](#qpcr-template-validatorpy)
@@ -82,7 +83,7 @@ chmod +x *.sh
 | `adaptive_sampling_filter.sh` | Filters pod5 files using adaptive sampling decisions |
 | `mapping_bams.sh` | Aligns FASTQ/BAM reads to a reference genome with minimap2 |
 | `update_dorado.sh` | Downloads and installs the latest stable Dorado release |
-| `generate_cellranger_template_atac.py` | Produces a cellranger-atac pipeline script from an AVT Excel file |
+| `pipelines/` | 10x Genomics CellRanger & SpaceRanger pipeline scripts (atac, arc, multi, visium) |
 | `fasta_to_gtf.py` | Converts custom multi-FASTA to cellranger-arc-compatible GTF |
 | `qpcr-template-validator.py` | Validates qPCR DNA/PRIMER Hamilton Excel templates before sending to robot |
 
@@ -377,21 +378,48 @@ bash update_dorado.sh
 
 ---
 
-## generate_cellranger_template_atac.py
+## pipelines/ — 10x Genomics CellRanger & SpaceRanger
 
-Given an AVT Excel tracking file, generates a ready-to-run shell script that executes `cellranger-atac count` for every sample in the run. Parses the "GECF fastq ID (avidxxxx)" column to locate each sample's FASTQ pair and writes out a properly formatted pipeline wrapper (`<AVT>_cellranger_atac_pipelines.sh`).
+All 10x Genomics pipeline scripts live in `pipelines/`, one subfolder per assay. Every pipeline follows the same conventions:
 
-### Usage
+| Pipeline | Folder | Tool | Archive destination |
+|----------|--------|------|---------------------|
+| visium (spatial) | `pipelines/visium/` | spaceranger count 4.1.0 | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/spaceranger/` |
+| atac (single-cell ATAC) | `pipelines/atac/` | cellranger-atac count | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/atac/` |
+| arc (Multiome RNA+ATAC) | `pipelines/arc/` | cellranger-arc count | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc/` |
+| multi (TotalSeq / VDJ) | `pipelines/multi/` | cellranger multi | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/multi/` |
+
+- **Standard archive rule:** results are rsync'd to `/AA/NGSruns/AVT/AV240401/ZZ_10XG/<modality>/<run folder>/`.
+- **Generator-style pipelines** (visium, atac): a Python generator reads the sample Excel/datasheet, writes one ready-to-run `.sh` into the **current working directory**; review it, then run it — results land locally there and are deployed to the archive automatically.
+- **Driver-style pipelines** (arc, multi): bash scripts that live with their datasheet on the server (`/home/gecf/NGS_pipelines/CR_pipeline/`), read `CR_*_datasheet*.txt` files, run the count, and rsync to the archive themselves.
+
+### visium — run_visium.sh + generate_spaceRanger_visium.py
+
+Entry point: `bash pipelines/visium/run_visium.sh <workbook.xlsx> [generator params]`. Parses and validates every sample row, previews the spaceranger commands, asks for confirmation, then runs (create-only by default; `--launch` waits and reports PASS/FAIL) or writes just the run script. Output goes into the **current working directory**.
 
 ```bash
-python3 generate_cellranger_template_atac.py file.xlsx
+cd /data/runs/AVT0598
+bash pipelines/visium/run_visium.sh workbook.xlsx --species human \
+    --chemistry 3p --cytaimage liver.tif --slide V10J25-015 --area A1
 ```
 
-The Excel sheet must contain at least:
-- A `"GECF fastq ID (avidxxxx)"` column linking samples to FASTQ pairs
-- A run name matching `AVT0\d{3,5}` somewhere in the sheet or filename
+### atac — generate_cellranger_template_atac.py
 
-> After running, check the generated script and verify paths before executing.
+Given an AVT Excel tracking file, generates a ready-to-run shell script that executes `cellranger-atac count` for every sample. Parses the "GECF fastq ID (avidxxxx)" column to locate each sample's FASTQ pair and writes out `<AVT>_cellranger_atac_pipelines.sh` into the current directory.
+
+```bash
+python3 pipelines/atac/generate_cellranger_template_atac.py file.xlsx
+```
+
+The Excel sheet must contain a `"GECF fastq ID (avidxxxx)"` column and a run name matching `AVT0\d{3,5}` (sheet or filename). After running, check the generated script and verify paths before executing.
+
+### arc — CRarc_patched_full (v1.4)
+
+Multiome (RNA+ATAC) driver. Must be run from its server copy directory `/home/gecf/NGS_pipelines/CR_pipeline/CRarc_Multiome`; reads every `CR_arc_datasheet*.txt` there, runs `cellranger-arc count` per sample (2 in parallel), extracts the joint web summary + CSVs, cleans up staging trees, and rsyncs to the arc archive.
+
+### multi — CRmulti (v2.11)
+
+TotalSeq / VDJ driver. Must be run from `/home/gecf/NGS_pipelines/CR_pipeline/CRmulti_OCM_VDJ_TotalSeq_FB/`; reads `CR_multi_datasheet*.txt`, runs `cellranger multi` per sample, produces Summary + Summary_metrics_multi.csv, and rsyncs to the multi archive.
 
 ---
 
