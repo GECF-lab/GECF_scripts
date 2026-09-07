@@ -399,6 +399,8 @@ The Excel sheet must contain at least:
 
 Converts a multi-FASTA file (one contig per custom gene) into four GTF lines (gene + transcript + exon + CDS). The output pairs with your FASTA for building a **cellranger-arc** reference (`mkref`). Also writes a cleaned FASTA matching all names used in the GTF.
 
+Contig names longer than **32 characters** are rejected with an error before any output is written. The cellranger-arc 2.x ATAC signal-track stage parses bedgraph rows with a 35-character field, so names over 35 are silently truncated and the run later fails with a misleading "invalid contig name" error. The 32-character cap keeps names safely under that limit.
+
 ### Usage
 
 ```bash
@@ -412,7 +414,7 @@ python3 fasta_to_gtf.py input.fasta output.gtf
 | `<output>.gtf` | 4 lines per FASTA record (+ strand) |
 | `<output>.clean.fasta` | Cleaned FASTA headers matching GTF contig names |
 
-> Names are sanitized: underscores become hyphens, `|` in headers drops metadata after the first pipe.
+> Names are sanitized: underscores become hyphens, `|` in headers drops metadata after the first pipe. Names must be at most 32 characters after sanitization, or the script aborts with an error.
 
 ---
 
