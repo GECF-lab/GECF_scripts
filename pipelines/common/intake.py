@@ -60,6 +60,20 @@ NGS_BASE_DIR_TEMPLATE = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/{avt_run}"
 #: Anchored match for a bare AVT run name (e.g. ``AVT0519``).
 AVT_PATTERN = re.compile(r"AVT0?\d{3,5}")
 
+#: A real GECF library id is ``avid`` followed by 4-6 digits (e.g. ``avid12499``).
+#: Label / legend / placeholder rows in the same columns carry strings like
+#: ``"0"``, ``"GECF libr. ID (avidxxxx)"`` or ``"Loaded molarity (pM)"`` — this
+#: pattern distinguishes genuine sample rows from those.  Both the ARC and ATAC
+#: generators use this as their row gate, so the single source of truth lives
+#: here rather than in each generator.
+FASTQ_ID_PATTERN = re.compile(r"^avid\d{4,6}$", re.IGNORECASE)
+
+#: Default ``--localcores`` / ``--localmem`` for cellranger invocations emitted
+#: by the generators.  Shared so the numbers stay in lockstep across assays;
+#: per-assay overrides remain possible via the generator's own constant.
+LOCAL_CORES = "44"
+LOCAL_MEM = "150"
+
 
 # ── non-interactive mode ──────────────────────────────────────────────────
 

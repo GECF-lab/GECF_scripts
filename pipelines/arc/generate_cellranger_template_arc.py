@@ -69,6 +69,9 @@ if _PIPELINES_ROOT not in sys.path:
 from common.intake import (  # noqa: E402
     NGS_BASE_DIR_TEMPLATE,
     AVT_PATTERN,
+    FASTQ_ID_PATTERN,   # row gate: ^avid\d{4,6}$ — single source of truth
+    LOCAL_CORES,        # cellranger --localcores (shared default "44")
+    LOCAL_MEM,          # cellranger --localmem   (shared default "150")
     norm,
     build_merged_cell_lookup,
     get_cell_value,
@@ -96,9 +99,6 @@ EXCLUDED_BATCH_PATTERNS = (
     re.compile(r"\bunassigned\b", re.IGNORECASE),
     re.compile(r"for_check", re.IGNORECASE),
 )
-
-LOCAL_CORES = "44"
-LOCAL_MEM = "150"
 TENX_TOKEN_PATH = "/home/gecf/.config/txg/credentials"
 
 
@@ -111,12 +111,6 @@ setup_readline_completer()  # tab-complete paths in the input() prompts
 # (norm / get_cell_value / build_merged_cell_lookup are imported from
 # common.intake — see the import block above.)
 
-
-# A real GECF library id is ``avid`` followed by 4-6 digits (e.g. avid12499).
-# Label/legend/placeholder rows in the same columns carry strings like
-# "0", "GECF libr. ID (avidxxxx)" or "Loaded molarity (pM)" — this pattern
-# distinguishes genuine sample rows from those.
-FASTQ_ID_PATTERN = re.compile(r"^avid\d{4,6}$", re.IGNORECASE)
 
 
 def _locate_header(ws, merged_lookup):
