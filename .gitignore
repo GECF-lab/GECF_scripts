@@ -105,4 +105,14 @@ Desktop.ini
 # ----------------------
 *.xlsx
 
+# ----------------------
+# Generated pipeline output (review-then-run .sh scripts)
+# ----------------------
+# The cellranger generators emit a per-AVT shell script for manual review.
+# These are build artifacts, not source — keep them out of the tree.
+cellranger-arc_AVT*.sh
+cellranger-atac_AVT*.sh
+cellranger-multi_AVT*.sh
+cellranger*_AVT*.sh
+
 .local/

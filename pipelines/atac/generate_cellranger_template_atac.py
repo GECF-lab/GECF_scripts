@@ -16,8 +16,6 @@ cellranger-atac_AVT0XXX.sh script pre-filled with one
 """
 
 import argparse
-import readline
-import glob
 import os
 import re
 import sys
@@ -35,77 +33,58 @@ except ImportError:
         "Install it with: pip3 install openpyxl"
     )
 
+# Ensure the pipelines/ package root is on sys.path so ``common.intake``
+# resolves.  The generator lives at ``pipelines/<assay>/`` so its parent
+# directory is the package root.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PIPELINES_ROOT = os.path.normpath(os.path.join(_HERE, os.pardir))
+if _PIPELINES_ROOT not in sys.path:
+    sys.path.insert(0, _PIPELINES_ROOT)
 
-NGS_BASE_DIR_TEMPLATE = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/{avt_run}"
+# Shared intake atoms — see pipelines/common/intake.py.  The constants are
+# re-exported here so any downstream code that imported them from this
+# module keeps working.
+from common.intake import (  # noqa: E402
+    NGS_BASE_DIR_TEMPLATE,
+    AVT_PATTERN,
+    norm,
+    build_merged_cell_lookup,
+    get_cell_value,
+    read_user_field,
+    set_non_interactive,
+    setup_readline_completer,
+    ask_avt_run,
+    ask_reference_genome,
+)
 
 HUMAN_GENOME_PATH = "/home/gecf/references/cellranger_references/current_human_arc_ATAC/refdata-cellranger-arc-GRCh38-2024-A"
 MOUSE_GENOME_PATH = "/home/gecf/references/cellranger_references/current_mouse_arc_ATAC/refdata-cellranger-arc-GRCm39-2024-A"
 # Central archive destination for cellranger-atac runs (fixed target).
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/atac"
 
-AVT_PATTERN = re.compile(r"AVT0?\d{3,5}", re.IGNORECASE)
+# A real GECF library id is `avid` followed by 4-6 digits (e.g. avid12499).
+# Label/legend/placeholder rows in the same columns carry strings like
+# "0", "GECF libr. ID (avidxxxx)" or "Loaded molarity (pM)" — this pattern
+# distinguishes genuine sample rows from those.
+FASTQ_ID_PATTERN = re.compile(r"^avid\d{4,6}$", re.IGNORECASE)
 
 
-def _path_completer(text, state):
-    matches = glob.glob(os.path.expanduser(text) + "*")
-    matches = [m + "/" if os.path.isdir(m) else m for m in matches]
-    return matches[state] if state < len(matches) else None
+setup_readline_completer()  # tab-complete paths in the input() prompts
 
 
-readline.set_completer_delims(" \t\n;")
-readline.set_completer(_path_completer)
-readline.parse_and_bind("tab: complete")
-
-
-def norm(value):
-    if value is None:
-        return ""
-    return str(value).strip().lower()
-
-
-# ─── helpers that survive merged headers without openpyxl's broken detection ──
-
-from collections import namedtuple
-_Merged = namedtuple("_Merged", "min_row max_row min_col max_col")
-
-
-def build_merged_cell_lookup(ws):
-    """
-    Returns a dict mapping (row, col) -> value for every cell that belongs
-    to a merged range, using the value stored in the top-left cell of that
-    range. This lets header rows that use merged cells (e.g. a label
-    merged across two rows) still resolve correctly.
-    """
-    lookup = {}
-    for merged_range in ws.merged_cells.ranges:
-        min_row, min_col, max_row, max_col = (
-            merged_range.min_row,
-            merged_range.min_col,
-            merged_range.max_row,
-            merged_range.max_col,
-        )
-        top_left_value = ws.cell(row=min_row, column=min_col).value
-        for r in range(min_row, max_row + 1):
-            for c in range(min_col, max_col + 1):
-                lookup[(r, c)] = top_left_value
-    return lookup
-
-
-def get_cell_value(ws, merged_lookup, row_idx, col_idx):
-    """
-    Return the value seen at (row, col). If that position is part of a
-    merged range whose top-left cell holds data, return that instead.
-    Falls back gracefully if ws.cell itself throws.
-    """
-    try:
-        # First check our lookup for merged ranges
-        if (row_idx, col_idx) in merged_lookup:
-            val = merged_lookup[(row_idx, col_idx)]
-            if val is not None:
-                return val
-        return ws.cell(row=row_idx, column=col_idx).value
-    except Exception:
-        return None
+def ranked_sheet_names(wb):
+    """Sheet order for parsing: User_x1x_copy first (the canonical
+    single-user block), then all remaining sheets in workbook order.
+    Used by parse_xlsx: the first sheet that exposes the required
+    header row wins, so the canonical sheet is always preferred and
+    the rest of the workbook is only fallback."""
+    ranked = []
+    if "User_x1x_copy" in wb.sheetnames:
+        ranked.insert(0, "User_x1x_copy")
+    for name in wb.sheetnames:
+        if name not in ranked:
+            ranked.append(name)
+    return ranked
 
 
 # ─── main parsing logic ───────────────────────────────────────────────
@@ -124,58 +103,64 @@ def parse_xlsx(path):
     wb = openpyxl.load_workbook(path, data_only=True)
     print(f"  Sheets: {', '.join(wb.sheetnames)}")
 
-    if "User_x1x_copy" in wb.sheetnames:
-        ws = wb["User_x1x_copy"]
-        print(f"  -> Using 'User_x1x_copy' sheet")
-    else:
-        ws = wb.active
-        print(f"  -> Using active sheet '{ws.title}'")
+    # Prefer the canonical single-user sheet (User_x1x_copy); otherwise scan
+    # every worksheet in workbook order and take the first one that exposes
+    # the required header row. This is resilient to multi-sheet GECF
+    # workbooks where the data block is no longer the first sheet (e.g. the
+    # 15-sheet layout with GUIDELINES first).
+    def _find_header(ws, merged_lookup):
+        max_header_scan = min(15, ws.max_row)
+        for row_idx in range(1, max_header_scan + 1):
+            row_vals = [
+                get_cell_value(ws, merged_lookup, row_idx, c)
+                for c in range(1, ws.max_column + 1)
+            ]
+            prev_row_vals = (
+                [
+                    get_cell_value(ws, merged_lookup, row_idx - 1, c)
+                    for c in range(1, ws.max_column + 1)
+                ]
+                if row_idx > 1
+                else [""] * ws.max_column
+            )
+            combined = [
+                f"{norm(prev)} {norm(cur)}".strip()
+                for prev, cur in zip(prev_row_vals, row_vals)
+            ]
+            f_idx = None
+            s_idx = None
+            for i, v in enumerate(combined):
+                if "fastq id" in v and "avid" in v:
+                    f_idx = i
+                if "sample name" in v:
+                    s_idx = i
+            if f_idx is not None and s_idx is not None:
+                return f_idx + 1, s_idx + 1, row_idx
+        return None
 
-    merged_lookup = build_merged_cell_lookup(ws)
-
+    ws = None
     fastq_col = None
     sample_col = None
     header_row_idx = None
+    for candidate in ranked_sheet_names(wb):
+        cand_ws = wb[candidate]
+        cand_lookup = build_merged_cell_lookup(cand_ws)
+        found = _find_header(cand_ws, cand_lookup)
+        if found is None:
+            continue
+        fastq_col, sample_col, header_row_idx = found
+        ws = cand_ws
+        merged_lookup = cand_lookup
+        if candidate != "User_x1x_copy":
+            print(f"  -> 'User_x1x_copy' not found with data; using '{candidate}' (fallback scan)")
+        else:
+            print(f"  -> Using 'User_x1x_copy' sheet")
+        break
 
-    # Scan header rows, combining each row with the row above it, so a
-    # header label merged/split across two rows (e.g. "GECF fastq ID" on
-    # one row and "(avidxxxx)" on the row above/below) is still detected.
-    max_header_scan = min(15, ws.max_row)
-    for row_idx in range(1, max_header_scan + 1):
-        row_vals = [
-            get_cell_value(ws, merged_lookup, row_idx, c)
-            for c in range(1, ws.max_column + 1)
-        ]
-        prev_row_vals = (
-            [
-                get_cell_value(ws, merged_lookup, row_idx - 1, c)
-                for c in range(1, ws.max_column + 1)
-            ]
-            if row_idx > 1
-            else [""] * ws.max_column
-        )
-        combined = [
-            f"{norm(prev)} {norm(cur)}".strip()
-            for prev, cur in zip(prev_row_vals, row_vals)
-        ]
-
-        f_idx = None
-        s_idx = None
-        for i, v in enumerate(combined):
-            if "fastq id" in v and "avid" in v:
-                f_idx = i
-            if "sample name" in v:
-                s_idx = i
-        if f_idx is not None and s_idx is not None:
-            fastq_col = f_idx + 1
-            sample_col = s_idx + 1
-            header_row_idx = row_idx
-            break
-
-    if fastq_col is None or sample_col is None:
+    if ws is None:
         sys.exit(
             "Error: could not find both 'GECF fastq ID (avidxxxx)' and "
-            "'Sample name' columns in the first 10 rows."
+            "'Sample name' columns in the first 10 rows of any sheet."
         )
 
     # If the header cell(s) are merged across multiple rows, make sure we
@@ -216,7 +201,7 @@ def parse_xlsx(path):
         if "run details" in norm(fastq_val) or "run details" in norm(sample_val):
             break
 
-        if fastq_val and sample_val:
+        if fastq_val and sample_val and FASTQ_ID_PATTERN.match(fastq_val):
             # Level 1 – per-row AVT detection: try fastq_id first, then other columns
             row_avt = None
             fq_match = AVT_PATTERN.search(fastq_val)
@@ -274,34 +259,8 @@ def parse_xlsx(path):
 
     return pairs, avt_found
 
-
-def read_user_field(path):
-    """
-    Scan every sheet for a ``User:`` label in the first column and return
-    the first whitespace-delimited word of the first non-empty cell to its
-    right. Returns "" when the label is missing or its value is blank.
-    The GECF submission sheet carries the requester on row 2 (label
-    col 1, value col 2) but the exact row can move, so a full scan is
-    used rather than a hard-coded row.
-    """
-    try:
-        wb = openpyxl.load_workbook(path, data_only=True)
-    except Exception:
-        return ""
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value is None:
-                    continue
-                norm = re.sub(r"[^a-z]", "", str(cell.value).lower())
-                if norm != "user":
-                    continue
-                for c in range(cell.column + 1, ws.max_column + 1):
-                    v = ws.cell(row=cell.row, column=c).value
-                    if v is not None and str(v).strip():
-                        return str(v).strip().split()[0]
-                return ""
-    return ""
+# (read_user_field is imported from common.intake — see the import block
+# near the top of this file.)
 
 
 def print_pairs_table(pairs):
@@ -329,62 +288,8 @@ def print_pairs_table(pairs):
         print(f"| {fastq_id:<{fastq_width}} | {sample_name:<{sample_width}} | {(avt or '(none)'):<{avt_width}} |")
     print(sep)
 
-
-# ─── user prompts (suppressed when NON_INTERACTIVE) ────────────────────
-
-# Global flag for non-interactive execution (CI/testing)
-NON_INTERACTIVE = False
-
-
-def ask_avt_run(detected_avt):
-    if NON_INTERACTIVE:
-        return detected_avt or "AVT0000"
-    if detected_avt:
-        while True:
-            print(f"Detected run name: {detected_avt}")
-            answer = input("Use this run name? [Y/n]: ").strip()
-            if answer[0].lower() == "y":
-                return detected_avt
-            elif answer[0].lower() == "n":
-                break
-            else:
-                print("Answer can only be Y or n. Please try again.")
-                continue
-
-    while True:
-        avt_run = input("Enter AVT run name (e.g. AVT0123): ").strip()
-        if avt_run:
-            return avt_run.upper()
-        else:
-            print("Run name cannot be empty. Please try again.\n")
-
-
-def ask_reference_genome():
-    genome_choices = [
-        ("Human ARC ATAC", HUMAN_GENOME_PATH),
-        ("Mouse ARC ATAC", MOUSE_GENOME_PATH),
-    ]
-
-    if NON_INTERACTIVE:
-        return HUMAN_GENOME_PATH
-
-    while True:
-        print("\nAvailable reference genomes:")
-        for i, (label, path) in enumerate(genome_choices, start=1):
-            print(f"  {i}. {label} — {path}")
-        print("  Custom: type a full path")
-        answer = input("Choice [1]: ").strip() or "1"
-
-        if answer == "1":
-            return HUMAN_GENOME_PATH
-        elif answer == "2":
-            return MOUSE_GENOME_PATH
-        else:
-            custom_path = os.path.expanduser(answer)
-            if os.path.isdir(custom_path):
-                return custom_path
-            else:
-                print(f"Path '{custom_path}' does not exist. Try again.\n")
+# (ask_avt_run / ask_reference_genome come from common/intake — see the
+# import block near the top of this file.)
 
 
 def build_script(reference_genome, pairs):
@@ -507,11 +412,12 @@ def build_script_full(reference_genome, pairs, user=""):
     # expands at run time (bash, same slot as arc/multi do it); user is
     # baked in here because the workbook already told us who runs this.
     user_tag = "_" + user if user else ""
-    server_folder_name = f"{main_avt}{user_tag}_${{TIMESTAMP}}"
-    
+    # Server_folder_name must be a SHELL variable in the emitted script
+    # (it is referenced below as ${server_folder_name} at run time).
     lines.append("")
     lines.append("# Working directory: cellranger-atac output and post-processing live here")
-    lines.append(f"Server_folder=$PWD/{server_folder_name}")
+    lines.append(f'server_folder_name="{main_avt}{user_tag}_$TIMESTAMP"')
+    lines.append('Server_folder="$PWD/${server_folder_name}"')
     lines.append('mkdir -vp "$Server_folder"')
     lines.append("")
     # Final archive destination (fixed central archive for all cellranger-atac runs)
@@ -627,8 +533,7 @@ def main():
     )
     args = parser.parse_args()
 
-    global NON_INTERACTIVE
-    NON_INTERACTIVE = args.non_interactive
+    set_non_interactive(args.non_interactive)
     xlsx_files = args.xlsx_files
 
     all_pairs = []
@@ -681,7 +586,8 @@ def main():
     avt_counts = Counter(avt for _, _, avt in all_pairs if avt is not None)
     main_avt = avt_counts.most_common(1)[0][0] if avt_counts else "MIXED_runs"
 
-    reference_genome = ask_reference_genome()
+    reference_genome = ask_reference_genome(
+        HUMAN_GENOME_PATH, MOUSE_GENOME_PATH, default_path=HUMAN_GENOME_PATH)
 
     # Read the requester from the workbook (first word, "" if absent)
     user = read_user_field(xlsx_files[0])
@@ -694,7 +600,9 @@ def main():
     os.chmod(out_script, 0o755)
 
     print(f"Generated: {out_script}")
-    print("Review it, fill in Server_folder / NGSruns_folder, and adjust fastq paths if needed.")
+    if "FIXME_LOCATE_" in script_content:
+        print("Note: some fastq paths could not be resolved — set the flagged "
+              "path_* variables (FIXME_LOCATE_ markers) before running.")
 
 
 if __name__ == "__main__":
