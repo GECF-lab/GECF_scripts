@@ -1,0 +1,43 @@
+# Conda environment for a bulk RNA-seq pipeline
+# (FastQC -> STAR -> featureCounts -> R-based QC/analysis, with RSeQC 3.x tools).
+#
+# Usage:
+#   conda env create -f flashseq-env.yaml
+#   conda activate flashseq
+#
+# Channel order is significant: bioconda packages are placed first and pull
+# required conda-forge dependencies automatically.
+
+name: flashseq
+channels:
+  - bioconda
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Alignment and read counting
+  - star=2.7.11b
+  - subread
+  - samtools=1.24
+
+  # Read quality control and preprocessing
+  - fastqc=0.12.1
+  - fastp
+
+  # RSeQC (geneBody_coverage.py, read_distribution.py, ...).
+  # pysam and its dependencies are pulled in automatically.
+  - rseqc=5.0.5
+
+  # GTF -> BED12 reference conversion (gffread --bed)
+  - gffread
+
+  # R environment for matrix operations and RSeQC plotting
+  - r-base=4.5
+  - r-readr
+  - r-tibble
+  - r-dplyr
+  - r-tidyr
+  - r-corrplot
+
+  # Runtime for the RSeQC command-line tools
+  - python>=3.12
+  - plotly>=7
