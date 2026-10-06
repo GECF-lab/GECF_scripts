@@ -17,7 +17,7 @@ Scripts developed at the **Gene Expression Core Facility (GECF)** for Oxford Nan
 - [mapping_bams.sh](#mapping_bamssh)
 - [update_dorado.sh](#update_doradosh)
 - [pipelines/ — 10x Genomics CellRanger & SpaceRanger](#pipelines--10x-genomics-cellranger--spaceranger)
-- [generate_cellranger_template_atac.py](#generate_cellranger_template_atacpy)
+- [FLASHseq/ — FLASH-seq (single-cell) RNA-seq](#flashseq--flash-seq-single-cell-rna-seq)
 - [fasta_to_gtf.py](#fasta_to_gtfpy)
 - [qpcr-template-validator.py](#qpcr-template-validatorpy)
 - [Test Fixtures](#test-fixtures)
@@ -84,6 +84,7 @@ chmod +x *.sh
 | `mapping_bams.sh` | Aligns FASTQ/BAM reads to a reference genome with minimap2 |
 | `update_dorado.sh` | Downloads and installs the latest stable Dorado release |
 | `pipelines/` | 10x Genomics CellRanger & SpaceRanger pipeline scripts (atac, arc, multi, visium) |
+| `FLASHseq/` | FLASH-seq (single-cell) RNA-seq pipeline + RSeQC QC |
 | `fasta_to_gtf.py` | Converts custom multi-FASTA to cellranger-arc-compatible GTF |
 | `qpcr-template-validator.py` | Validates qPCR DNA/PRIMER Hamilton Excel templates before sending to robot |
 
@@ -423,6 +424,47 @@ TotalSeq / VDJ driver. Must be run from `/home/gecf/NGS_pipelines/CR_pipeline/CR
 
 ---
 
+## FLASHseq/ — FLASH-seq (single-cell) RNA-seq
+
+Run-to-result pipeline for **Alithea FLASH-seq** single-cell RNA-seq: FASTQ →
+FastQC → STAR → featureCounts → one merged genes × samples count matrix, plus
+standalone per-sample RSeQC QC (gene-body coverage + read distribution) on the
+STAR BAMs. Resume-safe; a failing sample never blocks the others.
+
+| File | Purpose |
+|---|---|
+| `FLASHseq/flashseq_pipeline.sh` | Core pipeline (FastQC → STAR → featureCounts → merged matrix) |
+| `FLASHseq/flashseq_rseqc.sh` | Per-sample RSeQC QC on existing BAMs |
+| `FLASHseq/gbcov_redraw.py` | Merged gene-body plot: PDF/PNG/JPEG (via R) or interactive HTML (via plotly) |
+| `FLASHseq/flashseq-env.yaml` | Conda environment definition |
+
+See [FLASHseq/README.md](FLASHseq/README.md) for full usage, options, outputs,
+and worked examples.
+
+### Quick start
+
+```bash
+conda env create -f FLASHseq/flashseq-env.yaml   # once, if you don't have it
+conda activate flashseq
+
+# 1) the full pipeline (FastQC -> STAR -> featureCounts -> merged matrix)
+nohup bash FLASHseq/flashseq_pipeline.sh \
+  --species human \
+  --fastq-dir /mnt/PTEGraw/…/AVT0551/…/Samples/<project>_Jun26/ \
+  > pipeline.out 2>&1 &
+
+# 2) RSeQC QC on the finished run (interactive HTML plot at hundreds of samples)
+bash FLASHseq/flashseq_rseqc.sh \
+  --species human \
+  --outdir /mnt/data/FLASHseq_output/scrnaseq/AVT0551_human_20260910_0930 \
+  --steps gbcov --gbcov-format html
+```
+
+> `gbcov_redraw.py` must stay in the **same directory** as
+> `flashseq_rseqc.sh`.
+
+---
+
 ## fasta_to_gtf.py
 
 Converts a multi-FASTA file (one contig per custom gene) into four GTF lines (gene + transcript + exon + CDS). The output pairs with your FASTA for building a **cellranger-arc** reference (`mkref`). Also writes a cleaned FASTA matching all names used in the GTF.
@@ -573,4 +615,19 @@ bash dorado_basecaller_prod.sh
 ```bash
 conda activate basecaller
 bash get_stats.sh /path/to/any_file.bam
+```
+
+### FLASH-seq (single-cell) RNA-seq run
+
+```bash
+conda activate flashseq
+bash FLASHseq/flashseq_pipeline.sh \
+  --species human \
+  --fastq-dir /mnt/PTEGraw/…/AVT0551/…/Samples/<project>_Jun26/
+
+# then, once the pipeline has finished, RSeQC QC on the run:
+bash FLASHseq/flashseq_rseqc.sh \
+  --species human \
+  --outdir /mnt/data/FLASHseq_output/scrnaseq/AVT0551_human_20260910_0930 \
+  --gbcov-format html
 ```
