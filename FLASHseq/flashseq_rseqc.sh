@@ -38,7 +38,9 @@
 #                         the housekeeping set -- read_distribution needs
 #                         exons + introns to split reads into CDS/5'UTR/
 #                         3'UTR/intron/intergenic.
-# Override with --refbed PATH (gbcov only) or --gtf PATH (rdist only).
+# Override with --refbed PATH (ready housekeeping BED) and/or --gtf PATH
+# (genome-wide gene model; also the gbcov fallback when no housekeeping
+# BED exists for the species).
 #
 # Artifacts -- standard output layout:
 #   $OUT/rseqc/<gtf basename>.bed12
@@ -74,7 +76,7 @@
 set -uo pipefail
 
 # --- defaults ---------------------------------------------------------------
-SCRIPT_VERSION="1.2.0"   # Bump on any change that alters outputs/behaviour.
+SCRIPT_VERSION="1.3.0"   # Bump on any change that alters outputs/behaviour.
 SPECIES=""
 GTF_ARG=""
 OUT=""
@@ -394,8 +396,9 @@ OUT="${OUT%/}"
 #   geneBody_coverage (GBCOV_REFBED):
 #     1. --refbed PATH           : ready BED, used as-is
 #     2. per-species default     : REFBEDS table (housekeeping BED)
-#     3. (fallback) species GTF  : REFS table -- genome-wide, BAKED to BED12
-#                                  (warned about at run time)
+#     3. (fallback) GTF          : --gtf if given, else the REFS table GTF --
+#                                  genome-wide, BAKED to BED12 (warned about
+#                                  at run time)
 #   read_distribution (RDIST_BED12):
 #     1. --gtf PATH              : bake a BED12 from this GTF
 #     2. per-species default     : REFS table GTF, BAKED to BED12
@@ -429,12 +432,14 @@ else
     if [[ -n "$_dbed" ]]; then
       warn "gbcov housekeeping BED missing/unreadable: $_dbed"
     fi
-    _fgtf=$(_refgtf_for "$SPECIES")
+    # Fallback gene model: --gtf if the user gave one (custom species without
+    # a housekeeping BED), else the per-species default GTF.
+    _fgtf="${GTF_ARG:-$(_refgtf_for "$SPECIES")}"
     if [[ -n "$_fgtf" ]]; then
       warn "gbcov: falling back to GENOME-WIDE BED12 baked from GTF ($_fgtf) -- not the housekeeping set"
       GBCOV_FALLBACK_GTF="$_fgtf"
     else
-      err "no reference for --species $SPECIES -- give --refbed PATH (ready housekeeping BED)"
+      err "no reference for --species $SPECIES -- give --refbed PATH (ready housekeeping BED) or --gtf PATH (gene-model GTF, genome-wide BED12 baked from it)"
       echo; usage; exit 1
     fi
   fi
