@@ -368,7 +368,7 @@ resolve_star_index() {
       "--runMode"            genomeGenerate
       "--runThreadN"         "$THREADS_PER"
       "--genomeFastaFiles"   "$REF_FASTA"
-      "--sjdbGTFFile"        "$GTF"
+      "--sjdbGTFfile"        "$GTF"
       "--genomeDir"          "$STAR_INDEX"
       "--sjdbOverhang"       "$SJDB_OVERHANG")
 
