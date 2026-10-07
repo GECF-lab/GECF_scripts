@@ -76,7 +76,7 @@ def skewness(values):
 
 
 def load_dataset(path):
-    """Parse the table; return rows sorted by skewness (most 3'-biased first)."""
+    """Parse the table; return rows sorted by skewness (edge-heavy profiles first)."""
     rows = []
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -250,7 +250,7 @@ def write_html(dataset, file_prefix):
             )
         )
         fig.update_layout(
-            title="gbcov heatMap (ranked by skewness, 3'-biased on top)",
+            title="gbcov heatMap (ranked by skewness, edge-heavy on top)",
             xaxis=dict(title="Gene body percentile (5'->3')"),
             yaxis_autorange="reversed",  # first sample (most skewed) on top, like R
             width=1000,

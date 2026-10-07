@@ -29,6 +29,7 @@ set -uo pipefail
 
 
 # --- defaults ---------------------------------------------------------------
+SCRIPT_VERSION="1.1.0"   # Bump on any change that alters outputs/behaviour.
 AVT=""
 SPECIES=""
 STAR_BIN="STAR-avx2"
@@ -123,6 +124,7 @@ OPTIONAL
   --count-only           STAR+BAM already exist; just count + merge
   --no-resume            never skip finished steps
   --dry-run              print planned commands, execute nothing
+  --version              print the script version and exit
 
 EXAMPLES
   # typical: human, AVT and samples inferred/auto
@@ -157,6 +159,7 @@ while [[ $# -gt 0 ]]; do
     --exclude)      EXCLUDE="$2"; shift 2;;
     --no-resume)    RESUME=0; shift;;
     --dry-run)      DRY_RUN=1; shift;;
+    --version)      echo "flashseq_pipeline.sh $SCRIPT_VERSION"; exit 0;;
     -h|--help)      usage; exit 0;;
     *) die "Unknown option '$1' (see --help)";;
   esac
@@ -201,6 +204,33 @@ done
 
 [[ -n "$SPECIES" ]] || { err "--species is required (human|mouse|<custom>)"; echo; usage; exit 1; }
 [[ -n "$FASTQ_DIR" ]] || { err "--fastq-dir is required (root of the avid* sample dirs)"; echo; usage; exit 1; }
+
+# --- Conflict guard: built-in species + --ref-fasta + no --star-index ---------
+# --ref-fasta is only consumed when building an index (STAR --runMode
+# genomeGenerate). For a built-in species (human|mouse) without an explicit
+# --star-index, the index defaults to the built-in dir, which already has
+# Genome+SA, so the build path is never reached and --ref-fasta is silently
+# ignored. That is the same silent-ignoring class as the old custom-species
+# misrouting, so hard-stop it here rather than proceeding with the built-in
+# genome.
+#   Allowed:   --species human --gtf X            (annotation override)
+#   Allowed:   --species human --star-index I     (user prebuilt index)
+#   Allowed:   --species human --star-index J --ref-fasta R --gtf X
+#               (J empty -> build into J from R)
+#   Rejected:  --species human --ref-fasta R      (no target dir to build into)
+case "${SPECIES:-}" in
+  human|mouse)
+    if [[ -n "$REF_FASTA" && -z "$STAR_INDEX" ]]; then
+      err "--ref-fasta (build an index) was given with the built-in species '$SPECIES' but no --star-index."
+      err "That combination has no place to build the index, so --ref-fasta would be silently"
+      err "ignored and the built-in genome would be used instead."
+      err "Options:"
+      err "  - drop --ref-fasta (use the built-in '$SPECIES' index + GTF), or"
+      err "  - add --star-index <fresh-dir> to build a STAR index in that dir from --ref-fasta + --gtf."
+      exit 1
+    fi
+    ;;
+esac
 
 # --- AVT resolution -----------------------------------------------------------
 # Priority: explicit --avt > inferred from --fastq-dir (first AVT[0-9]{3,5}
@@ -303,10 +333,22 @@ resolve_star_index() {
   fi
 
   # Default location for a species' index (Ensembl-116 FLASHseq tree).
+  # A custom species (anything other than human|mouse) has no default index:
+  # it must be mapped to a prebuilt --star-index or built from --ref-fasta, and
+  # never falls back to a built-in genome (which would silently re-target the run).
   if [[ -z "$STAR_INDEX" ]]; then
     case "${SPECIES:-}" in
+      human) STAR_INDEX="/home/gecf/references/STAR_references/FLASHseq/current_human_star/Homo_sapiens.GRCh38.116" ;;
       mouse) STAR_INDEX="/home/gecf/references/STAR_references/FLASHseq/current_mouse_star/Mus_musculus.GRCm39.116" ;;
-      *)     STAR_INDEX="/home/gecf/references/STAR_references/FLASHseq/current_human_star/Homo_sapiens.GRCh38.116" ;;
+      "")
+        die "no species specified: pass --species <human|mouse|name>, or --star-index <dir>"
+        ;;
+      *)
+        # custom species: only buildable if a FASTA was supplied
+        [[ -n "$REF_FASTA" ]] \
+          || die "species '$SPECIES' has no default STAR index: pass --star-index, or --ref-fasta (with a GTF) to build one"
+        STAR_INDEX="/home/gecf/references/STAR_references/FLASHseq/custom/${SPECIES}_star"
+        ;;
     esac
   fi
 
@@ -750,6 +792,7 @@ info "stages     : fastqc=$DO_FASTQC  skip-star=$SKIP_STAR  count-only=$COUNT_ON
 {
   printf '=== run %s ===\n' "$(date -Is)"
   printf 'species=%s(%s) avt=%s out=%s parallel=%sx%s\n' "$SPECIES" "$GENESET" "$AVT" "$OUT" "$MAX_JOBS" "$THREADS_PER"
+  printf '%-21s: %s\n' 'flashseq_pipeline.sh' "$SCRIPT_VERSION"
   echo "--- tools ---"
   { command -v "$STAR_BIN" >/dev/null && "$STAR_BIN" --version 2>&1 | head -1; } || STAR --version 2>&1 | head -1
   featureCounts -v 2>&1 | head -1
