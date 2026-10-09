@@ -153,19 +153,16 @@ SJDB_USED="$(awk -F'\t' '$1=="sjdbOverhang"{print $2}' "$OUTDIR/genomeParameters
 echo "   sjdbOverhang in use: ${SJDB_USED:-<not found>}"
 echo "   (provenance: $OUTDIR/genomeParameters.txt — exact command used to build it)"
 
-# --- bundle the reference files actually used into the index directory -------
-# Move the FASTA/GTF that were actually fed to STAR into the freshly built
-# index folder so the index is self-contained and reproducible. When ERCC
-# spike-ins were appended, these are the merged versions
-# (reference_with_ERCC.fa / annotation_with_ERCC.gtf); otherwise they are
-# the original --fasta/--gtf inputs.
-REF_FASTA_PATH="$REF_FASTA"
-REF_GTF_PATH="$GTF_PLAIN"
-for f in "$REF_FASTA_PATH" "$REF_GTF_PATH"; do
+# --- move the original input files into the index directory ------------------
+# Move the actual --fasta/--gtf (and --ercc-fasta/--ercc-gtf, if given)
+# files into the freshly built index folder, keeping their original names,
+# so the index folder is self-contained. Files already inside the outdir
+# are left in place.
+for f in "$FASTA" "$GTF" ${ERCC_FASTA:+"$ERCC_FASTA"} ${ERCC_GTF:+"$ERCC_GTF"}; do
   base="$(basename "$f")"
-  if [[ "$(readlink -f "$f")" != "$(readlink -f "$OUTDIR")/$base" ]]; then
+  if [[ "$(dirname "$(readlink -f "$f")")" != "$(readlink -f "$OUTDIR")" ]]; then
     mv -f "$f" "$OUTDIR/$base"
     echo "Moved: $f -> $OUTDIR/$base"
   fi
 done
-echo "   (source FASTA/GTF are now inside the index directory)"
+echo "   (input FASTA/GTF are now inside the index directory)"
