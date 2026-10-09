@@ -100,7 +100,8 @@ One sample failing does not stop the others.
 
 REQUIRED (all species)
   --species  human | mouse | <name>
-             human/mouse = built-in references (GRCh38-2024-A / GRCm39-2024-A);
+             human/mouse = built-in Ensembl STAR references under
+             /home/gecf/references/STAR_references/FLASHseq/;
              anything else = custom: --gtf required, plus either --star-index
              (prebuilt) or --ref-fasta (index is built from FASTA + your GTF).
   --fastq-dir  DIR   root containing the avid*/ sample dirs.
