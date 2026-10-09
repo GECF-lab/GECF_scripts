@@ -29,7 +29,7 @@ set -uo pipefail
 
 
 # --- defaults ---------------------------------------------------------------
-SCRIPT_VERSION="1.1.0"   # Bump on any change that alters outputs/behaviour.
+SCRIPT_VERSION="1.2.0"   # Bump on any change that alters outputs/behaviour.
 AVT=""
 SPECIES=""
 STAR_BIN="STAR-avx2"
@@ -712,8 +712,11 @@ import sys
 from collections import Counter
 
 def group_of(name):
-    """Infer the sample group from a name: its leading token."""
-    return name.split("_", 1)[0]
+    """Infer the sample group: the name minus a trailing '_<digits>' index."""
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return name
 
 def load_matrix_labels(path):
     """Sample names = header row entries after the first column (geneID)."""
