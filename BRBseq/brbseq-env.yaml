@@ -1,0 +1,37 @@
+# Conda environment for the BRB-seq pipeline
+# (STARsolo -> UMI/duplication stats -> optional BAM/FASTQ demultiplexing).
+#
+# Usage:
+#   conda env create -f brbseq-env.yaml
+#   conda activate brbseq
+#
+# Channel order is significant: bioconda packages are placed first and pull
+# required conda-forge dependencies automatically.
+
+name: brbseq
+channels:
+  - bioconda
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Alignment and STARsolo counting
+  - star=2.7.11b
+  - samtools=1.24
+
+  # GTF -> BED12 reference conversion (gffread --bed)
+  - gffread
+
+  # Read quality control and FASTQ demultiplexing
+  - fastqc=0.12.1
+  - fqtk=0.3.1
+  - picard
+
+  # RSeQC (read_distribution.py).
+  # pysam and its dependencies are pulled in automatically.
+  - rseqc>=5.0.4
+
+  # Runtime for UMI/duplication statistics (pandas, scipy, numpy)
+  - python=3.12
+  - pandas>=2.3.3
+  - scipy>=1.15.3
+  - numpy>=2.1
