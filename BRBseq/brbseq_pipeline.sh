@@ -562,7 +562,7 @@ fi
 #--- generate manifest from lib-prep workbook (workbook mode) ----------------
 # parse_libprep_xlsx.py needs python+openpyxl (verified above); the caller
 # activates their own environment before launching.
-if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" ]]; then
+if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   mkdir -p "$BARCODES_DIR"
   log "lib-prep workbook mode: generating manifest from $LIBPREP_XLSX"
   parse_args=( --xlsx "$LIBPREP_XLSX" --out "$MANIFEST" --provenance "$LIBPREP_PROV" )
@@ -588,6 +588,8 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" ]]; then
   fi
   [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
   log "manifest   = ${MANIFEST}  (generated from lib-prep workbook)"
+elif [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 1 ]]; then
+  log "manifest   = (workbook mode; would generate from lib-prep workbook — skipped in dry-run)"
 elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   # manifest already on disk (resume).  It must match this call:
   #  - flag set, rows missing  -> stale artifact (resume created without the
