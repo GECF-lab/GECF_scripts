@@ -7,12 +7,12 @@
 #
 #   STAR genome indexing            (one-time, NOT a pipeline step)
 #   Creating barcode files          [MANDATORY ]  prepare_barcodes.sh
-#   FASTQ quality (fastqc)          [optional   ]  --run-fastq
+#   FASTQ quality (fastqc)          [ON by default]  off: --skip-fastq
 #   STARsolo alignment + counts     [MANDATORY ]  STAR
-#   Read distribution (RSeQC)       [optional   ]  --run-rseqc
+#   Read distribution (RSeQC)       [ON by default]  off: --skip-rseqc
 #   Duplication statistics          [MANDATORY ]  get_duplication_statistics.py
-#   BAM demultiplex (picard)        [optional   ]  --run-dmux-bam
-#   FASTQ demultiplex (fqtk)        [optional   ]  --run-dmux-fq
+#   BAM demultiplex (picard)        [ON by default]  off: --skip-dmux-bam
+#   FASTQ demultiplex (fqtk)        [ON by default]  off: --skip-dmux-fq
 #   Merge multi-lane FASTQ          [note       ]  pre-merge or comma-list
 #
 # Logging (automatic, no flag)
@@ -89,10 +89,17 @@ REFS=(
 BED_FILE=""                      # RSeQC BED12
 OUT_DIR="${OUT_DIR:-/mnt/data/BRB-seq_output}"
 MANIFEST_HEADER=1                # resolved to 1 (header row) or 0 (none) from auto-detection
-RUN_OPT_FASTQ="${RUN_OPT_FASTQ:-0}"
-RUN_OPT_RSEQC="${RUN_OPT_RSEQC:-0}"
-RUN_OPT_DEMUX_BAM="${RUN_OPT_DEMUX_BAM:-0}"
-RUN_OPT_DEMUX_FQ="${RUN_OPT_DEMUX_FQ:-0}"
+# Optional analyses are ON by default: fastqc, read_distribution
+# (RSeQC), BAM demux (picard), FASTQ demux (fqtk).  Disable any of them
+# with --skip-fastq / --skip-rseqc / --skip-dmux-bam / --skip-dmux-fq.
+# Disable any of them with --skip-fastq / --skip-rseqc / --skip-dmux-bam /
+# --skip-dmux-fq.
+RUN_OPT_FASTQ="${RUN_OPT_FASTQ:-1}"
+RUN_OPT_RSEQC="${RUN_OPT_RSEQC:-1}"
+RUN_OPT_DEMUX_BAM="${RUN_OPT_DEMUX_BAM:-1}"
+RUN_OPT_DEMUX_FQ="${RUN_OPT_DEMUX_FQ:-1}"
+# did the user pass the --skip-* opt-out for each?
+S_FASTQ=0; S_RSEQC=0; S_DMBAM=0; S_DMFQ=0
 # Alithea BRB-seq production SAM tag set (fixed, not user-configurable).
 SAM_ATTRS="NH HI nM AS CR UR CB UB GX GN sS sQ sM"
 RESUME="${RESUME:-auto}"         # auto | force
@@ -140,13 +147,10 @@ OPTIONAL FLAGS
   --out-dir <dir>       root output dir (default /mnt/data/BRB-seq_output)
   --threads <n>         threads (default 8)
   --resume <auto|force> auto = skip completed steps (default); force = rerun
-  --run-fastq           fastqc (needs fastqc in PATH)
-  --run-rseqc           read_distribution (needs samtools,
-                        read_distribution.py, and a BED12: --bed-file or a GTF
-                        inside the STAR index dir)
-  --run-dmux-bam        picard BAM demux (needs picard)
-  --run-dmux-fq         fqtk FASTQ demux (needs fqtk; 14 bp CB + 14 bp UMI,
-                        Alithea BRB-seq standard — hardcoded)
+  --skip-fastq          skip fastqc  (on by default)
+  --skip-rseqc          skip read_distribution  (on by default)
+  --skip-dmux-bam       skip picard BAM demux  (on by default)
+  --skip-dmux-fq        skip fqtk FASTQ demux  (on by default)
   --force-plate         suppress the kit/plate family cross-check in workbook
                         mode (override a deliberate re-prep where the
                         --barcodes-plate family differs from the workbook's
@@ -161,45 +165,27 @@ OPTIONAL FLAGS
   --version             print version and exit
 
 EXAMPLES
-  # Full mandatory pipeline on a mouse pool (built-in reference):
-  ./brbseq_pipeline.sh \
-      --species mouse \
-      --r1-barcode  /data/AVT0608/pool_poolA_S1_R1_001.fastq.gz \
-      --r2-genomic  /data/AVT0608/pool_poolA_S1_R2_001.fastq.gz \
-      --barcode-tsv /data/AVT0608/sample_barcode.tsv \
-      --run-name Eleni --threads 16 \
-      --out-dir     /mnt/data/BRB-seq_output
+  # TSV manifest:
+  ./brbseq_pipeline.sh --species mouse \
+      --r1-barcode /data/POOL/S1_R1_001.fastq.gz \
+      --r2-genomic /data/POOL/S1_R2_001.fastq.gz \
+      --barcode-tsv /data/POOL/sample_barcode.tsv \
+      --run-name Daniel --threads 16 --out-dir /mnt/data/BRB-seq_output
 
-  # Same, but feed the Mercurius lib-prep workbook directly (no hand-made
-  # TSV; manifest goes to <run>/barcodes/, run name inferred from the
-  # workbook 'Researcher' row).  The barcode plate is optional here: when
-  # omitted it is inferred from the workbook's 'Kit ref' row — here V5A,
-  # i.e. barcodes_96_V5A*.txt that sits next to the xlsx file:
-  ./brbseq_pipeline.sh \
-      --species mouse \
-      --r1-barcode  /data/PHX537/pool_Eleni_S1_R1_001.fastq.gz \
-      --r2-genomic  /data/PHX537/pool_Eleni_S1_R2_001.fastq.gz \
-      --libprep-xlsx  "Mercurius HS BRB-seq RNA lib prep GECF Eleni_vA.02_PHX537.xlsx" \
-      --out-dir /mnt/data/BRB-seq_output
+  # Lib-prep workbook instead of a TSV (plate inferred from the workbook):
+  ./brbseq_pipeline.sh --species mouse \
+      --r1-barcode /data/POOL/S1_R1_001.fastq.gz \
+      --r2-genomic /data/POOL/S1_R2_001.fastq.gz \
+      --libprep-xlsx "Mercurius HS BRB-seq RNA lib prep GECF.xlsx"
 
-  # Custom species: build a STAR index once with build_star_index.sh, then pass it:
-  ./build_star_index.sh \
-      --fasta Mus_musculus.GRCm39.dna.primary_assembly.fa \
-      --gtf  Mus_musculus.GRCm39.114.gtf \
-      --outdir star_index/Mus_musculus.GRCm39.114 \
-      --sjdbOverhang 89
-  ./brbseq_pipeline.sh \      --species mouse-custom --star-genome star_index/Mus_musculus.GRCm39.114 \
-      ...
+  # Custom species: build a STAR index once, then pass it:
+  ./build_star_index.sh --fasta genome.fa --gtf genes.gtf --outdir star_index --sjdbOverhang 89
+  ./brbseq_pipeline.sh --species mouse-custom --star-genome star_index ...
 
-  # Tools (STAR, samtools, ...) must be on PATH — activate the brbseq env first.
-  # If the env does not exist yet on this machine, create it from the env file
-  # shipped next to this script:
-  conda env create -f brbseq-env.yaml          # (once, on a fresh host; creates env 'brbseq')
-  conda activate brbseq
-  ./brbseq_pipeline.sh ...
-
-  # Dry run (print what WOULD be done, do not execute):
+  # Dry run (no side effects):
   ./brbseq_pipeline.sh ... --dry-run
+
+  # See the README for environment setup (conda), full flags, and output layout.
 EOF
 }
 
@@ -219,10 +205,10 @@ while [[ $# -gt 0 ]]; do
     --bed-file)     BED_FILE="${2:?missing --bed-file value}";      shift 2;;
     --out-dir)      OUT_DIR="${2:?missing --out-dir value}";        shift 2;;
     --threads)      THREADS="${2:?missing --threads value}";        shift 2;;
-    --run-dmux-fq)  RUN_OPT_DEMUX_FQ=1;                               shift;;
-    --run-fastq)    RUN_OPT_FASTQ=1;                                  shift;;
-    --run-rseqc)    RUN_OPT_RSEQC=1;                                  shift;;
-    --run-dmux-bam) RUN_OPT_DEMUX_BAM=1;                              shift;;
+    --skip-dmux-fq) S_DMFQ=1;                                         shift;;
+    --skip-fastq)   S_FASTQ=1;                                        shift;;
+    --skip-rseqc)   S_RSEQC=1;                                        shift;;
+    --skip-dmux-bam)S_DMBAM=1;                                        shift;;
     --resume)       RESUME="${2:?missing --resume value}";            shift 2;;
     --dry-run)      DRY_RUN=1;                                        shift;;
     -h|--help)      usage; exit 0;;
@@ -231,6 +217,12 @@ while [[ $# -gt 0 ]]; do
     *)              die "I don't recognise '$1' as a valid option or value. The full list of options is printed by:  brbseq_pipeline.sh --help";;
   esac
 done
+
+#--- apply --skip-* opt-outs (steps run by default otherwise) ---------------
+[[ "$S_FASTQ"  -eq 1 ]] && RUN_OPT_FASTQ=0
+[[ "$S_RSEQC"  -eq 1 ]] && RUN_OPT_RSEQC=0
+[[ "$S_DMBAM"  -eq 1 ]] && RUN_OPT_DEMUX_BAM=0
+[[ "$S_DMFQ"   -eq 1 ]] && RUN_OPT_DEMUX_FQ=0
 
 #--- validate required inputs ------------------------------------------------
 # Exactly one manifest source must be provided:
@@ -266,7 +258,7 @@ fi
 # Rule: take the basename, cut at the lane marker "_S<n>" — everything
 # before "_S" is kept verbatim.
 #   pool_poolA_S1_R1_001.fastq.gz  -> pool_poolA
-#   pool_Eleni_S2_R2_001.fastq.gz  -> pool_Eleni
+#   pool_poolB_S2_R2_001.fastq.gz  -> pool_poolB
 #   sample_S1_R1_001.fastq.gz      -> sample
 # R1 and R2 must agree; a disagreement is a WARNING (R1 wins).
 infer_pool() {
@@ -340,7 +332,7 @@ fi
 #   1 GTF          -> RSEQC_GTF set, BED12 baked at run time (unless --bed-file given)
 #   >1 GTFs        -> die (explicit list of all of them) — or warn and
 #                     continue if --bed-file is given (baking never happens)
-#   0 GTFs         -> --run-rseqc without --bed-file dies at the gate below
+#   0 GTFs         -> read_distribution auto-skips (warn), rest of pipeline proceeds
 RSEQC_GTF=""
 if [[ -d "$STAR_INDEX" ]]; then
   RSEQC_GTF_CANDIDATES=()
@@ -372,12 +364,10 @@ if [[ -d "$STAR_INDEX" ]]; then
     # offender.  If RSeQC is not in this run (or --bed-file makes the
     # choice moot) we still say so explicitly, but do not block the run.
     if [[ "$RUN_OPT_RSEQC" -eq 1 && -z "$BED_FILE" ]]; then
-      {
-        echo "The read-distribution step needs the gene model (a GTF) for the genome, but the STAR index folder ($STAR_INDEX) contains $n different GTF gene-annotation files, and the pipeline does not know which one is the correct gene model for this genome:"
-        printf '%s\n' "${RSEQC_GTF_CANDIDATES[@]}" | sed 's/^/      /' >&2
-        echo "This stops the read-distribution step (the rest of the pipeline still runs). FIX: either pass the correct gene model already converted to BED12 format with  --bed-file <file.bed12>,  or remove the extra .gtf files from that folder so only the correct one remains." >&2
-      }
-      exit 1
+      # read_distribution is ON by default, so a broken gene model must not
+      # abort the whole run: skip the read-distribution step only and continue.
+      warn "WARNING (read-distribution step): the STAR index folder $STAR_INDEX contains more than one GTF gene annotation ($n files found), and the pipeline does not know which one is the correct gene model for this genome, so it can't build the RSeQC BED12 file automatically this run. The read-distribution report will NOT be produced; the rest of the pipeline continues normally. To turn the report back on: pass the correct gene model already converted to BED12 format with --bed-file <file.bed12>, or remove the extra .gtf files from that folder so only the correct one remains."
+      RUN_OPT_RSEQC=0
     else
       local_list="$(printf '%s, ' "${RSEQC_GTF_CANDIDATES[@]}")"
       warn "WARNING (read-distribution step): the STAR index folder $STAR_INDEX contains more than one GTF gene annotation (${local_list%, }). The pipeline does not know which one of these is the correct gene model for this genome, so it will not try to build the RSeQC BED12 file automatically this run — the rest of the pipeline continues normally, but the read-distribution report will not be produced. To turn on the read-distribution report, supply the correct gene model directly with  --bed-file <file.bed12>."
@@ -387,7 +377,7 @@ fi
 if [[ -z "$BED_FILE" && -n "$RSEQC_GTF" ]]; then
   log "RSeQC: no --bed-file given; will bake BED12 from $RSEQC_GTF (the single GTF in the STAR index dir — the gene model the index was built from)"
 elif [[ -z "$BED_FILE" && -z "$RSEQC_GTF" ]]; then
-  # Nothing to bake from; the gate below dies when --run-rseqc is enabled.
+  # Nothing to bake from; the check below skips read_distribution (warn).
   :
 fi
 log "reference = ${SPECIES}  ->  STAR index $STAR_INDEX"
@@ -408,7 +398,10 @@ fi
 [[ -d "$STAR_INDEX"  ]] || die "The STAR genome index directory could not be found: $STAR_INDEX. Check the --star-genome value (or the built-in path for your --species) and re-run. If the index was deleted or moved, you will need to rebuild it with build_star_index.sh."
 if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
   if [[ -z "$BED_FILE" && -z "$RSEQC_GTF" ]]; then
-    die "The read-distribution step (--run-rseqc) needs a BED12 gene-model file, and it could not find one. Either give the file directly with --bed-file <file.bed12>, or make sure the GTF annotation is present inside the STAR index directory (build_star_index.sh normally copies it there) so the pipeline can build BED12 from it."
+    # read_distribution is ON by default: a missing gene model skips only that
+    # step (the rest of the pipeline — alignment, counts, demux — still runs).
+    warn "WARNING (read-distribution step): no gene-model file is available for it — neither --bed-file nor a GTF inside the STAR index directory was found, so the pipeline cannot build the BED12 it needs. The read-distribution report will NOT be produced; the rest of the pipeline continues normally. To turn the report back on: give the file directly with --bed-file <file.bed12>, or make sure the GTF annotation is present inside the STAR index directory (build_star_index.sh normally copies it there)."
+    RUN_OPT_RSEQC=0
   fi
   if [[ -n "$BED_FILE" && ! -f "$BED_FILE" ]]; then
     die "The BED12 gene-model file passed with --bed-file was not found: $BED_FILE. Check the path and re-run. If you do not have a BED12 file, leave --bed-file out and instead make sure the original GTF annotation is inside the STAR index directory, so the pipeline can convert it to BED12 automatically."
@@ -754,7 +747,7 @@ if [[ "$RUN_OPT_FASTQ" -eq 1 ]]; then
   touch "$FQ_MARKER"  # idempotent completion marker
   log "fastqc outputs in: $FASTQC_DIR"
 else
-  log ""; log "fastqc — not requested (use --run-fastq to enable)"
+  log ""; log "fastqc — skipped (--skip-fastq)"
 fi
 
 #=== STARsolo  [MANDATORY] =================================================
@@ -1009,7 +1002,7 @@ if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
     log "removed baked BED12 intermediate (cleaned up after use): $RSEQC_BED"
   fi
 else
-  log ""; log "RSeQC — not requested (use --run-rseqc to enable)"
+  log ""; log "RSeQC — skipped (--skip-rseqc, or auto-skipped: no gene model / read-distribution tools)"
 fi
 
 #--- dup-stats helpers (kept here to anchor the section) --------------------
@@ -1098,7 +1091,7 @@ if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
     fi
   fi
 else
-  log ""; log "BAM demux — not requested (use --run-dmux-bam + picard)"
+  log ""; log "BAM demux — skipped (--skip-dmux-bam)"
 fi
 
 #=== Sample demultiplex (FASTQ, fqtk)  [OPTIONAL] ==========================
@@ -1125,7 +1118,7 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
     fi
   fi
 else
-  log ""; log "FASTQ demux — not requested (use --run-dmux-fq + fqtk)"
+  log ""; log "FASTQ demux — skipped (--skip-dmux-fq)"
 fi
 
 #=== Merging multi-lane FASTQ ==============================================
