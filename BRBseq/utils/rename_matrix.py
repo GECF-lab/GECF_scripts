@@ -21,8 +21,8 @@ Behaviour:
     preserving all STAR columns.
   * A barcode claimed by two different Sample_IDs is FATAL (exit 2): the remap
     would be ambiguous.
-  * Duplicate barcode lines mapping to the same Sample_ID (sample barcoded in
-    two wells) collapse into the one matrix column under that name; WARNING.
+  * A Sample_ID mapped to more than one barcode is FATAL (exit 2): one sample
+    must occupy exactly one well; name replicates with distinct Sample_IDs.
   * .mtx inputs may be symlinks (the pipeline symlinks consolidated output);
     outputs are regular files in --out-dir.
 
@@ -98,26 +98,25 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", required=True, help="output dir for the remapped matrix")
     p.add_argument("--dedup-methods", default="NoDedup 1MM_Directional",
                    help="space-separated umiDedup method names to remap (default: both BRB-seq methods)")
-    p.add_argument("--no-header", action="store_true", help="mapping file has no header row")
     args = p.parse_args(argv)
 
     methods = [m for m in args.dedup_methods.split() if m]
     for req in ("barcodes.tsv", "features.tsv") + tuple(f"umiDedup-{m}.mtx" for m in methods):
         if not os.path.isfile(os.path.join(args.raw_dir, req)):
-            print(f"ERROR: required matrix input missing: {os.path.join(args.raw_dir, req)}",
+            print(f"ERROR: The step that gives every sample its proper name (matching the Sample_ID from your list) is missing one of the input files it needs — the STAR counting step should have produced a file called '{req}' inside the folder {args.raw_dir}, but it is not there. This points to a problem in the earlier STAR / UMI-counting step (which is why a needed file never appeared), not in this step itself. See the messages printed above for the likely reason in the STAR step, fix that, and re-run the pipeline (using --resume auto so steps that already finished are not redone).",
                   file=sys.stderr)
             return 3
 
     # ---- read mapping --------------------------------------------------------
     bar2name: dict[str, str] = {}
-    dup_collapses = 0
+    name2bars: dict[str, list[str]] = {}
     try:
         with open(args.mapping, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except OSError as e:
-        print(f"ERROR: cannot read mapping {args.mapping}: {e}", file=sys.stderr)
+        print(f"ERROR: Could not read the sample-to-barcode list file used to give samples their names: {args.mapping}. The specific reason reported by the system is: {e}. In plain terms: either the file is not where it is expected to be, or the computer running the pipeline does not have permission to read it. Check that the file path is correct and readable, then re-run.", file=sys.stderr)
         return 1
-    if not args.no_header and lines and lines[0].split("\t")[0].strip().lower() == "sample_id":
+    if lines and lines[0].split("\t")[0].strip().lower() == "sample_id":
         lines = lines[1:]
     for ln, line in enumerate(lines, 1):
         parts = line.split("\t") if "\t" in line else line.split()
@@ -130,31 +129,47 @@ def main(argv: list[str] | None = None) -> int:
         if prev is not None:
             if prev != name:
                 print(
-                    f"ERROR: mapping conflict: barcode {barcode} is claimed by both "
-                    f"'{prev}' and '{name}' (line {ln}). Two samples cannot share one "
-                    "barcode in a single pool.",
+                    f"ERROR: In the sample-to-barcode list (line {ln}), the barcode {barcode} is claimed by two different samples: "
+                    f"'{prev}' and '{name}'. In one pooled run, a single 14-base barcode belongs to exactly one sample "
+                    f"— one well on the plate — so two samples cannot both use it. The list is used to rename each column of "
+                    f"the count table, so this step has to stop. Please correct the list (one sample per barcode, one well "
+                    f"per sample) and re-run.",
                     file=sys.stderr,
                 )
-                return 2
-            dup_collapses += 1  # same sample, second well
-            continue
+            else:
+                print(
+                    f"ERROR: In the sample-to-barcode list, the same sample name '{name}' appears on more than one "
+                    f"different barcode (first seen earlier, again on line {ln}). One sample must occupy exactly "
+                    f"one well — so it can only ever have one barcode. If this is really two different samples "
+                    f"(for example a biological or technical replicate), give it its own distinct name. Otherwise "
+                    f"delete the duplicated line. Then re-run.",
+                    file=sys.stderr,
+                )
+            return 2
         bar2name[barcode] = name
+        name2bars.setdefault(name, []).append(barcode)
+        if len(name2bars[name]) > 1:
+            print(
+                f"ERROR: In the sample-to-barcode list, the sample '{name}' is linked to more than one barcode "
+                f"({', '.join(name2bars[name])}), meaning it is written against more than one well. One sample "
+                f"must occupy exactly one well (one barcode). If these are really separate samples (for example a "
+                f"biological or technical replicate), give each of them its own distinct sample name — one well "
+                f"each — and re-run.",
+                file=sys.stderr,
+            )
+            return 2
 
     if not bar2name:
-        print("ERROR: mapping produced no usable Sample_ID/Barcode pairs", file=sys.stderr)
+        print("ERROR: The sample-to-barcode list that is supposed to tell this step which name belongs to which barcode could not be turned into any usable 'name + barcode' pairs at all — every line was either missing the name, missing the barcode, or the barcode was not a valid DNA letter sequence (A/C/G/T/N). The list used was: "
+              f"{args.mapping}. Check that file (it should be a two-column tab-separated list: sample name, then barcode, one sample per line) and re-run once it has at least one correct line.", file=sys.stderr)
         return 2
-    if dup_collapses:
-        print(
-            f"WARNING: {dup_collapses} mapping line(s) reused an already-mapped barcode "
-            "(sample barcoded in more than one well) — one matrix column labelled by that name.",
-            file=sys.stderr,
-        )
 
     # ---- remap columns ---------------------------------------------------------
     with open(os.path.join(args.raw_dir, "barcodes.tsv"), encoding="utf-8") as fh:
         bcols = [l.strip() for l in fh if l.strip()]
     if not bcols:
-        print("ERROR: barcodes.tsv is empty", file=sys.stderr)
+        print("ERROR: The list of barcodes that this step needs to rename into proper sample names (file: "
+              f"{os.path.join(args.raw_dir, 'barcodes.tsv')}) is empty — meaning the earlier STAR step did not report a single barcode it found in the data. This almost always means the alignment step itself produced essentially no usable result (for example, the barcode file given to the pipeline did not match the barcodes actually present in the data at all). Check the results of the earlier alignment step and the barcode list you supplied, fix the mismatch, and re-run the pipeline (using --resume auto so steps that already finished are not redone).", file=sys.stderr)
         return 3
 
     new_cols = [bar2name.get(b, f"UNMATCHED_{b}") for b in bcols]
@@ -170,12 +185,14 @@ def main(argv: list[str] | None = None) -> int:
             ambiguous += 1
     if ambiguous:
         print(
-            f"WARNING: {ambiguous} column(s) resolved to an already-used Sample_ID "
-            "(same sample barcoded in several distinct wells) — suffixed with the "
-            "barcode to keep each well's column distinct: "
-            + ", ".join(final_cols) + "\n"
-            "  Both columns still carry the full sample's reads for that well. "
-            "Merge them downstream (sum) if you want one column per sample.",
+            f"NOTE: {ambiguous} barcode column(s) in the count table corresponded to a sample name that had already "
+            f"been used for an earlier column (the most common reason is that the same sample was barcoded in more "
+            f"than one well, or in more than one pool batch). So each such column is kept, but with the well's "
+            f"barcode added to its name (for example sampleX__ACGT...) so that no two columns collide and nothing "
+            f"is silently merged. Both columns still carry all of that sample's reads from their own well. If you "
+            f"want a single column per sample instead, add the two together (sum) when you analyse the results. "
+            f"Column names written out: "
+            + ", ".join(final_cols),
             file=sys.stderr,
         )
 
@@ -185,8 +202,12 @@ def main(argv: list[str] | None = None) -> int:
     no_reads = [n for n in bar2name.values() if n not in used]
     if unmatched:
         print(
-            f"WARNING: {len(unmatched)}/{len(bcols)} matrix barcode column(s) not in the mapping — "
-            f"kept as UNMATCHED_*: {', '.join(unmatched)}",
+            f"NOTE: {len(unmatched)} of the {len(bcols)} barcode columns actually present in this pool's data were "
+            f"NOT listed in your sample-to-barcode list, so they have no sample name to be given. To make sure "
+            f"none of their reads are silently dropped, each is kept as its own column under a name beginning with "
+            f"'UNMATCHED_' (for example UNMATCHED_ACGT...). If these belong to real samples, add them to your "
+            f"sample/workbook list with their correct name and re-run so they end up properly labelled. The kept "
+            f"UNMATCHED_* columns are: {', '.join(unmatched)}",
             file=sys.stderr,
         )
     if no_reads:
@@ -211,20 +232,18 @@ def main(argv: list[str] | None = None) -> int:
     for mth in methods:
         rows, cols, coords = read_mtx(os.path.join(args.raw_dir, f"umiDedup-{mth}.mtx"))
         if cols != len(bcols):
-            print(
-                f"ERROR: umiDedup-{mth}.mtx has {cols} column(s) but barcodes.tsv lists "
-                f"{len(bcols)} — refusing to write an inconsistent matrix.",
-                file=sys.stderr,
-            )
+            print(f"ERROR: Refusing to write out the renamed count table for the '{mth}' counting method: the count table itself has {cols} sample columns, but the barcode list it should be renamed against lists {len(bcols)} — these two should always agree, and if they disagree the earlier STAR step's output is internally inconsistent. This is not a problem with your sample naming or the mapping file; it points to the STAR step's own result folder. Fix the earlier step and re-run the pipeline (using --resume auto so steps that already finished are not redone).",
+                  file=sys.stderr)
             return 3
         write_mtx(os.path.join(out, f"umiDedup-{mth}.mtx"), rows, cols, coords)
 
     print(
-        f"rename_matrix: {len(bcols)} sample column(s): {len(matched)} remapped to sample names, "
-        f"{len(unmatched)} unmatched (kept as UNMATCHED_*); {len(methods)} matrix file(s) written",
+        f"Done remapping sample columns: out of {len(bcols)} sample(s) found in the data, {len(matched)} were recognised from your sample list and renamed properly, "
+        f"{len(unmatched)} could not be matched to any entry in your list (they are kept under a name beginning with 'UNMATCHED_', so nothing is silently dropped), "
+        f"and {len(methods)} finished count table(s) have been written out. "
+        f"The renamed files are in: {out}",
         file=sys.stderr,
     )
-    print(f"rename_matrix: output -> {out}", file=sys.stderr)
     return 0
 
 

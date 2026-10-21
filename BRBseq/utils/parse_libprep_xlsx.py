@@ -36,7 +36,7 @@ Which column becomes Sample_ID:
 Plate file format (two columns, tab or comma separated, with or without a
 header):  well position + barcode sequence.  Well cells are matched
 permissively: 'A01' == 'A1' == 'a01'; barcodes are upper-cased and must be
-[ACGT]{12,}.  Any layout with one position + one barcode per line is
+[ACGT]{14}.  Any layout with one position + one 14-nt barcode per line is
 accepted (e.g. the 'barcodes_96_*_brb_STAR_solo.txt' well-matched files).
 
 The workbook's 'Kit ref' row cross-checks the plate FAMILY: the same well
@@ -52,9 +52,10 @@ the same day (original backup in ~/.hermes/cache/scratch).
 Sheet selection:  the first sheet (top to bottom) containing a header row
 with BOTH a sample column (name or code) and a well-position column.  This
 finds the 'Libraries analysis' table even when other sample tables appear
-earlier.  Empty sample rows after the data are ignored; a sample whose
-NAME is missing is fatal (no way to name its column); a sample with an
-empty well cell is skipped with a warning.
+earlier. Empty sample rows after the data are ignored; a sample whose
+NAME is missing is fatal (no way to name its column); a sample whose WELL
+CELL is empty or not a valid position is FATAL — the lib-prep workbook must
+contain a verified well position for every sample.
 
 Kit ref cross-check (prevents using a mis-labelled plate file):
 
@@ -64,9 +65,10 @@ Kit ref cross-check (prevents using a mis-labelled plate file):
     wrong plate file silently tags every sample to the wrong barcode:
 
   * --plate omitted (default): the script reads the Kit ref, determines the
-    barcode family (V5A / V5D), and scans --xlsx's directory for the
-    matching barcodes_96_<family>_*.txt file.  This is the recommended
-    path — you can no longer pass the wrong plate file by mistake.
+    barcode family (V5A / V5D), and scans the plate directory for the
+    matching barcodes_96_<family>_*.txt file.  The directory is the
+    hardcoded PLATE_DIR (prod: /home/gecf/NGS_pipelines/BRB-seq/BRB_plates);
+    pass --plate explicitly to use a file in some other location.
 
   * --plate given: the plate file name's family (V5A / V5D) must be
     compatible with the workbook's Kit ref, else the script exits with
@@ -86,12 +88,19 @@ import re
 import sys
 
 WELL_RE = re.compile(r"^\s*([A-Ha-h])\s*(\d{1,2})\s*$")
-BARCODE_RE = re.compile(r"^[ACGT]{12,}$")
+BARCODE_RE = re.compile(r"^[ACGT]{14}$")
 MAX_ID_LEN = 64
 # Matches a barcode family token (V5A10, V5A, V5D, ...) and captures the
 # A/D discriminator.  Used for both the workbook Kit ref and the plate file
 # name, which use the same vocabulary.
 KIT_FAMILY_RE = re.compile(r"(?<![A-Za-z])V5([AD])\d*", re.IGNORECASE)
+# Plate directory (prod server): the well-matched barcode plates
+# (barcodes_96_V5A10_brb.txt / barcodes_96_V5D_brb_STAR_solo.txt) live here,
+# not next to the lib-prep workbooks.  Used when --plate is omitted and the
+# plate is inferred from the workbook's 'Kit ref' row.
+PLATE_DIR = os.environ.get(
+    "BRB_PLATE_DIR", "/home/gecf/NGS_pipelines/BRB-seq/BRB_plates"
+)
 
 
 # ---------------------------------------------------------------- helpers
@@ -292,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if not os.path.isfile(args.xlsx):
-        print(f"ERROR: workbook not found: {args.xlsx}", file=sys.stderr)
+        print(f"ERROR: The library-prep workbook this step needs could not be found at: {args.xlsx}. Check that the file name and folder are spelled exactly right (file names are case-sensitive) and that it is still there, then re-run. Nothing else needs to change — the workbook is the only missing piece.", file=sys.stderr)
         return 1
 
     # ---- open workbook (needed before plate selection for kit ref) -------
@@ -300,9 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         import openpyxl
     except ImportError:
         print(
-            "ERROR: openpyxl is not installed in the active python.  "
-            "(on this host: /home/hermes/.conda/envs/brbseq/bin/python3 has it, "
-            "or pass 'python' via the pipeline.)",
+            "ERROR: This step reads the .xlsx workbook with a program called openpyxl, and it is not available in the Python that is currently active. This is an environment-setup issue, not a problem with your workbook. Activate (or create) the pipeline's Conda environment — for example 'conda activate brbseq' — and re-run; running the whole pipeline the usual way already puts you in the right environment.",
             file=sys.stderr,
         )
         return 2
@@ -315,8 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         fam_note = f"  [family: {kit_family}]" if kit_family else "  [no barcode family recognised]"
         print(f"parse_libprep_xlsx: kit ref   = {kit_raw}{fam_note}")
     else:
-        print("WARNING: no 'Kit ref' row found in the workbook — "
-              "kit/plate family cross-check and auto-plate-inference are disabled.",
+        print("NOTE: no 'Kit ref' row was found in this workbook, so the pipeline cannot cross-check that the barcode plate being used matches the plate family that was actually used in the lab (for example V5A vs V5D). If you are telling the pipeline which plate file to use yourself, that is fine and you can keep going. If you normally rely on the pipeline picking the plate automatically from the workbook, add or check the workbook's 'Kit ref' row so it records the plate family used.",
               file=sys.stderr)
 
     # ---- determine plate file -------------------------------------------
@@ -325,46 +331,49 @@ def main(argv: list[str] | None = None) -> int:
         # infer from kit family
         if not kit_family:
             print(
-                "ERROR: --plate not supplied and no usable 'Kit ref' row found in the "
-                "workbook, so the barcode family cannot be determined.\n"
-                "  Pass --plate explicitly, or add a 'Kit ref' row to the workbook.",
+                "ERROR: I could not work out which barcode plate to use: no plate file was named explicitly, and the workbook has no usable 'Kit ref' row that says which plate family (e.g. V5A or V5D) was used. Either tell the pipeline the plate file directly with --plate <file>, or add/fix the workbook's 'Kit ref' row so the plate family is recorded, then re-run.",
                 file=sys.stderr,
             )
             return 1
-        xlsx_dir = os.path.dirname(os.path.abspath(args.xlsx))
-        plate_path = _infer_plate_from_kit(xlsx_dir, kit_family)
+        # the plate directory is hardcoded (PLATE_DIR), not the xlsx's own dir
+        plate_path = _infer_plate_from_kit(PLATE_DIR, kit_family)
         if not plate_path:
             try:
                 candidates = sorted(
-                    e for e in os.listdir(xlsx_dir)
+                    e for e in os.listdir(PLATE_DIR)
                     if e.endswith(".txt") and (e.lower().startswith("barcodes_96_")
                                                or e.lower().startswith("barcode_")))
             except OSError:
                 candidates = []
             print(
-                f"ERROR: no barcodes_96_{kit_family}_*.txt plate file found in "
-                f"{xlsx_dir}.\n  Candidates there: {candidates or '(none)'}",
+                f"ERROR: The workbook's 'Kit ref' says this run used the {kit_family} plate family, but a matching barcode plate file (a file named like barcodes_96_{kit_family}_*.txt) was not found in the folder the pipeline looks in: {PLATE_DIR}.\n"
+                f"  Files that do sit there: {candidates or '(none — the folder appears empty or unreadable)'}\n"
+                f"  Either put the correct {kit_family} plate file into that folder, or point the pipeline at it directly with --plate <file>, then re-run.",
                 file=sys.stderr,
             )
             return 1
         print(f"parse_libprep_xlsx: plate     = {plate_path}  (inferred from kit ref {kit_family})")
     else:
         if not os.path.isfile(plate_path):
-            print(f"ERROR: barcode plate file not found: {plate_path}", file=sys.stderr)
+            print(f"ERROR: The barcode plate file you asked to use could not be found at: {plate_path}. Check that the file name and folder are spelled exactly right (file names are case-sensitive) and that it is still there, then re-run.", file=sys.stderr)
             return 1
         # cross-check the explicit plate file against the kit ref
         if kit_family and not args.force_plate:
             plate_fam = _family_from_text(os.path.basename(plate_path))
             if plate_fam and plate_fam != kit_family:
                 print(
-                    f"ERROR: plate file family '{plate_fam}' "
-                    f"({os.path.basename(plate_path)}) disagrees with the workbook's "
-                    f"kit ref family '{kit_family}'.\n"
-                    f"  Kit ref: {kit_raw}\n"
-                    f"  Plate file: {plate_path}\n"
-                    f"  The same well encodes a different CB in V5A vs V5D — the wrong "
-                    f"plate file silently mis-assigns every barcode.\n"
-                    f"  If this mismatch is intentional (e.g. a re-prep), re-run with --force-plate.",
+                    f"ERROR: The barcode plate file you named is from the '{plate_fam}' plate "
+                    f"family ({os.path.basename(plate_path)}), but the workbook's 'Kit ref' "
+                    f"row says this preparation used the '{kit_family}' family:\n"
+                    f"  Workbook Kit ref: {kit_raw}\n"
+                    f"  Plate file named: {plate_path}\n"
+                    f"  These must agree: the same well position is printed with a "
+                    f"DIFFERENT 14-base barcode on a V5A plate than on a V5D plate, so "
+                    f"using the wrong one would quietly tag every sample to the wrong "
+                    f"barcode. Please confirm which family really was used in the lab and "
+                    f"use the matching plate file. If it is genuinely a deliberate re-prep "
+                    f"where the two are meant to differ, re-run with --force-plate to let "
+                    f"this mismatch through knowingly.",
                     file=sys.stderr,
                 )
                 return 4
@@ -385,15 +394,24 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if well in plate and plate[well] != barcode:
                 print(
-                    f"ERROR: plate file: well {well} maps to both {plate[well]} and {barcode} (line {ln})",
+                    f"ERROR: The barcode plate file is internally inconsistent: well {well} is "
+                    f"listed against two different barcodes ({plate[well]} on an earlier "
+                    f"line, {barcode} on line {ln}). A plate file should give exactly one "
+                    f"barcode per well, so this one appears to be damaged or was written "
+                    f"by a different tool than expected. Please obtain the correct, complete "
+                    f"plate file for this plate family and try again.",
                     file=sys.stderr,
                 )
                 return 3
             plate[well] = barcode
     if not plate:
         print(
-            f"ERROR: plate file {plate_path}: no usable 'well + [ACGT]{{12,}}' lines found\n"
-            "Expected one line per well, e.g.  A01<TAB>ACGT...  (or with header 'Position\\tBarcode').",
+            f"ERROR: The barcode plate file ({plate_path}) did not contain any lines that look like "
+            "'a well position and a 14-base barcode' — it needs one such line per well, for "
+            "example:  A01\tACGT...  (a single 'Well\\tBarcode' header row at the top is "
+            "fine). It looks like this may not be a well-matched barcode list at all, or it "
+            "is empty/corrupt. Please use the correct well-matched barcode file for this "
+            "plate family, or point the pipeline at the right file with --plate <file>.",
             file=sys.stderr,
         )
         return 3
@@ -407,8 +425,13 @@ def main(argv: list[str] | None = None) -> int:
             break
     if header_row < 0:
         print(
-            "ERROR: no sheet found that contains BOTH a sample-name/code column "
-            "and a well-position column (case-insensitive header match).",
+            "ERROR: I could not find the sample/well table inside this workbook. It looks for "
+            "any table whose header row names a 'sample' column (sample name or code) AND "
+            "a 'well' column together, and found none. If this is genuinely the right "
+            "lib-prep workbook, the table's column headings may have been renamed or "
+            "rearranged — check that a column still says something like 'sample name' and "
+            "another still says 'well', then re-run (or open the workbook and put the "
+            "standard headers back).",
             file=sys.stderr,
         )
         return 2
@@ -417,10 +440,13 @@ def main(argv: list[str] | None = None) -> int:
     col_well = info["well_col"]
     if info["kind"] == "code":
         print(
-            f"WARNING: no 'sample name' column found in sheet '{chosen_sheet}' "
-            f"(sample header: '{info['sample_header']}', well header: '{info['well_header']}'). "
-            "Falling back to the sample CODE as Sample_ID. Add an 'RNA sample name' "
-            "column to use human names instead.",
+            f"NOTE: in the table I found (sheet '{chosen_sheet}'), I could not find a column "
+            f"for the sample NAME (I found the column headed '{info['sample_header']}' instead), "
+            f"so the pipeline will use each sample's CODE as its name in the results. Nothing is "
+            f"lost and the run proceeds — it simply means the columns of the count table will "
+            f"be labelled with sample codes rather than the friendlier, human sample names. If "
+            f"you'd like to see the actual sample names instead, add an 'RNA sample name' column "
+            f"to the workbook and re-run.",
             file=sys.stderr,
         )
 
@@ -435,8 +461,7 @@ def main(argv: list[str] | None = None) -> int:
                 fh.write(researcher_first_name + "\n")
                 print(f"parse_libprep_xlsx: run name   = {researcher_first_name} (from 'Researcher:' row)")
         if not researcher_first_name:
-            print("WARNING: no 'Researcher' row found in the workbook — "
-                  "run name not inferred (pass --run-name to set it explicitly).",
+            print("NOTE: this workbook has no 'Researcher' row, so there is no name to use when labelling this run automatically. The run still proceeds; if you want a specific run name, supply one with --run-name <your name>.",
                   file=sys.stderr)
 
     # ---- read the sample rows --------------------------------------------
@@ -457,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
             "well_raw": str(well_raw).strip() if well_raw is not None else "",
         })
     if not rows:
-        print(f"ERROR: sheet '{chosen_sheet}' header found (row {header_row}) but no sample rows below it.",
+        print(f"ERROR: In the workbook's sample table (sheet '{chosen_sheet}'), the column headers were found (row {header_row}) but there are no sample rows below them — the table appears to be empty. Fill in the sample/well rows for this run (or confirm you are using the right workbook) and re-run.",
               file=sys.stderr)
         return 2
 
@@ -465,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     used_ids: dict[str, int] = {}          # lower(id) -> line of first occurrence
     seen_id_raw: dict[str, str] = {}       # lower(id) -> raw name of first occurrence
     used_barcodes: set[str] = set()
+    barcode_owner: dict[str, str] = {}     # barcode -> sample id (1 well = 1 sample)
     manifest_lines: list[str] = []
     prov_lines: list[str] = ["Sample_ID\tSample_raw\tWell\tBarcode"]
     missing_wells: list[str] = []
@@ -472,73 +498,108 @@ def main(argv: list[str] | None = None) -> int:
         raw_name = row["name_raw"]
         if not raw_name:
             print(
-                f"ERROR: sheet '{chosen_sheet}' row {row['line']}: sample name is empty "
-                f"(well '{row['well_raw'] or 'n/a'}').  Provide the RNA sample name or "
-                "remove the row — samples cannot be skipped silently, their well would be orphaned.",
+                f"ERROR: Row {row['line']} of the sample table (sheet '{chosen_sheet}') has a well "
+                f"position filled in but no sample name (well '{row['well_raw'] or 'not filled in'}'). "
+                f"Every well in the workbook must belong to a named sample — it cannot be left "
+                f"bluntly empty, because that well's barcode would otherwise be unaccounted for "
+                f"in the results. Please either give this sample its name, or delete this row "
+                f"if it is not part of this run, then re-run.",
                 file=sys.stderr,
             )
             return 2
         sid = sanitize_sample_id(raw_name)
         if not sid:
             print(
-                f"ERROR: sheet '{chosen_sheet}' row {row['line']}: sample name {raw_name!r} "
-                f"sanitises to an empty ID.  Use names with at least one letter or digit.",
+                f"ERROR: Row {row['line']} of the sample table (sheet '{chosen_sheet}') has the name "
+                f"'{raw_name}', but after the pipeline strips out characters that are not allowed "
+                f"in a file/column name (spaces, slashes, and similar), nothing is left. Please "
+                f"rename this sample using at least one letter or number (for example a patient "
+                f"or cohort identifier) — symbols like '#', '!', or '... ' on their own cannot "
+                f"become a usable name — then re-run.",
                 file=sys.stderr,
             )
             return 2
         if args.empty_wells and sid.lower().startswith("empty_well"):
             print(
-                f"ERROR: sheet '{chosen_sheet}' row {row['line']}: sample name {raw_name!r} "
-                f"sanitises to '{sid}', which starts with the reserved 'empty_well' prefix "
-                "used for the generated empty-well columns in --empty-wells mode.  "
-                "Rename the sample or drop --empty-wells.",
+                f"ERROR: Row {row['line']} of the sample table (sheet '{chosen_sheet}') has the name "
+                f"'{raw_name}', which after cleaning becomes '{sid}'. That starts with "
+                f"'empty_well', a label the pipeline reserves for the blank plate wells it "
+                f"generates automatically (in --empty-wells mode), so using it for a real "
+                f"sample would make the two indistinguishable. Please rename this sample (drop "
+                f"the 'empty_well' part) — or, if you do not actually need the automatically "
+                f"generated blank-well columns, re-run without the --empty-wells option.",
                 file=sys.stderr,
             )
             return 2
         key = sid.lower()
         if key in used_ids:
             print(
-                f"ERROR: ambiguous sample names on sheet '{chosen_sheet}': "
-                f"rows {used_ids[key]} and {row['line']}: {seen_id_raw[key]!r} (row {used_ids[key]}) "
-                f"and {raw_name!r} (row {row['line']}) both sanitise to '{sid}'. "
-                "Give them distinct names (the well alone is not recoverable downstream).",
+                f"ERROR: Two samples in the sheet '{chosen_sheet}' end up with the SAME cleaned name: "
+                f"'{seen_id_raw[key]}' (row {used_ids[key]}) and '{raw_name}' (row {row['line']}) "
+                f"both become '{sid}'. The pipeline needs each sample to have its own distinct "
+                f"name, because once the run has finished you can no longer tell these two apart "
+                f"in the results just from their well. Please give the two samples clearly "
+                f"different names (for example append a batch number or cell source to each) "
+                f"and re-run.",
                 file=sys.stderr,
             )
             return 2
         used_ids[key] = row["line"]
         seen_id_raw[key] = raw_name
         if not row["well"]:
-            detail = "empty well cell" if not row["well_raw"] else \
-                f"well cell {row['well_raw']!r} is not a valid well position (expected e.g. 'A01')"
-            print(f"WARNING: {sid} (row {row['line']}): {detail} — skipped (no barcode).",
-                  file=sys.stderr)
-            continue
+            detail = "its well cell is empty" if not row["well_raw"] else \
+                f"its well cell ('{row['well_raw']}') is not recognised as a valid well position — expected a letter A-H followed by a number, for example 'A01'"
+            print(
+                f"ERROR: Row {row['line']} of the sample table (sheet '{chosen_sheet}'), for sample "
+                f"'{sid}', {detail}. The workbook must record the verified well position for "
+                f"every sample (where it was barcoded on the plate). Please correct this cell "
+                f"in the workbook, or delete this row if the sample is not part of this run, "
+                f"then re-run.",
+                file=sys.stderr,
+            )
+            return 2
         barcode = plate.get(row["well"])
         if barcode is None:
             missing_wells.append(f"{sid} (well {row['well_raw'] or row['well']})")
             continue
-        # two samples sharing one well (duplicate barcoded in two wells of the
-        # same sample) is allowed: STARsolo will emit two CB columns and both
-        # carry this sample id
+        # one well is one sample: two different samples mapped to the same
+        # well are FATAL here, before alignment (rename_matrix.py would only
+        # catch it after STAR, and the failure would be late and confusing)
+        previous = barcode_owner.get(barcode)
+        if previous is not None and previous != sid:
+            print(
+                f"ERROR: Well {row['well']} (barcode {barcode}) is listed for two different samples: "
+                f"'{previous}' and '{sid}'. In this assay one well holds exactly one sample, "
+                f"so two samples sharing a well is not a valid setup — this would make it "
+                f"impossible to know which sample that well's molecules actually come from. "
+                f"Please give one of these two samples its own, separate well on the plate "
+                f"(and record that correctly in the workbook), then re-run.",
+                file=sys.stderr,
+            )
+            return 2
+        barcode_owner[barcode] = sid
         used_barcodes.add(barcode)
         manifest_lines.append(f"{sid}\t{barcode}")
         prov_lines.append(f"{sid}\t{raw_name}\t{row['well']}\t{barcode}")
 
     if not manifest_lines:
-        print(f"ERROR: no sample rows could be joined to the plate.  "
-              f"Unmatched wells: {', '.join(missing_wells) or 'none read at all'}.",
-              file=sys.stderr)
-        print("  Check that the well column uses positions that exist in the "
-              f"plate file ({sorted(plate)[:8]}{'...' if len(plate)>8 else ''}).",
+        print(f"ERROR: None of the samples in the workbook could be matched to a well on the barcode plate, so no usable sample list could be produced. "
+              f"Unmatched wells: {', '.join(missing_wells) or 'none were read at all'}.\n"
+              f"  This almost always means the well letters/numbers written in the workbook do not line up with the wells that exist on the plate file actually being used "
+              f"(for example a V5A workbook paired with a V5D plate). The plate's wells (first 8 shown): {sorted(plate)[:8]}{'...' if len(plate)>8 else ''}.\n"
+              f"  Please check that the plate file and the workbook describe the same physical plate, fix whichever side is wrong, and re-run.",
               file=sys.stderr)
         return 2
     if missing_wells:
-        print(f"WARNING: {len(missing_wells)} sample(s) had wells not in the plate file — "
-              f"excluded from the manifest:", file=sys.stderr)
+        print(f"NOTE: the following sample(s) named in the workbook had a well position that does not exist on the plate file, so they were NOT included in the final sample list:",
+              file=sys.stderr)
         for m in missing_wells:
             print(f"    {m}", file=sys.stderr)
-        print(f"  Continuing with {len(manifest_lines)} sample(s).  "
-              f"Plate wells (first 12): {sorted(plate)[:12]}", file=sys.stderr)
+        print(f"  The run still proceeds with the {len(manifest_lines)} sample(s) that could be matched, and nothing else is lost. "
+              f"The plate's wells (first 12 shown): {sorted(plate)[:12]}. "
+              f"This almost always means the well letters/numbers written in the workbook do not line up with the wells on the plate file actually being used "
+              f"(for example a V5A workbook paired with a V5D plate). Check that those two describe the same physical plate, fix whichever side is wrong, and re-run to include these samples.",
+              file=sys.stderr)
 
     # ---- empty wells (optional: --empty-wells) ---------------------------
     # Emit every UNOCCUPIED plate well as empty_well_<WELL> (old-pipeline
@@ -557,8 +618,7 @@ def main(argv: list[str] | None = None) -> int:
             # generated IDs above, but an alias could still collide in theory
             if name in {m.split("\t")[0] for m in manifest_lines}:
                 print(
-                    f"ERROR: generated empty-well ID {name!r} collides with a "
-                    "real sample ID — cannot emit it.",
+                    f"ERROR: There is a name clash: a real sample in the workbook has already taken the label '{name}', which the pipeline was about to use for one of the automatically generated blank-well columns (in --empty-wells mode). It cannot create a blank-well column under a name that already belongs to a sample. Please rename that sample so it no longer starts with 'empty_well', or re-run without the --empty-wells option.",
                     file=sys.stderr,
                 )
                 return 2

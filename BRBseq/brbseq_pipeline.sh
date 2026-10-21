@@ -15,6 +15,15 @@
 #   FASTQ demultiplex (fqtk)        [optional   ]  --run-dmux-fq
 #   Merge multi-lane FASTQ          [note       ]  pre-merge or comma-list
 #
+# Logging (automatic, no flag)
+#   * Every pipeline message AND the stdout/stderr of the tools it launches
+#     (fastqc, samtools, picard, fqtk, python helpers) is mirrored to
+#     <run-dir>/pipeline.log — no need to wrap the call in `tee`.
+#   * The exact command line of each step is logged (run_or_skip prints
+#     "RUN  <step>: <cmd>"; STAR's full invocation is logged the same way and
+#     is also written as the first line of <run-dir>/star/STAR.log for
+#     provenance). STAR's own runtime output stays in star/STAR.log.
+#
 # Note on the STAR invocation
 #   The STAR request below asks for BOTH dedup methods (NoDedup and
 #   1MM_Directional) in one alignment pass, so both result matrices are
@@ -26,9 +35,14 @@
 #
 # Usage notes
 #   * All inputs are supplied via flags; no paths are hard-coded.
-#   * Portable across hosts: --conda-env activates a package environment
-#     before running, --star selects the STAR binary, and helper scripts are
-#     resolved from ./utils (shipped with this directory).
+#   * Portable across hosts: activate your environment before running
+#     (e.g. 'conda activate brbseq') so STAR, samtools, RSeQC, fastqc,
+#     picard, fqtk and python+openpyxl are on PATH.  If the env does not
+#     exist yet on the target machine, create it first from the env file
+#     shipped next to this script:
+#     conda env create -f brbseq-env.yaml            (creates env 'brbseq')
+#     conda activate brbseq
+#     (helper scripts are resolved from ./utils, shipped with this directory).
 #   * Re-runnable: a step is skipped when its output already exists
 #     (disable skipping with --resume force).
 #   * The optional steps (FASTQ QC, RSeQC, BAM demux, FASTQ demux) are off by
@@ -46,7 +60,7 @@ DEMUX_BAM="${UTILS_DIR}/demultiplex_bam.sh"
 DUP_STATS="${UTILS_DIR}/get_duplication_statistics.py"
 PARSE_LIBPREP="${UTILS_DIR}/parse_libprep_xlsx.py"
 RENAME_MATRIX="${UTILS_DIR}/rename_matrix.py"
-PCA_CSV="${UTILS_DIR}/prepare_for_pca.py"
+UMI_MATRIX_PREP="${UTILS_DIR}/prepare_umi_matrix.py"
 
 #--- defaults (all overridable via flags) -----------------------------------
 RUN_NAME="${RUN_NAME:-}"         # run label for the output leaf: BRBseq_<run-name>_<timestamp>
@@ -74,15 +88,13 @@ REFS=(
 )
 BED_FILE=""                      # RSeQC BED12
 OUT_DIR="${OUT_DIR:-/mnt/data/BRB-seq_output}"
-MANIFEST_HEADER=1                # 1 = has header row (default)
+MANIFEST_HEADER=1                # resolved to 1 (header row) or 0 (none) from auto-detection
 RUN_OPT_FASTQ="${RUN_OPT_FASTQ:-0}"
 RUN_OPT_RSEQC="${RUN_OPT_RSEQC:-0}"
 RUN_OPT_DEMUX_BAM="${RUN_OPT_DEMUX_BAM:-0}"
 RUN_OPT_DEMUX_FQ="${RUN_OPT_DEMUX_FQ:-0}"
 # Alithea BRB-seq production SAM tag set (fixed, not user-configurable).
 SAM_ATTRS="NH HI nM AS CR UR CB UB GX GN sS sQ sM"
-CONDA_ENV="${CONDA_ENV:-}"
-STAR_BIN="${STAR:-}"             # default autodetected
 RESUME="${RESUME:-auto}"         # auto | force
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON="${PYTHON:-python3}"
@@ -97,106 +109,56 @@ usage() {
   printf 'brbseq_pipeline.sh — MERCURIUS DRUG-seq (BRB-seq) single-pool pipeline (v%s).\n\n' "$SCRIPT_VERSION"
   cat <<'EOF'
 MERCURIUS 3' RNA-seq – Data Pre-Processing (BRB-seq / DRUG-seq) pipeline.
-  STAR genome indexing is a one-time setup step and is NOT executed here:
-  built-in human/mouse genomes are resolved from --species; for any other
-  species build an index once with build_star_index.sh (same directory) and
-  pass it via --star-genome.
-
-  MANDATORY:   barcode prep | STARsolo alignment + counts | duplication stats
-               | PCA-ready count CSV (genes x samples)
-  OPTIONAL:    fastqc (--run-fastq) | RSeQC (--run-rseqc) |
-               BAM demux (--run-dmux-bam) | FASTQ demux (--run-dmux-fq)
-
-  REFERENCES (built-in):  human, mouse  (--star-genome may override)
-  REFERENCES (custom):    any other --species name + --star-genome
 
 REQUIRED FLAGS
-  --species     <sp>      human | mouse | <custom name>
-  --r1-barcode  <fq.gz>   R1 barcode read (14 bp CB + 14 bp UMI)
-  --r2-genomic  <fq.gz>   R2 genomic / cDNA read
-  --run-name   <name>     run label for the output leaf BRBseq_<name>_<timestamp>;
-                          in lib-prep mode taken from the workbook 'Researcher'
-                          row (first name) unless given here.  Required in
-                          --barcode-tsv mode (no workbook to read).
-  pool label is INFERRED from the FASTQ names — everything before the lane
-  marker "_S<n>" (kept verbatim).  e.g. pool_poolA_S1_R1_001.fastq.gz ->
-  pool_poolA.  R1 and R2 must agree; a disagreement is a warning (R1 wins).
+  --species <sp>        human | mouse | <custom name>
+  --r1-barcode <fq.gz>  R1 barcode read (14 bp CB + 14 bp UMI)
+  --r2-genomic <fq.gz>  R2 genomic / cDNA read
+  --run-name <name>     run label for the output leaf
+                        BRBseq_<run-name>_<timestamp>; in lib-prep mode
+                        taken from the workbook 'Researcher' row (first
+                        name) unless given here. Required in --barcode-tsv
+                        mode (no workbook to read).
 
   MANIFEST SOURCE — exactly one of these two:
-  (a)  --barcode-tsv <tsv>
-        ready-made manifest: Sample_ID<TAB>Barcode (2 cols)
-  (b)  --libprep-xlsx <xlsx>  (+ optional --barcodes-plate <file>)
-        Mercurius lib-prep workbook (sample code + Oligo-dT primer well).
-        The barcode plate is joined by well.  If --barcodes-plate is omitted,
-        it is inferred from the workbook's 'Kit ref' row (V5A/V5D →
-        barcodes_96_<family>_*.txt next to the xlsx); if given, the file's
-        family is cross-checked against the Kit ref and a mismatch aborts the
-        run (pass --force-plate to override a deliberate re-prep).
-        Needs python+openpyxl — detected from the active python, the brbseq
-        conda env, or a --conda-env you pin.
-
+    (a)  --barcode-tsv <tsv>
+    (b)  --libprep-xlsx <xlsx>   (+ optional --barcodes-plate <file>)
+         Mercurius lib-prep workbook (sample code + Oligo-dT primer well). The
+         barcode plate is joined by well. If --barcodes-plate is omitted, it is
+         inferred from the workbook's 'Kit ref' row (V5A/V5D ->
+         barcodes_96_<family>_*.txt next to the xlsx); if given, the file's
+         family is cross-checked against the Kit ref and a mismatch aborts the
+         run (pass --force-plate to override a deliberate re-prep).
 
 OPTIONAL FLAGS
-  --star-genome <dir>     STAR genomeDir (built with build_star_index.sh);
-                          required for custom --species, overrides built-in
-  --bed-file    <bed12>   RSeQC BED12 gene model (override). If omitted,
-                          bakes one at run time from the GTF shipped
-                          inside the STAR index dir (build_star_index.sh
-                          moves it there) — needs gffread in PATH
-  --out-dir     <dir>     root output dir (default /mnt/data/BRB-seq_output)
-  --threads     <n>       threads (default 8)
-  --run-fastq               fastqc (needs fastqc in PATH)
-  --run-rseqc               read_distribution (needs samtools,
-                            read_distribution.py, and a BED12: --bed-file or
-                            a GTF inside the STAR index dir)
-  --run-dmux-bam            picard BAM demux (needs picard)
-  --run-dmux-fq             fqtk FASTQ demux (needs fqtk; 14 bp CB + 14 bp UMI,
-                            Alithea BRB-seq standard — hardcoded)
-  --no-header               manifest has NO header row
-                          (default: has a header)
-  --force-plate             suppress the kit/plate family cross-check in
-                          workbook mode (override a deliberate re-prep where
-                          the --barcodes-plate family differs from the work-
-                          book's 'Kit ref' row)
-  --empty-wells             workbook mode: also emit every unoccupied plate
-                          well as an empty_well_<WELL> column (old-pipeline
-                          convention) so all plate wells show up in the
-                          STARsolo matrix.  Reserved prefix: sample names
-                          must not start with 'empty_well'.
-  --conda-env  <name>       activate a conda env before running (portable hosts)
-  --star       <bin>        STAR binary name (default autodetect: STAR-avx2,
-                          STAR-avx, STAR)
-  --resume     auto|force   auto = skip completed steps (default); force = rerun
-  --dry-run                 emit planned commands and exit (no side effects)
-  -h, --help                this help
-  --version                 print version and exit
-
-ENVIRONMENT OVERRIDES (advanced)
-  STAR, UTILS_DIR, PYTHON, OUT_DIR, THREADS, AVT (legacy: treated as --run-name),
-  SPECIES, RUN_NAME, RUN_OPT_FASTQ, RUN_OPT_RSEQC, RUN_OPT_DEMUX_BAM,
-  RUN_OPT_DEMUX_FQ.
-
-OUTPUT LAYOUT (under OUT_DIR):
-  OUT_DIR/BRBseq_<run-name>_<timestamp>/
-      barcodes/          barcode_whitelist.txt, fastq_sample_metadata
-                          .tsv, bam_barcodes.tsv
-      star/              <pool>/*.out.{bam,bam.bai,tar}, <pool>_Solo.out/
-                         .../Gene/raw/{barcodes.tsv,features.tsv,
-                         umiDedup-NoDedup.mtx, umiDedup-1MM_Directional.mtx}
-                         [raw, barcode-labelled — never modified]
-      star/samples/      the same matrix with barcode columns renamed to
-                         Sample_IDs: barcodes.tsv, features.tsv,
-                         umiDedup-<method>.mtx, sample_barcode_map.tsv
-      rseqc/             <pool>_read_distribution.txt  (if --run-rseqc)
-                          (+ <gtf>.bed12 auto-baked from the index-dir GTF
-                          when --bed-file is not given)
-      duplication_statistics.csv   barcodes x reads/UMIs/umi_%
-      <pool>_counts_for_pca.csv    gene rows x sample cols (gene_symbol header);
-                          the 1MM_Directional umiDedup MTX flattened for
-                          downstream PCA / DE — replaces the legacy
-                          _counts.detailed_for_pca.csv
-      demux_bam/         per-sample BAMs                     (if --run-dmux-bam)
-      demux_fastq/       per-sample FASTQs                   (if --run-dmux-fq)
+  --star-genome <dir>   STAR genomeDir (built with build_star_index.sh);
+                        required for custom --species, overrides built-in
+  --bed-file <bed12>    RSeQC BED12 gene model (override). If omitted, bakes
+                        one at run time from the GTF shipped inside the STAR
+                        index dir (build_star_index.sh moves it there) — needs
+                        gtfToGenePred + genePredToBed (UCSC) in PATH
+  --out-dir <dir>       root output dir (default /mnt/data/BRB-seq_output)
+  --threads <n>         threads (default 8)
+  --resume <auto|force> auto = skip completed steps (default); force = rerun
+  --run-fastq           fastqc (needs fastqc in PATH)
+  --run-rseqc           read_distribution (needs samtools,
+                        read_distribution.py, and a BED12: --bed-file or a GTF
+                        inside the STAR index dir)
+  --run-dmux-bam        picard BAM demux (needs picard)
+  --run-dmux-fq         fqtk FASTQ demux (needs fqtk; 14 bp CB + 14 bp UMI,
+                        Alithea BRB-seq standard — hardcoded)
+  --force-plate         suppress the kit/plate family cross-check in workbook
+                        mode (override a deliberate re-prep where the
+                        --barcodes-plate family differs from the workbook's
+                        'Kit ref' row)
+  --empty-wells         workbook mode: also emit every unoccupied plate well as
+                        an empty_well_<WELL> column (old-pipeline convention)
+                        so all plate wells show up in the STARsolo matrix.
+                        Reserved prefix: sample names must not start with
+                        'empty_well'
+  --dry-run             emit planned commands and exit (no side effects)
+  -h, --help            this help
+  --version             print version and exit
 
 EXAMPLES
   # Full mandatory pipeline on a mouse pool (built-in reference):
@@ -229,9 +191,12 @@ EXAMPLES
   ./brbseq_pipeline.sh \      --species mouse-custom --star-genome star_index/Mus_musculus.GRCm39.114 \
       ...
 
-  # On a host that needs a conda env to see STAR / samtools / ...:
-  conda activate brbseq      # or
-  ./brbseq_pipeline.sh ... --conda-env brbseq
+  # Tools (STAR, samtools, ...) must be on PATH — activate the brbseq env first.
+  # If the env does not exist yet on this machine, create it from the env file
+  # shipped next to this script:
+  conda env create -f brbseq-env.yaml          # (once, on a fresh host; creates env 'brbseq')
+  conda activate brbseq
+  ./brbseq_pipeline.sh ...
 
   # Dry run (print what WOULD be done, do not execute):
   ./brbseq_pipeline.sh ... --dry-run
@@ -254,19 +219,16 @@ while [[ $# -gt 0 ]]; do
     --bed-file)     BED_FILE="${2:?missing --bed-file value}";      shift 2;;
     --out-dir)      OUT_DIR="${2:?missing --out-dir value}";        shift 2;;
     --threads)      THREADS="${2:?missing --threads value}";        shift 2;;
-    --no-header)    MANIFEST_HEADER=0;                               shift;;
+    --run-dmux-fq)  RUN_OPT_DEMUX_FQ=1;                               shift;;
     --run-fastq)    RUN_OPT_FASTQ=1;                                  shift;;
     --run-rseqc)    RUN_OPT_RSEQC=1;                                  shift;;
     --run-dmux-bam) RUN_OPT_DEMUX_BAM=1;                              shift;;
-    --run-dmux-fq)  RUN_OPT_DEMUX_FQ=1;                               shift;;
-    --conda-env)    CONDA_ENV="${2:?missing --conda-env value}";      shift 2;;
-    --star)         STAR_BIN="${2:?missing --star value}";           shift 2;;
-    --resume)       RESUME="${2:?missing --resume value}";          shift 2;;
+    --resume)       RESUME="${2:?missing --resume value}";            shift 2;;
     --dry-run)      DRY_RUN=1;                                        shift;;
     -h|--help)      usage; exit 0;;
     --version)      echo "brbseq_pipeline.sh ${SCRIPT_VERSION}"; exit 0;;
-    -*)             die "unknown option: $1 (see --help)";;
-    *)              die "unexpected argument: $1 (see --help)";;
+    -*)             die "I don't recognise the option '$1'. Please check the spelling (options start with '--' or '-'). The full list of options is printed by:  brbseq_pipeline.sh --help";;
+    *)              die "I don't recognise '$1' as a valid option or value. The full list of options is printed by:  brbseq_pipeline.sh --help";;
   esac
 done
 
@@ -279,7 +241,7 @@ done
 # workbook) — or cross-checks an explicitly given plate against it (exit 4 on
 # a family mismatch, --force-plate to override).
 if [[ -n "$BARCODE_TSV" && -n "$LIBPREP_XLSX" ]]; then
-  die "manifest conflict: pass either --barcode-tsv OR --libprep-xlsx, not both"
+  die "You specified both --barcode-tsv and --libprep-xlsx, but only one of them can be used (both define the sample ↔ barcode mapping).  Remove one of the two flags and re-run."
 fi
 LIBPREP_MODE=0
 if [[ -n "$LIBPREP_XLSX" ]]; then
@@ -290,14 +252,14 @@ MISSING=()
 [[ -n "$R2_GENOMIC"  ]] || MISSING+=( "--r2-genomic" )
 # manifest source: exactly one of (a) --barcode-tsv  or  (b) --libprep-xlsx.
 if [[ -z "$LIBPREP_XLSX" && -n "$BARCODES_PLATE" ]]; then
-  die "--barcodes-plate is a workbook-mode flag: pass --libprep-xlsx as well — or drop the plate and let the workbook's 'Kit ref' row select it"
+  die "--barcodes-plate only makes sense together with the lib-prep workbook, but --libprep-xlsx was not given. Either add --libprep-xlsx <workbook.xlsx>, or remove --barcodes-plate and let the workbook's 'Kit ref' row choose the plate automatically."
 elif [[ "$LIBPREP_MODE" -ne 1 && -z "$BARCODE_TSV" ]]; then
   MISSING+=( "manifest source: --barcode-tsv <tsv>   or   --libprep-xlsx <xlsx>  (+ optional --barcodes-plate <file>)" )
 fi
 [[ -n "$SPECIES"     ]] || MISSING+=( "--species" )
 [[ -n "$RUN_NAME" || -n "$AVT_ID" || "$LIBPREP_MODE" -eq 1 ]]   || MISSING+=( "--run-name <name>" )
-[[ "$RESUME" == "auto" || "$RESUME" == "force" ]] || die "--resume must be auto or force"
-[[ "${#MISSING[@]}" -eq 0 ]] || die "missing required flag(s): ${MISSING[*]} (see --help)"
+[[ "$RESUME" == "auto" || "$RESUME" == "force" ]] || die "--resume can only be 'auto' (skip steps that already finished) or 'force' (run every step again). Use one of those two and re-run."
+[[ "${#MISSING[@]}" -eq 0 ]] || die "The command is missing required option(s): ${MISSING[*]}. Add the listed option(s) to the command and re-run. (Full list of options: brbseq_pipeline.sh --help)"
 
 #--- pool label ---------------------------------------------------------------
 # The pool label is INFERRED from the FASTQ names (no user parameter).
@@ -323,16 +285,16 @@ if [[ -n "$POOL_R1" && -n "$POOL_R2" && "$POOL_R1" == "$POOL_R2" ]]; then
   log "pool       = ${POOL_R1}  (inferred from FASTQ names)"
   POOL="$POOL_R1"
 elif [[ -n "$POOL_R1" && -n "$POOL_R2" ]]; then
-  warn "pool label disagrees between FASTQ names: R1 suggests '$POOL_R1', R2 suggests '$POOL_R2' — using R1 ('$POOL_R1'). Rename the FASTQs to fix this."
+  warn "CAUTION: the two FASTQ files you gave disagree about which pooled experiment this is. The R1 (barcode) file suggests the pool is named  '$POOL_R1'  and the R2 (genomic) file suggests  '$POOL_R2'. This is only used to LABEL the output folders (e.g.  ${POOL}_aligned.bam), it does not change the biological analysis. The pipeline is using '$POOL_R1' (taken from the R1/barcode file). If the two really are from the same pooled run, just rename the FASTQ files so both spell the pool name the same way, and it will stop warning."
   POOL="$POOL_R1"
 elif [[ -n "$POOL_R1" ]]; then
-  warn "could not infer pool from '$(basename "$R2_GENOMIC")' (no <pool>_<label>_S<lane> pattern); using '$POOL_R1' from R1. Rename the FASTQs to fix this."
+  warn "CAUTION: the file name '$(basename "$R2_GENOMIC")' (R2/genomic) does not let the pipeline read a 'pool' name out of it — it expected something like <pool>_<label>_S<lane>_...fastq.gz. The pool is only used to label output folders, so the pipeline is using '$POOL_R1' (read from the R1/barcode file) instead. If that label looks wrong, rename this FASTQ file so it follows the expected pattern, and it will stop warning."
   POOL="$POOL_R1"
 elif [[ -n "$POOL_R2" ]]; then
-  warn "could not infer pool from '$(basename "$R1_BARCODE")' (no <pool>_<label>_S<lane> pattern); using '$POOL_R2' from R2. Rename the FASTQs to fix this."
+  warn "CAUTION: the file name '$(basename "$R1_BARCODE")' (R1/barcode) does not let the pipeline read a 'pool' name out of it — it expected something like <pool>_<label>_S<lane>_...fastq.gz. The pool is only used to label output folders, so the pipeline is using '$POOL_R2' (read from the R2/genomic file) instead. If that label looks wrong, rename this FASTQ file so it follows the expected pattern, and it will stop warning."
   POOL="$POOL_R2"
 else
-  die "could not infer the pool label from either FASTQ name (expected <pool>_<label>_S<lane>_R<read>_...fastq, e.g. pool_poolA_S1_R1_001.fastq.gz)"
+  die "The pipeline reads the 'pool' name from the FASTQ file names, but neither of your two files uses a recognisable name. A valid name has the form <pool>_<label>_S<lane>_R<read>_...fastq.gz — for example pool_poolA_S1_R1_001.fastq.gz (everything before _S1 is the pool name). Please rename the FASTQ files so they follow that pattern, then re-run."
 fi
 
 #--- reference resolution ------------------------------------------------------
@@ -357,15 +319,11 @@ if [[ -n "$STAR_INDEX" && ! -f "$STAR_INDEX/Genome" && ! -f "$STAR_INDEX/SA" ]];
   for d in "$STAR_INDEX"/*/; do
     [[ -f "${d}Genome" && -f "${d}SA" ]] && inner="${d%/}"
   done
-  [[ -n "$inner" ]] || die "no STAR index found in $STAR_INDEX (no subfolder contains Genome + SA)"
+  [[ -n "$inner" ]] || die "The folder you gave with --star-genome ($STAR_INDEX) does not look like a STAR genome index — a STAR index is a folder that contains one or more subfolders, each holding two small files called 'Genome' and 'SA' (built by build_star_index.sh). This folder has no such subfolder, so the pipeline can't align the reads. Either check that the path you passed is really the index folder (and not, e.g., the folder one level above it), or build a fresh index with:  ./build_star_index.sh --fasta <genome.fa> --gtf <annotation.gtf> --outdir <index-dir> --sjdbOverhang 89  and re-run the pipeline with that <index-dir> as --star-genome."
   STAR_INDEX="$inner"
 fi
 if [[ -z "$STAR_INDEX" ]]; then
-  die "--species '$SPECIES' has no built-in reference and no --star-genome was given.
-  Build a STAR index once with build_star_index.sh and pass it:
-    ./build_star_index.sh --fasta <genome.fa> --gtf <annotation.gtf> \
-        --outdir <index-dir> --sjdbOverhang 89
-    ./brbseq_pipeline.sh ... --species $SPECIES --star-genome <index-dir>"
+  die "--species '$SPECIES' has no built-in reference and no --star-genome was given. Either choose a supported species (human or mouse), or point the pipeline at a pre-built STAR index with --star-genome <index_dir>. If no such index exists yet, build one once with: ./build_star_index.sh --fasta <genome.fa> --gtf <annotation.gtf> --outdir <index-dir> --sjdbOverhang 89, then re-run the pipeline with that <index-dir>."
 fi
 #--- RSeQC reference resolution (bake BED12 at run time if no --bed-file) ----
 # RSeQC read_distribution.py needs a 12-column gene-model BED (BED12). If the
@@ -415,14 +373,14 @@ if [[ -d "$STAR_INDEX" ]]; then
     # choice moot) we still say so explicitly, but do not block the run.
     if [[ "$RUN_OPT_RSEQC" -eq 1 && -z "$BED_FILE" ]]; then
       {
-        echo "ERROR: $STAR_INDEX contains $n GTF annotations — cannot tell which one is the gene model to bake the RSeQC BED12 from:"
-        printf '%s\n' "${RSEQC_GTF_CANDIDATES[@]}" | sed 's/^/    /' >&2
-        echo "Fix: pass --bed-file <bed12> explicitly, or clean the index dir so it holds exactly one .gtf/.gtf.gz (one genome build per dir)." >&2
+        echo "The read-distribution step needs the gene model (a GTF) for the genome, but the STAR index folder ($STAR_INDEX) contains $n different GTF gene-annotation files, and the pipeline does not know which one is the correct gene model for this genome:"
+        printf '%s\n' "${RSEQC_GTF_CANDIDATES[@]}" | sed 's/^/      /' >&2
+        echo "This stops the read-distribution step (the rest of the pipeline still runs). FIX: either pass the correct gene model already converted to BED12 format with  --bed-file <file.bed12>,  or remove the extra .gtf files from that folder so only the correct one remains." >&2
       }
       exit 1
     else
       local_list="$(printf '%s, ' "${RSEQC_GTF_CANDIDATES[@]}")"
-      warn "RSeQC: $STAR_INDEX holds multiple GTF annotations (${local_list%, }) — no RSeQC reference can be selected from the index dir; use --bed-file explicitly"
+      warn "WARNING (read-distribution step): the STAR index folder $STAR_INDEX contains more than one GTF gene annotation (${local_list%, }). The pipeline does not know which one of these is the correct gene model for this genome, so it will not try to build the RSeQC BED12 file automatically this run — the rest of the pipeline continues normally, but the read-distribution report will not be produced. To turn on the read-distribution report, supply the correct gene model directly with  --bed-file <file.bed12>."
     fi
   fi
 fi
@@ -436,33 +394,33 @@ log "reference = ${SPECIES}  ->  STAR index $STAR_INDEX"
 #--- (end RSeQC reference resolution) -------------------------------------------------
 
 #--- validate file/directory inputs ------------------------------------------
-[[ -f "$R1_BARCODE"  ]] || die "R1 barcode  read not found: $R1_BARCODE"
-[[ -f "$R2_GENOMIC"  ]] || die "R2 genomic  read not found: $R2_GENOMIC"
-# In lib-prep mode the manifest is generated later (needs the conda-env python);
-# only validate the workbook here.  The plate is optional: when omitted, the
+[[ -f "$R1_BARCODE"  ]] || die "The R1 (barcode-channel) FASTQ file was not found: $R1_BARCODE.  Check that the path in --r1-barcode is correct and the file is still there, then re-run."
+[[ -f "$R2_GENOMIC"  ]] || die "The R2 (genomic-channel) FASTQ file was not found: $R2_GENOMIC.  Check that the path in --r2-genomic is correct and the file is still there, then re-run."
+# In lib-prep mode the manifest is generated later; only validate the workbook
+# here.  The plate is optional: when omitted, the
 # parser infers it from the workbook's 'Kit ref' row.
 if [[ "$LIBPREP_MODE" -eq 1 ]]; then
-  [[ -f "$LIBPREP_XLSX" ]] || die "lib-prep workbook not found: $LIBPREP_XLSX"
-  [[ -z "$BARCODES_PLATE" || -f "$BARCODES_PLATE" ]] || die "barcode plate not found: $BARCODES_PLATE"
+  [[ -f "$LIBPREP_XLSX" ]] || die "The lib-prep workbook (--libprep-xlsx) file could not be found: $LIBPREP_XLSX. Check the path and re-run."
+  [[ -z "$BARCODES_PLATE" || -f "$BARCODES_PLATE" ]] || die "The barcode plate file (--barcodes-plate) could not be found: $BARCODES_PLATE. Check the path and re-run."
 else
-  [[ -f "$BARCODE_TSV" ]] || die "manifest (barcode TSV) not found: $BARCODE_TSV"
+  [[ -f "$BARCODE_TSV" ]] || die "The sample manifest (--barcode-tsv) file could not be found: $BARCODE_TSV. It should be a plain-text file with exactly two tab-separated columns: sample_id  [TAB]  barcode (one sample per line). Check the path and re-run."
 fi
-[[ -d "$STAR_INDEX"  ]] || die "STAR index dir  not found: $STAR_INDEX"
+[[ -d "$STAR_INDEX"  ]] || die "The STAR genome index directory could not be found: $STAR_INDEX. Check the --star-genome value (or the built-in path for your --species) and re-run. If the index was deleted or moved, you will need to rebuild it with build_star_index.sh."
 if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
   if [[ -z "$BED_FILE" && -z "$RSEQC_GTF" ]]; then
-    die "--run-rseqc needs a BED12 gene model: pass --bed-file <bed12>, or have a GTF inside the STAR index dir (build_star_index.sh moves it there) so we can bake one."
+    die "The read-distribution step (--run-rseqc) needs a BED12 gene-model file, and it could not find one. Either give the file directly with --bed-file <file.bed12>, or make sure the GTF annotation is present inside the STAR index directory (build_star_index.sh normally copies it there) so the pipeline can build BED12 from it."
   fi
   if [[ -n "$BED_FILE" && ! -f "$BED_FILE" ]]; then
-    die "BED12 file not found: $BED_FILE"
+    die "The BED12 gene-model file passed with --bed-file was not found: $BED_FILE. Check the path and re-run. If you do not have a BED12 file, leave --bed-file out and instead make sure the original GTF annotation is inside the STAR index directory, so the pipeline can convert it to BED12 automatically."
   fi
 fi
 
 #--- validate shipped helpers ------------------------------------------------
-for req in "$PREPARE_BARCODES" "$DEMUX_BAM" "$DUP_STATS" "$RENAME_MATRIX" "$PCA_CSV"; do
-  [[ -f "$req" ]] || die "missing helper script: $req  (must live in BRBseq/utils/)"
+for req in "$PREPARE_BARCODES" "$DEMUX_BAM" "$DUP_STATS" "$RENAME_MATRIX" "$UMI_MATRIX_PREP"; do
+  [[ -f "$req" ]] || die "The pipeline's own supporting helper file is missing from this installation: $req — these small helper scripts should live in a 'utils' folder right next to brbseq_pipeline.sh. This means the pipeline installation itself is incomplete (for example the 'utils' folder was not copied when the pipeline was being set up on this machine). Fix: make sure the whole BRBseq folder (including its 'utils' subfolder) is intact in one place, point the pipeline at it again, and re-run. If you just copied files between machines, this is usually where a step got dropped."
 done
 if [[ "$LIBPREP_MODE" -eq 1 ]]; then
-  [[ -f "$PARSE_LIBPREP" ]] || die "missing helper script: $PARSE_LIBPREP  (BRBseq/utils/)"
+  [[ -f "$PARSE_LIBPREP" ]] || die "The pipeline's own small helper program that reads the lib-prep Excel workbook is missing from this installation: $PARSE_LIBPREP — it should sit in a 'utils' folder right next to brbseq_pipeline.sh. This means the pipeline installation itself is incomplete (for example the 'utils' folder was not copied when the pipeline was being set up on this machine). Fix: make sure the whole BRBseq folder (including its 'utils' subfolder) is intact in one place, point the pipeline at it again, and re-run."
 fi
 
 #--- run name (resolution, pre-layout) ---------------------------------------
@@ -490,11 +448,11 @@ PYEOF
     [[ -n "$RUN_NAME" ]] || die "could not infer a run name from the workbook (no 'Researcher' row) — pass --run-name <name>"
     log "run name   = ${RUN_NAME}  (inferred from the workbook 'Researcher' row)"
   else
-    die "no run name — pass --run-name <name> (or use --libprep-xlsx which names the researcher)"
+    die "A run name is required so the output folder can be labelled, but no name was found. Pass it explicitly with --run-name <name> (or use --libprep-xlsx, whose workbook records the researcher's name and supplies it automatically)."
   fi
 fi
 RUN_NAME="$(tr -dc 'A-Za-z0-9._-' <<<"${RUN_NAME// /_}" )"   # filesystem-safe
-[[ -n "$RUN_NAME" ]] || die "run name sanitised to empty"
+[[ -n "$RUN_NAME" ]] || die "The run name you supplied (--run-name) is made up only of characters that are not allowed in file names, so after cleaning it became an empty name and the pipeline has no way to label the output folder. Please use a run name made of letters, numbers, dots, dashes or underscores (spaces will be turned into underscores) — for example 'PHX537_poolA' — and re-run."
 
 #--- output layout -----------------------------------------------------------
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -507,7 +465,8 @@ DMUX_BAM_DIR="${RUN_DIR}/demux_bam"
 DMUX_FQ_DIR="${RUN_DIR}/demux_fastq"
 RENAME_DIR="${STAR_DIR}/samples"
 DUP_CSV="${RUN_DIR}/duplication_statistics.csv"
-PCA_OUT_CSV="${RUN_DIR}/${POOL}_counts_for_pca.csv"
+UMI_MATRIX_CSV="${RUN_DIR}/${POOL}_umi_matrix.csv"
+READS_MATRIX_CSV="${RUN_DIR}/${POOL}_reads_matrix.csv"
 # In --barcode-tsv mode the manifest lives where the user put it (no generation);
 # in lib-prep mode the manifest is generated into <run>/barcodes/ and survives re-runs.
 MANIFEST="$BARCODE_TSV"
@@ -518,13 +477,43 @@ else
   LIBPREP_PROV=""
 fi
 
+#--- manifest header decision (auto-detected, no flag) ----------------------
+# parse_libprep_xlsx.py (GECF utility parser) always emits a header row on
+# line 1, so in lib-prep mode the answer is known without inspecting the file.
+# For user-supplied --barcode-tsv, auto-detect from line 1: a valid line-1
+# barcode cell (14-nt ACGTN, matches the Alithea BRB-seq kit constraint the
+# STAR call hardcodes via --soloCBlen 14) means "no header"; anything else
+# (a word, empty, or wrong length) means "has header".
+if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+  MANIFEST_HEADER=1
+else
+  # Read line 1 as a pure string; guard with `|| true` so a missing file
+  # doesn't trip `set -e` — the file-existence check happens earlier and the
+  # real validation happens in Alithea's prepare_barcodes.sh downstream.
+  line1="$(head -n1 -- "$MANIFEST" 2>/dev/null || true)"
+  c2="${line1#*$'\t'}"; [[ "$c2" == "$line1" ]] && c2=""
+  c2_clean="${c2%$'\r'}"; c2_up="$(printf '%s' "$c2_clean" | tr '[:lower:]' '[:upper:]')"
+  if [[ ${#c2_up} -eq 14 && "$c2_up" =~ ^[ACGTN]+$ ]]; then
+    MANIFEST_HEADER=0
+    log "manifest : line 1 barcode cell '$c2_up' is a valid 14-nt ACGTN cell barcode - treating line 1 as DATA (no header)"
+  else
+    MANIFEST_HEADER=1
+    log "manifest : line 1 barcode cell '${c2_clean:-<empty>}' is not a valid 14-nt ACGTN cell barcode - treating line 1 as HEADER (skipped)"
+  fi
+fi
+if [[ "$MANIFEST_HEADER" -eq 0 ]]; then
+  log "header   = NONE (manifest treated as headerless)"
+else
+  log "header   = YES   (first row of $MANIFEST is a header and is skipped)"
+fi
+
 #--- tool discovery ----------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
-if [[ -z "$STAR_BIN" ]]; then
-  for cand in STAR-avx2 STAR-avx STAR; do
-    if have "$cand"; then STAR_BIN="$cand"; break; fi
-  done
-fi
+# STAR ships in the brbseq conda env (bioconda); autodetect the binary.
+STAR_BIN=""
+for cand in STAR-avx2 STAR-avx STAR; do
+  if have "$cand"; then STAR_BIN="$cand"; break; fi
+done
 HAVE_STAR=0;      [[ -n "$STAR_BIN" ]] && have "$STAR_BIN" && HAVE_STAR=1
 HAVE_FASTQC=0;    have fastqc              && HAVE_FASTQC=1
 HAVE_SAMTOOLS=0;  have samtools            && HAVE_SAMTOOLS=1
@@ -532,69 +521,47 @@ HAVE_RSEQC=0;     have read_distribution.py && HAVE_RSEQC=1
 HAVE_PICARD=0;    have picard              && HAVE_PICARD=1
 HAVE_FQTK=0;      have fqtk                && HAVE_FQTK=1
 have "$PYTHON"    || PYTHON="$(have python3 && echo python3 || echo python)"
-
-#--- conda env (portable hosts) ---------------------------------------------
-# In lib-prep mode the manifest parser needs openpyxl.  If the active python
-# can already import it, nothing extra is required.  Otherwise, prefer the
-# brbseq env — via --conda-env activation when conda is available, or by
-# pointing directly at the env's python when the env dir is on this host
-# (no conda needed).  Only if neither works do we fail, with a message that
-# names the missing piece.
-py_has_openpyxl() { [[ "$1" != "" ]] && "$1" -c "import openpyxl" >/dev/null 2>&1; }
-py_ok=0
-py_has_openpyxl "$PYTHON" && py_ok=1
-
-if [[ "$LIBPREP_MODE" -eq 1 && "$py_ok" -ne 1 ]]; then
-  resolved_openpyxl=0
-  if command -v conda >/dev/null 2>&1; then
-    # try the brbseq env (or the pinned one) via conda
-    want="${CONDA_ENV:-brbseq}"
-    if conda env list 2>/dev/null | awk '{print $1}' | grep -qx "$want"; then
-      log "activating conda env for openpyxl: ${want}"
-      # shellcheck disable=SC1091
-      eval "$(conda shell.bash hook)" 2>/dev/null || true
-      if conda activate "$want" 2>/dev/null; then
-        have "$PYTHON" || PYTHON="python3"
-        py_has_openpyxl "$PYTHON" && resolved_openpyxl=1
-      fi
-    fi
-  fi
-  if [[ "$resolved_openpyxl" -ne 1 ]]; then
-    # conda not usable; fall back to the env's python directly (if on host)
-    for cand in \
-      "${HOME:-/nonexistent}/.conda/envs/brbseq/bin/python3" \
-      "${HOME:-/nonexistent}/miniconda3/envs/brbseq/bin/python3" \
-      "/opt/conda/envs/brbseq/bin/python3"; do
-      if [[ -x "$cand" ]] && py_has_openpyxl "$cand"; then
-        PYTHON="$cand"
-        resolved_openpyxl=1
-        break
-      fi
-    done
-  fi
-  if [[ "$resolved_openpyxl" -ne 1 ]]; then
-    die "lib-prep mode needs python+openpyxl; none available.  Fix: pass --conda-env <name with openpyxl> AND activate conda, or run with a python that can 'import openpyxl' (e.g. the brbseq conda env's python3)."
-  fi
-fi
-
-if [[ -n "$CONDA_ENV" ]]; then
-  have conda || die "--conda-env requested but 'conda' not in PATH"
-  log "activating conda env: ${CONDA_ENV}"
-  # shellcheck disable=SC1091
-  eval "$(conda shell.bash hook)"
-  conda activate "$CONDA_ENV" || die "conda activate ${CONDA_ENV} failed"
-  # re-detect tools after activation
+#--- auto-activate the known production env (ptegsrv3) ----------------------
+# The brbseq env on ptegsrv3 lives at this LITERAL prefix — the square
+# brackets are real characters in the path, so it must stay quoted (an
+# unquoted '[' would glob). Override for other hosts via the environment:
+#   BRBSEQ_ENV=<prefix>/envs/brbseq ./brbseq_pipeline.sh ...
+BRBSEQ_ENV="${BRBSEQ_ENV:-/home/gecf/softwares/anaconda/[/home/gecf/softwares/anaconda]/envs/brbseq}"
+if [[ "$HAVE_STAR" -eq 0 && -d "${BRBSEQ_ENV}/bin" ]]; then
+  export PATH="${BRBSEQ_ENV}/bin:${PATH}"
+  [[ -x "${BRBSEQ_ENV}/bin/python" ]] && PYTHON="${BRBSEQ_ENV}/bin/python"
+  # PATH changed: re-run tool discovery so HAVE_* reflects the env.
+  STAR_BIN=""
+  for cand in STAR-avx2 STAR-avx STAR; do
+    if have "$cand"; then STAR_BIN="$cand"; break; fi
+  done
   HAVE_STAR=0;      [[ -n "$STAR_BIN" ]] && have "$STAR_BIN" && HAVE_STAR=1
   HAVE_FASTQC=0;    have fastqc              && HAVE_FASTQC=1
   HAVE_SAMTOOLS=0;  have samtools            && HAVE_SAMTOOLS=1
   HAVE_RSEQC=0;     have read_distribution.py && HAVE_RSEQC=1
   HAVE_PICARD=0;    have picard              && HAVE_PICARD=1
   HAVE_FQTK=0;      have fqtk                && HAVE_FQTK=1
+  log "env      = ${BRBSEQ_ENV}"
+fi
+if [[ "$HAVE_STAR" -eq 0 ]]; then
+  die "The Python environment that runs this pipeline cannot be found. This is the set of programs (STAR, samtools, etc.) the pipeline needs. Two ways to fix it: 1) create it once, from this script's folder: conda env create -f ${SCRIPT_DIR}/brbseq-env.yaml, then activate it: conda activate brbseq — then re-run;  2) or, if you already have such an environment, point to it:  BRBSEQ_ENV=<folder>/envs/<name> brbseq_pipeline.sh ..."
+fi
+
+#--- python with openpyxl (workbook mode) -----------------------------------
+# parse_libprep_xlsx.py needs 'import openpyxl'.  The caller activates their
+# own environment (e.g. 'conda activate brbseq') before launching; this script
+# only verifies the active python has it and fails with a clear message if not.
+py_has_openpyxl() { [[ "$1" != "" ]] && "$1" -c "import openpyxl" >/dev/null 2>&1; }
+if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+  py_has_openpyxl "$PYTHON" || {
+    have python3 || PYTHON="python3"
+  }
+  py_has_openpyxl "$PYTHON" || die "Reading the lib-prep Excel workbook needs a Python setup that includes the 'openpyxl' package, but the Python currently in use does not have it. Usually this is fixed by activating the 'brbseq' Conda environment:  conda activate brbseq  — then re-run the pipeline. If you have never created that environment, create it once from the 'brbseq-env.yaml' file that sits next to this pipeline script:  conda env create -f brbseq-env.yaml  and then 'conda activate brbseq', and re-run."
 fi
 
 #--- generate manifest from lib-prep workbook (workbook mode) ----------------
-# Must run after conda activation: parse_libprep_xlsx.py needs openpyxl, which
-# ships in the brbseq env (or any --conda-env the caller supplies).
+# parse_libprep_xlsx.py needs python+openpyxl (verified above); the caller
+# activates their own environment before launching.
 if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" ]]; then
   mkdir -p "$BARCODES_DIR"
   log "lib-prep workbook mode: generating manifest from $LIBPREP_XLSX"
@@ -615,11 +582,11 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" ]]; then
   "$PYTHON" "$PARSE_LIBPREP" "${parse_args[@]}" || parse_rc=$?
   if [[ "$parse_rc" -ne 0 ]]; then
     if [[ "$parse_rc" -eq 4 ]]; then
-      die "kit/plate barcode family mismatch (see error above) — re-run with a --barcodes-plate whose family matches the workbook's 'Kit ref' row, or override deliberately with --force-plate"
+      die "The barcode plate file you are using does not match the 'Kit ref' recorded in the Excel workbook — in other words, the well positions / barcode families look like they belong to a different plate than the one the workbook expects. Double-check that --barcodes-plate points at the file for the SAME plate as this exact lib-prep workbook (the file name usually includes a family code that must match the 'Kit ref' row). If, after checking, you are certain the plate is actually the right one and the two simply use a different naming scheme, you can force the pipeline to proceed despite this mismatch by adding the  --force-plate  flag — but only do that if you have verified the plate is correct."
     fi
-    die "parse_libprep_xlsx.py failed (exit ${parse_rc}; see error above) — in workbook mode the plate is inferred from the workbook's 'Kit ref' row (needs a barcodes_96_<family>_*.txt next to the xlsx), or pass --barcodes-plate <file>"
+    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  saved in the same folder as the workbook. If that file is missing or named differently, either rename/move it into place, or pass it explicitly with  --barcodes-plate <file>. Then re-run."
   fi
-  [[ -s "$MANIFEST" ]] || die "generated manifest is empty: $MANIFEST"
+  [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
   log "manifest   = ${MANIFEST}  (generated from lib-prep workbook)"
 elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   # manifest already on disk (resume).  It must match this call:
@@ -631,10 +598,10 @@ elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   ew_in_manifest=0
   grep -q $'^empty_well_[A-H][0-9][0-9]	' "$MANIFEST" && ew_in_manifest=1
   if [[ "$EMPTY_WELLS" -eq 1 && "$ew_in_manifest" -eq 0 ]]; then
-    die "manifest ${MANIFEST} has no empty_well_* rows but this call passes --empty-wells (stale artifact from a run without the flag).  Remove the stale manifest (or delete the run dir) so it regenerates, then re-run — the barcodes step will rebuild the whitelist accordingly"
+    die "You asked to include empty wells (--empty-wells), but the sample→barcode list already saved from a previous run of this experiment (file: $MANIFEST) does not include any empty-well entries — it was generated earlier without that option. Mixing the two would give an inconsistent list, so the pipeline is stopping rather than silently proceeding. To fix: delete the stale file (or the whole previous run's output folder) and re-run, and it will regenerate the list including the empty wells."
   fi
   if [[ "$EMPTY_WELLS" -eq 0 && "$ew_in_manifest" -eq 1 ]]; then
-    die "the existing manifest ${MANIFEST} contains empty_well_* rows, but this call does NOT pass --empty-wells.  Remove the stale manifest (or delete the run dir) and re-run, or start a fresh run"
+    die "The existing sample→barcode list from a previous run of this experiment (file: $MANIFEST) does include empty-well entries, but this call does not ask for them (no --empty-wells flag). Mixing the two would give an inconsistent list, so the pipeline is stopping rather than silently proceeding. To fix: either add --empty-wells to keep the list as-is, or delete the stale file (or the whole previous run's output folder) and re-run without that flag, and the list will be regenerated without empty wells."
   fi
   log "manifest   = ${MANIFEST}  (already present, reusing)"
 fi
@@ -646,7 +613,7 @@ log "pool       = ${POOL}"
 log "threads    = ${THREADS}"
 log "R1 (CB+UMI)= ${R1_BARCODE}"
 log "R2 (cDNA)  = ${R2_GENOMIC}"
-log "manifest   = ${MANIFEST}  (header=${MANIFEST_HEADER})"
+log "manifest   = ${MANIFEST}  (header-mode=${MANIFEST_HEADER})"
 log "STAR index = ${STAR_INDEX}   (star=${STAR_BIN:-NOT_FOUND})"
 log "output     = ${RUN_DIR}"
 log "optional:  fastqc=${RUN_OPT_FASTQ}  rseqc=${RUN_OPT_RSEQC}  demux_bam=${RUN_OPT_DEMUX_BAM}  demux_fq=${RUN_OPT_DEMUX_FQ}"
@@ -667,9 +634,11 @@ fi
 #--- execute (or dry-run) ----------------------------------------------------
 if [[ "$DRY_RUN" -eq 1 ]]; then
   log "---- DRY RUN: planned steps ----"
-  log "  prepare_barcodes.sh -i <manifest> -w <OUT>/barcodes/barcode_whitelist.txt -f <OUT>/barcodes/fastq_sample_metadata.tsv -b <OUT>/barcodes/bam_barcodes.tsv -$([[ "$MANIFEST_HEADER" -eq 1 ]] && echo H)"
+  hdr_flag=""
+  [[ "$MANIFEST_HEADER" -eq 1 ]] && hdr_flag=" -H"
+  log "  prepare_barcodes.sh -i <manifest> -w <OUT>/barcodes/barcode_whitelist.txt -f <OUT>/barcodes/fastq_sample_metadata.tsv -b <OUT>/barcodes/bam_barcodes.tsv${hdr_flag}"
   if [[ "$RUN_OPT_FASTQ" -eq 1 ]]; then
-    log "  fastqc  --threads 2 --outdir <OUT>/fastqc <R1> <R2>"
+    log "  fastqc  --threads 16 --outdir <OUT>/fastqc <R1> <R2>"
   fi
   log "  STAR    (one STARsolo call, both dedup methods in list form)"
   log "      ${STAR_BIN} --runMode alignReads --runThreadN ${THREADS} --genomeDir ${STAR_INDEX} --readFilesIn <R2> <R1> --soloCBwhitelist <OUT>/barcodes/barcode_whitelist.txt --soloCBlen 14 --soloUMIlen 14 --soloUMIstart 15 --soloUMIdedup NoDedup 1MM_Directional --outSAMattributes '${SAM_ATTRS}' --quantMode GeneCounts ..."
@@ -678,9 +647,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     if [[ -n "$BED_FILE" ]]; then
       log "  RSeQC   reference (given --bed-file): ${BED_FILE}"
     else
-      log "  RSeQC   bake:   gffread ${RSEQC_GTF} --bed > <OUT>/rseqc/$(basename "${RSEQC_GTF%.gz}").bed12"
+      log "  RSeQC   bake:   gtfToGenePred ${RSEQC_GTF} tmp.gp ; genePredToBed tmp.gp <OUT>/rseqc/$(basename "${RSEQC_GTF%.gz}").bed12   (UCSC chain)"
     fi
-    log "      samtools index <OUT>/star/${POOL}_Aligned.sortedByCoord.out.bam"
+    log "      samtools index <OUT>/star/${POOL}_Aligned.sortedByCoord.out.bam   [-@ 16]"
     log "      read_distribution.py -i <OUT>/star/${POOL}_Aligned.sortedByCoord.out.bam -r <bed12> > <OUT>/rseqc/${POOL}_read_distribution.txt"
   fi
   log "  dups    ${PYTHON} <UTILS>/get_duplication_statistics.py --raw_dir <OUT>/star/${POOL}_Solo.out/Gene/raw --dedup_method 1MM_Directional --output_csv <OUT>/duplication_statistics.csv"
@@ -702,6 +671,18 @@ mkdir -p "$BARCODES_DIR" "$STAR_DIR"
 [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]] && mkdir -p "$DMUX_BAM_DIR"
 [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]] && mkdir -p "$DMUX_FQ_DIR"
 
+#--- automatic pipeline.log ----------------------------------------------------
+# Mirror everything (pipeline messages + tool stdout/stderr) to
+# <RUN_DIR>/pipeline.log in addition to the terminal.  The per-step exact
+# commands are already logged by run_or_skip ("RUN  <step>: <cmd>") and by
+# star_solo (into star/STAR.log); tool chatter now lands in the file too.
+LOG_FILE="${RUN_DIR}/pipeline.log"
+exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+# Drain the tee pipes before the shell dies, or the final buffered lines can
+# be lost on exit (process-substitution pipe flush is async).
+trap 'sleep 0.5' EXIT
+log "log file = ${LOG_FILE}  (automatic; exact commands + tool output mirrored here)"
+
 # --- run_or_skip -------------------------------------------------------------
 # Execute the command ($5...) unless the marker file ($2) already exists in
 # auto mode.  Failure policy: a failing OPTIONAL step logs a warning and does
@@ -721,9 +702,9 @@ run_or_skip() {
   fi
   if [[ -n "$tool" ]] && ! have "$tool"; then
     if [[ "$mode" == "mandatory" ]]; then
-      die "${name} requires tool '${tool}' which is not in PATH."
+      die "The step '${name}' needs a program called '${tool}' to run, but that program is not installed in the current environment. It normally ships inside the 'brbseq' Conda environment — activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it), then re-run the pipeline. Because this is a required step, the pipeline has stopped here."
     else
-      warn "${name}: optional step skipped (tool '${tool}' not in PATH)"
+      warn "Skipping optional step '${name}': the program it needs ('${tool}') is not installed in the current environment. This does not stop the pipeline — everything else will still run — but the output this step would have produced will be missing. If you want it, install it into the 'brbseq' environment ('conda activate brbseq'; create it with 'conda env create -f brbseq-env.yaml' if needed) and re-run."
       return 0
     fi
   fi
@@ -732,9 +713,9 @@ run_or_skip() {
   "${cmd[@]}" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     if [[ "$mode" == "mandatory" ]]; then
-      die "${name} failed (exit ${rc}) — mandatory step"
+      die "The required step '${name}' ran into an error and could not be completed, so the pipeline has stopped. The specific reason is in the messages printed in the lines just above this one (also saved in the run's pipeline.log). Fix that underlying problem, then re-run the pipeline — you can use --resume auto so steps that already finished are not redone."
     else
-      warn "${name} failed (exit ${rc}) — optional step, continuing"
+      warn "The optional step '${name}' ran into an error, so it did not finish — but this does not stop the pipeline; everything else will still run. The likely reason is in the messages printed just above this one (and in the run's pipeline.log). If you want this step's output, fix the underlying problem and re-run (it is safe to re-run just this one)."
     fi
   else
     [[ -n "$marker" ]] && touch "$marker"
@@ -757,9 +738,9 @@ run_or_skip "prepare_barcodes" "$WHITELIST" "" "mandatory" \
     -b "$BAM_BARCODES" \
     "${HDR_ARGS[@]}"
 # post-check
-[[ -s "$WHITELIST"    ]] || die "barcode prep failed: whitelist is empty"
-[[ -f "$FQ_META"      ]] || die "barcode prep failed: fastq_sample_metadata.tsv missing"
-[[ -f "$BAM_BARCODES" ]] || die "barcode prep failed: bam_barcodes.tsv missing"
+[[ -s "$WHITELIST"    ]] || die "The barcode file needed to align the reads ended up empty (file: $WHITELIST) — meaning none of the samples in your list were successfully turned into a usable barcode. See the message just above for the reason (usually a problem with the sample→barcode list itself). Fix the source list and re-run."
+[[ -f "$FQ_META"      ]] || die "The per-sample barcode list used later to split the raw sequence files (file: $FQ_META) was not produced. See the message just above for the reason, fix it, and re-run."
+[[ -f "$BAM_BARCODES" ]] || die "The per-sample barcode list used later to split the aligned results file (file: $BAM_BARCODES) was not produced. See the message just above for the reason, fix it, and re-run."
 log "barcode prep done: whitelist=$(wc -l < "$WHITELIST") barcodes; fastq_meta+bam_map ready"
 
 #=== FASTQ Quality Assessment  [OPTIONAL] ==================================
@@ -767,7 +748,7 @@ if [[ "$RUN_OPT_FASTQ" -eq 1 ]]; then
   log ""; log "fastqc (optional)"
   FQ_MARKER="${FASTQC_DIR}/QC_done"
   run_or_skip "fastqc" "$FQ_MARKER" "fastqc" "optional" \
-    fastqc --threads 2 --outdir "$FASTQC_DIR" "$R1_BARCODE" "$R2_GENOMIC"
+    fastqc --threads 16 --outdir "$FASTQC_DIR" "$R1_BARCODE" "$R2_GENOMIC"
   touch "$FQ_MARKER"  # idempotent completion marker
   log "fastqc outputs in: $FASTQC_DIR"
 else
@@ -776,10 +757,10 @@ fi
 
 #=== STARsolo  [MANDATORY] =================================================
 log ""; log "STARsolo alignment + UMI count matrix (mandatory)"
-[[ "$HAVE_STAR" -eq 1 ]] || die "STAR binary not found (looked for STAR-avx2/STAR-avx/STAR); use --star or --conda-env."
-[[ -d "$STAR_INDEX" ]] || die "STAR index dir not found: $STAR_INDEX"
-[[ -f "${STAR_INDEX}/Genome" ]] || warn "STAR index: no 'Genome' file in $STAR_INDEX — STAR will fail if index is incomplete."
-[[ -f "${STAR_INDEX}/SA"     ]] || warn "STAR index: no 'SA' file in $STAR_INDEX — STAR will fail if index is incomplete."
+[[ "$HAVE_STAR" -eq 1 ]] || die "The STAR aligner (the program that maps reads to the genome) was not found on this machine. It ships inside the 'brbseq' Conda environment. To fix: first make sure that environment exists and is active — run 'conda activate brbseq' — then try again. If you have never created it, create it once with: conda env create -f brbseq-env.yaml  (that file sits next to this pipeline script), then 'conda activate brbseq', then re-run."
+[[ -d "$STAR_INDEX" ]] || die "The STAR genome index directory could not be found: $STAR_INDEX. Check the --star-genome value (or the built-in path for your --species) and re-run. If the index was deleted or moved, rebuild it with build_star_index.sh."
+[[ -f "${STAR_INDEX}/Genome" ]] || warn "The STAR index folder $STAR_INDEX appears incomplete — the 'Genome' file is missing, and STAR will not be able to start if the index is unfinished. If you are unsure this index is finished, rebuild it with build_star_index.sh, then re-run."
+[[ -f "${STAR_INDEX}/SA"     ]] || warn "The STAR index folder $STAR_INDEX appears incomplete — the 'SA' (sequence-to-genome) file is missing, and STAR will not be able to start if the index is unfinished. If you are unsure this index is finished, rebuild it with build_star_index.sh, then re-run."
 
 # The suffixes appended to --outFileNamePrefix differ across STAR builds:
 #   * older Alithea STAR : <prefix>_Aligned...  /  <prefix>Solo.out
@@ -809,41 +790,45 @@ star_solo() {
   # STAR 2.7.11b requires each tag as a SEPARATE argument; passing the
   # whole list as one quoted string is a FATAL INPUT ERROR
   # ("unknown/unimplemented SAM attribute (tag): NH HI nM ...").
-  local -a attr_tokens=()
-  read -r -a attr_tokens <<< "${SAM_ATTRS}"
-  local STAR_ATTR_ARGS=( --outSAMattributes "${attr_tokens[@]}" )
-  log "RUN  STARsolo (--soloUMIdedup ${DEDUP_METHODS[*]}, list form) -> ${prefix}"
-  if "${STAR_BIN}" \
-      --runMode alignReads \
-      --runThreadN "${THREADS}" \
-      --genomeDir "${STAR_INDEX}" \
-      --readFilesIn "${R2_GENOMIC}" "${R1_BARCODE}" \
-      --readFilesCommand zcat \
-      --soloCBwhitelist "${WHITELIST}" \
-      --soloCBstart 1 \
-      --soloCBlen 14 \
-      --soloUMIstart 15 \
-      --soloUMIlen 14 \
-      --soloUMIdedup "${DEDUP_METHODS[@]}" \
-      --soloType CB_UMI_Simple \
-      --soloCBmatchWLtype 1MM \
-      --soloStrand Forward \
-      --soloCellFilter None \
-      --soloBarcodeReadLength 0 \
-      --outFilterMultimapNmax 1 \
-      "${STAR_ATTR_ARGS[@]}" \
-      --outSAMmapqUnique 60 \
-      --outSAMunmapped Within \
-      --outSAMtype BAM SortedByCoordinate \
-      --outBAMsortingThreadN 1 \
-      --outSAMmultNmax 1 \
-      --outFilterIntronMotifs None \
-      --outFileNamePrefix "${prefix}" \
-      --quantMode GeneCounts  > "${log_file}" 2>&1
-  then
+  local -a sam_attr_tokens=()
+  read -r -a sam_attr_tokens <<< "${SAM_ATTRS}"
+  # Build the invocation as one array: logged verbatim (pipeline.log) and
+  # written as the first line of STAR.log for provenance.
+  local -a STAR_CMD=(
+    "${STAR_BIN}"
+    --runMode alignReads
+    --runThreadN "${THREADS}"
+    --genomeDir "${STAR_INDEX}"
+    --readFilesIn "${R2_GENOMIC}" "${R1_BARCODE}"
+    --readFilesCommand zcat
+    --soloCBwhitelist "${WHITELIST}"
+    --soloCBstart 1
+    --soloCBlen 14
+    --soloUMIstart 15
+    --soloUMIlen 14
+    --soloUMIdedup "${DEDUP_METHODS[@]}"
+    --soloType CB_UMI_Simple
+    --soloCBmatchWLtype 1MM
+    --soloStrand Forward
+    --soloCellFilter None
+    --soloBarcodeReadLength 0
+    --outFilterMultimapNmax 1
+    --outSAMattributes "${sam_attr_tokens[@]}"
+    --outSAMmapqUnique 60
+    --outSAMunmapped Within
+    --outSAMtype BAM SortedByCoordinate
+    --outBAMsortingThreadN 1
+    --outSAMmultNmax 1
+    --outFilterIntronMotifs None
+    --outFileNamePrefix "${prefix}"
+    --quantMode GeneCounts
+  )
+  log "RUN  STARsolo: ${STAR_CMD[*]}"
+  printf '%s\n' "${STAR_CMD[*]}" > "${log_file}"
+  if "${STAR_CMD[@]}" >> "${log_file}" 2>&1; then
     return 0
   else
-    log "ERROR: STARsolo (--soloUMIdedup ${DEDUP_METHODS[*]}) failed; tail of ${log_file}:"
+    log "The STAR alignment/counting step (STARsolo, UMI counting methods: ${DEDUP_METHODS[*]}) reported that it failed. The last lines of its own log file are printed directly above this line — read them for the specific reason (for example too few reads, an index it cannot read, or a run out of memory). Fix that, then re-run the pipeline with --resume auto so the steps that already finished are not redone."
     tail -20 "${log_file}" >&2 || true
     return 1
   fi
@@ -863,7 +848,7 @@ consolidate_solo_output() {
   # rather than hard-coding one form.
   local solo_dir
   solo_dir="$(find "$STAR_DIR" -maxdepth 2 -type d \( -iname 'runSolo.out' -o -iname '*Solo.out' -o -iname '*SOLOout' \) 2>/dev/null | head -1)"
-  [[ -n "$solo_dir" && -d "$solo_dir" ]] || die "consolidation: no Solo.out dir under $STAR_DIR/"
+  [[ -n "$solo_dir" && -d "$solo_dir" ]] || die "STAR finished, but the pipeline did not find its output folder (normally a folder called 'Solo.out' or similar inside $STAR_DIR/). This usually means STAR itself stopped early with an error — check the STAR log files inside $STAR_DIR for the actual reason, then re-run the pipeline (set --resume force to redo every step)."
   log "consolidation: solo_dir=$solo_dir"
   local method kind
   for method in "${DEDUP_METHODS[@]}"; do
@@ -872,7 +857,7 @@ consolidate_solo_output() {
                "${solo_dir}/Gene/umiDedup-${method}.mtx"; do
       [[ -f "$src" ]] && { ln -f "$src" "${dest}/umiDedup-${method}.mtx" 2>/dev/null || cp -f "$src" "${dest}/umiDedup-${method}.mtx"; break; }
     done
-    [[ -f "${dest}/umiDedup-${method}.mtx" ]] || die "consolidation: no umiDedup-${method}.mtx anywhere under $solo_dir"
+    [[ -f "${dest}/umiDedup-${method}.mtx" ]] || die "STAR finished, but the raw UMI count matrix for the '${method}' counting mode was not found inside $solo_dir. This usually means STAR stopped early with an error — check the STAR log files inside $STAR_DIR for the actual reason, then re-run the pipeline (set --resume force to redo every step)."
     log "consolidate: $src  ->  ${dest}/umiDedup-${method}.mtx"
   done
   for kind in barcodes.tsv features.tsv; do
@@ -907,19 +892,40 @@ if [[ "$RESUME" != "auto" || "$S14_DONE" -eq 0 || -z "$STAR_BAM" ]]; then
   star_solo "${STAR_BASE}"
   consolidate_solo_output
   STAR_BAM="$(find_star_bam "$STAR_DIR" | head -n 1)"
-  [[ -n "$STAR_BAM" && -s "$STAR_BAM" ]] || die "finished but no Aligned.sortedByCoord.out.bam found under $STAR_DIR"
+  [[ -n "$STAR_BAM" && -s "$STAR_BAM" ]] || die "The alignment step (STAR) ran to completion, but the aligned reads file it should have produced (Aligned.sortedByCoord.out.bam) was not found or is empty under $STAR_DIR. This usually means STAR itself stopped early with an error — see the STAR log files inside $STAR_DIR (e.g. STAR.log.out, STAR.log) for the specific reason. Fix that, then re-run the pipeline (use --resume auto so earlier steps are not redone)."
   echo "$(date +%FT%T)" > "${STAR_DIR}/_s14_done"
 fi
 log "STAR BAM: $STAR_BAM"
 log "consolidated mtx dir: ${STAR_DIR}/Gene/raw"
 SOLO_OUT="${STAR_DIR}/Gene/raw"   # alias used by the dup-stats step
 
-#--- bake helper: GTF -> BED12 (house recipe: gffread --bed) -----------------
+#--- bake helper: GTF -> BED12 (UCSC genePred chain) -------------------------
 # Same conversion as flashseq_rseqc.sh so both pipelines produce identical
 # BED12 from the same GTF.  Writes $RSEQC_DIR/<gtf-basename>.bed12
 # (.gz GTFs are decompressed on the fly).  Sets global RSEQC_BED to the
 # output path (NOT via stdout capture — log() writes to stdout, so the value
 # is returned in a variable to avoid mixing prose into the path).
+#
+# Chain (UCSC genePred, exactly what UCSC docs recommend and what RSeQC
+# expects):
+#          gtfToGenePred GTF   gp   (transcript-level genePred, 8 cols)
+#          genePredToBed gp    bed  (12-col BED12)
+#
+# WHY UCSC CHAIN, NOT gffread --bed: for transcripts whose GTF has no explicit
+# CDS feature (many lncRNAs / pseudogenes / many BRB-seq annotations), gffread
+# fills thickStart/thickEnd over the WHOLE transcription-unit span — RSeQC
+# read_distribution.py then classifies every exon as "CDS_exons". The UCSC
+# chain leaves thickStart=thickEnd (empty CDS), which is the biologically
+# faithful reading of "no CDS in this transcript". That is the correct,
+# RSeQC-recommended partition for CDS/5'UTR/3'UTR/intron bucketing.
+#
+# Two live bugs to guard against (see flashseq_rseqc.sh bake_bed12):
+#   1. genePredToBed takes <in.gp> <out.bed> positionally — it DOES NOT print
+#      to stdout, so we must call it as `genePredToBed "$gp" "$bed"` (not
+#      `genePredToBed "$gp" > "$bed"`).
+#   2. genePredToBed prints usage to stderr and RETURNS 0 in the usage-error
+#      case, so `if ! genePredToBed ...` will not catch failure — we MUST
+#      check the output is non-empty (`[[ -s "$bed" ]]`) after every step.
 RSEQC_BED=""
 bake_rseqc_bed12() {
   local gtf="$1" out
@@ -929,27 +935,42 @@ bake_rseqc_bed12() {
     RSEQC_BED="$out"
     return 0
   fi
-  command -v gffread >/dev/null 2>&1 || die "gffread not in PATH — needed to bake the BED12 from $gtf (add the env with cufflinks, pass --bed-file, or activate with --conda-env)"
-  local tmp rc=1
-  tmp="$(mktemp "${TMPDIR:-/tmp}/brbseq_bed12.XXXXXX")"
+  # Tool gate: BOTH UCSC chain binaries must be reachable. (UCSC tools have
+  # no --version flag — presence on PATH is what we check here; provenance is
+  # logged by the caller via the no-arg usage string.)
+  local _missing=""
+  command -v gtfToGenePred >/dev/null 2>&1 || _missing="$_missing gtfToGenePred"
+  command -v genePredToBed >/dev/null 2>&1 || _missing="$_missing genePredToBed"
+  [[ -z "$_missing" ]] || die "The read-distribution step needs one or two UCSC conversion tools (missing: ${_missing// /, }) to turn the GTF gene model (file: $gtf) into the BED12 format that RSeQC reads, and they are currently not installed in this environment. Fix: install them into the 'brbseq' Conda environment with 'conda install -c bioconda ucsc-gtftogenepred ucsc-genepredtobed', then run 'conda activate brbseq' again and re-run the pipeline. Alternatively, skip the automatic conversion entirely by pointing the pipeline at a finished BED12 file: --bed-file <file.bed12>."
+  local tmpdir rc=1
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/brbseq_bed12.XXXXXX")"
+  local gp="$tmpdir/genes.gp" bedtmp="$tmpdir/genes.bed"
+  # -- GTF -> genePred -------------------------------------------------------
   # pipefail/errexit are off inside if-conditions: capture rc explicitly.
-  if   [[ "$gtf" == *.gz  ]]; then gzip -dc "$gtf" | gffread --bed -           > "$tmp"; rc=$?
-  elif [[ "$gtf" == *.bz2 ]]; then bzcat -d "$gtf" | gffread --bed -           > "$tmp"; rc=$?
-  else                             gffread       "$gtf" --bed                 > "$tmp"; rc=$?; fi
-  if [[ $rc -ne 0 ]] || [[ ! -s "$tmp" ]]; then
-    rm -f "$tmp"
-    die "bake failed: gffread --bed produced no usable output for $gtf (rc=$rc) — check the GTF (gene/exon entries, quotes, contig names)"
+  if   [[ "$gtf" == *.gz  ]]; then gzip -dc "$gtf"  | gtfToGenePred -  "$gp"; rc=$?
+  elif [[ "$gtf" == *.bz2 ]]; then bzcat -d "$gtf"  | gtfToGenePred -  "$gp"; rc=$?
+  else                             gtfToGenePred     "$gtf"           "$gp"; rc=$?; fi
+  (( rc == 0 ))      || { rm -rf "$tmpdir"; die "Could not convert the GTF gene-model file into an intermediate genePred format (this is step 1 of 2 before RSeQC) — the conversion tool gtfToGenePred stopped with an error on file: $gtf. This usually means the GTF file itself is malformed (for example, missing or broken 'gene'/'exon' lines, or unusual characters in chromosome names). Fix or re-download the GTF file, or supply a finished BED12 instead with --bed-file <file.bed12>."; }
+  [[ -s "$gp" ]]     || { rm -rf "$tmpdir"; die "The conversion of the GTF gene-model file produced an empty intermediate result (step 1 of 2 before RSeQC) for file: $gtf — this usually means the GTF does not contain any recognisable 'gene'/'exon' entries, so there was nothing to convert. Double-check that this is really a GTF annotation file (not, say, a FASTA genome file) and re-run, or supply a finished BED12 instead with --bed-file <file.bed12>."; }
+  # -- genePred -> BED12 (genePredToBed takes <in.gp> <out.bed>; output file is
+  # NOT stdout, and it returns 0 on a usage error, so check the file is
+  # non-empty, not just the exit code) --------------------------------------
+  if ! genePredToBed "$gp" "$bedtmp"; then
+    rm -rf "$tmpdir"
+    die "Could not finish converting the gene model into the BED12 format RSeQC needs (this is step 2 of 2) for file: $gtf. The conversion tool itself reported an error. If you have a BED12 file already prepared for this same gene model, you can point the pipeline at it directly with --bed-file <file.bed12> and skip this conversion entirely.";
   fi
+  [[ -s "$bedtmp" ]] || { rm -rf "$tmpdir"; die "The BED12 conversion finished, but it produced an empty result for file: $gtf — meaning the gene model did not get converted into the format RSeQC needs. If you have a BED12 file already prepared for this same gene model, you can point the pipeline at it directly with --bed-file <file.bed12> instead."; }
   local cols
-  cols="$(awk -F'\t' '!/^#/{print NF; exit}' "$tmp")"
+  cols="$(awk -F'\t' '!/^#/{print NF; exit}' "$bedtmp")"
   if [[ "${cols:-0}" -lt 12 ]]; then
-    rm -f "$tmp"
-    die "bake failed: output for $gtf has ${cols:-0} column(s) (< 12) — not a valid BED12 gene-model file"
+    rm -rf "$tmpdir"
+    die "The finished BED12 file was produced, but its format is wrong (it has ${cols:-0} columns per line; a valid BED12 gene-model file needs exactly 12). This points to a problem in the original GTF gene-model file: $gtf. If you have a known-good BED12 for this gene model, point the pipeline at it with --bed-file <file.bed12> instead."
   fi
-  mv -f "$tmp" "$out"
+  mv -f "$bedtmp" "$out"
+  rm -rf "$tmpdir"
   local rows; rows="$(wc -l < "$out" | tr -d '[:space:]')"
   log "baked BED12 (RSeQC): $out   [from GTF: $gtf]  (${rows} rows x ${cols} cols)"
-  log "provenance:  gffread $gtf --bed > $out"
+  log "provenance:  gtfToGenePred $gtf tmp.gp ; genePredToBed tmp.gp $out   (UCSC chain)"
   RSEQC_BED="$out"
 }
 
@@ -962,21 +983,28 @@ if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
   if [[ -n "$BED_FILE" ]]; then
     log "RSeQC reference in use (as given --bed-file): $BED_FILE"
   else
-    [[ -n "$RSEQC_GTF" ]] || die "cannot bake BED12: no GTF found in $STAR_INDEX (build_star_index.sh moves it there) and no --bed-file was given."
+    [[ -n "$RSEQC_GTF" ]] || die "The read-distribution step needs a gene-model file in a specific format (BED12), but the pipeline could not find the source file (a GTF annotation) to build one from, and no finished BED12 was given either. Normally build_star_index.sh saves the GTF inside the STAR index folder at index-build time, so check that $STAR_INDEX still contains a .gtf (or .gtf.gz) file; if it does not, either rebuild the index so it is saved there again, or supply a finished BED12 directly with --bed-file <file.bed12>."
     # Bake only when RSeQC actually runs; the bake is idempotent
     # (bake_rseqc_bed12 reuses an existing .bed12).  Sets RSEQC_BED.
     bake_rseqc_bed12 "$RSEQC_GTF"
-    [[ -n "$RSEQC_BED" && -s "$RSEQC_BED" ]] || die "bake failed: no BED12 produced."
+    [[ -n "$RSEQC_BED" && -s "$RSEQC_BED" ]] || die "The pipeline tried to build the BED12 gene-model file that RSeQC needs, but the result was missing or zero-sized. This is the same class of problem as a broken/malformed GTF; if you have a known-good BED12 for this gene model, point the pipeline at it with --bed-file <file.bed12> instead."
     BED_FILE="$RSEQC_BED"
   fi
   log "RSeQC reference in use: $BED_FILE"
-  log "RSeQC provenance: baked from GTF $RSEQC_GTF   (recipe: gffread <gtf> --bed > <gtf>.bed12)"
+  log "RSeQC provenance: baked from GTF $RSEQC_GTF   (recipe: gtfToGenePred <gtf> tmp.gp ; genePredToBed tmp.gp <gtf>.bed12   [UCSC chain])"
   run_or_skip "samtools index" "${STAR_BAM}.bai" "samtools" "optional" \
-    samtools index -@ 8 "$STAR_BAM"
+    samtools index -@ 16 "$STAR_BAM"
   run_or_skip "read_distribution" "$RSEQC_OUT" "read_distribution.py" "optional" \
     read_distribution.py -i "$STAR_BAM" -r "$BED_FILE" > "$RSEQC_OUT"
   if [[ -s "$RSEQC_OUT" ]]; then
     log "distribution report: $RSEQC_OUT"
+  fi
+  # Post-use cleanup: remove the baked BED12 (a genome-wide intermediate, not a
+  # per-sample result) now that read_distribution has consumed it. Only ours —
+  # a user-supplied --bed-file leaves RSEQC_BED empty and is left untouched.
+  if [[ -n "$RSEQC_BED" && -f "$RSEQC_BED" ]]; then
+    rm -f "$RSEQC_BED"
+    log "removed baked BED12 intermediate (cleaned up after use): $RSEQC_BED"
   fi
 else
   log ""; log "RSeQC — not requested (use --run-rseqc to enable)"
@@ -989,14 +1017,15 @@ RAW_DIR="${STAR_DIR}/Gene/raw"
 for req in "$RAW_DIR/barcodes.tsv" \
            "$RAW_DIR/umiDedup-NoDedup.mtx" \
            "$RAW_DIR/umiDedup-1MM_Directional.mtx"; do
-  [[ -s "$req" ]] || die "required dup-stats matrix input missing: $req"
+  [[ -s "$req" ]] || die "The step that measures how duplicated / how 'empty' each sample's reads are needs three input files (the raw UMI count tables STAR produces), and one of them is missing or zero-sized: $req. All three must exist in $RAW_DIR before this step can run — this points to a problem earlier in the pipeline (the STAR / UMI-counting step). See the messages printed above for the likely reason; fix that, then re-run (use --resume auto so steps that already finished are not redone)."
 done
 run_or_skip "duplication stats" "$DUP_CSV" "" "mandatory" \
   "$PYTHON" "$DUP_STATS" \
     --raw_dir "$RAW_DIR" \
     --dedup_method "1MM_Directional" \
+    --manifest "$MANIFEST" \
     --output_csv "$DUP_CSV"
-[[ -s "$DUP_CSV" ]] || die "dup stats failed: duplication_statistics.csv not produced"
+[[ -s "$DUP_CSV" ]] || die "The step that measures how duplicated / how 'empty' each sample's reads are did not produce its result file ($DUP_CSV). See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume auto so steps that already finished are not redone)."
 log "duplication stats: $DUP_CSV"
 if [[ -f "${DUP_CSV%.*}.summary.csv" ]]; then
   log "summary           : ${DUP_CSV%.*}.summary.csv"
@@ -1014,33 +1043,45 @@ run_or_skip "rename matrix" "${RENAME_DIR}/barcodes.tsv" "" "mandatory" \
     --mapping   "$MANIFEST" \
     --out-dir   "$RENAME_DIR" \
     --dedup-methods "${DEDUP_METHODS[*]}"
-[[ -s "${RENAME_DIR}/barcodes.tsv" ]] || die "rename failed: no remapped barcodes.tsv"
-[[ -s "${RENAME_DIR}/umiDedup-1MM_Directional.mtx" ]] || die "rename failed: no remapped umiDedup-1MM_Directional.mtx"
+[[ -s "${RENAME_DIR}/barcodes.tsv" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed barcode list ($RENAME_DIR/barcodes.tsv) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume auto so steps that already finished are not redone)."
+[[ -s "${RENAME_DIR}/umiDedup-1MM_Directional.mtx" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed UMI count table ($RENAME_DIR/umiDedup-1MM_Directional.mtx) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume auto so steps that already finished are not redone)."
 log "sample-named matrix dir: ${RENAME_DIR}"
 log "  (barcode->sample map: ${RENAME_DIR}/sample_barcode_map.tsv; raw matrix unchanged in ${RAW_DIR})"
 
-#=== PCA-ready count CSV  [MANDATORY] ========================================
-# Flatten the 1MM_Directional sample-named umiDedup matrix into a single
-# gene x sample CSV.  One row per gene (duplicate symbols folded by summing,
-# matching HTSeq 'union' semantics), one column per Sample_ID from barcodes.tsv.
+#=== matrix CSVs  [MANDATORY] ================================================
+# Flatten the sample-named umiDedup matrices into single gene x sample CSVs.
+# Row key: Gene_id (column 1, unique) then gene_symbol (column 2, annotation)
+# — same layout as the old FastReadCounter deliveries (Gene_id, Gene_name).
+# Cell values are written exactly as they are in the MTX.
+# One column per Sample_ID from barcodes.tsv.
 # This is the "ready for PCA" table — the equivalent of the legacy
 # <pool>_counts.detailed_forPCA.csv — and the input for any downstream
 # clustering/differential-expression step.
 log ""
-log "PCA-ready count CSV (mandatory)"
-run_or_skip "PCA count CSV" "$PCA_OUT_CSV" "" "mandatory" \
-  "$PYTHON" "$PCA_CSV" \
+log "UMI matrix CSV (mandatory)"
+run_or_skip "UMI matrix (deduplicated UMI counts)" "$UMI_MATRIX_CSV" "" "mandatory" \
+  "$PYTHON" "$UMI_MATRIX_PREP" \
     --samples-dir "$RENAME_DIR" \
-    --out-csv   "$PCA_OUT_CSV" \
+    --out-csv   "$UMI_MATRIX_CSV" \
     --dedup     "1MM_Directional"
-[[ -s "$PCA_OUT_CSV" ]] || die "PCA CSV step failed: $PCA_OUT_CSV not produced"
-log "PCA-ready CSV: $PCA_OUT_CSV"
+[[ -s "$UMI_MATRIX_CSV" ]] || die "The final UMI-based gene count table (one row per gene, one column per sample — the primary result table) was not produced at $UMI_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume auto so steps that already finished are not redone)."
+log "UMI matrix CSV: $UMI_MATRIX_CSV"
+
+log ""
+log "Reads matrix CSV (mandatory — NoDedup / all PCR copies)"
+run_or_skip "Reads matrix (NoDedup, all PCR copies)" "$READS_MATRIX_CSV" "" "mandatory" \
+  "$PYTHON" "$UMI_MATRIX_PREP" \
+    --samples-dir "$RENAME_DIR" \
+    --out-csv   "$READS_MATRIX_CSV" \
+    --dedup     "NoDedup"
+[[ -s "$READS_MATRIX_CSV" ]] || die "The final gene count table based on total read counts rather than unique UMIs (one row per gene, one column per sample) was not produced at $READS_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume auto so steps that already finished are not redone)."
+log "Reads matrix CSV: $READS_MATRIX_CSV"
 
 #=== Sample demultiplex (BAM, picard)  [OPTIONAL] ==========================
 if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
   log ""; log "BAM demultiplex via picard (optional)"
-  [[ -f "$BAM_BARCODES" ]] || die "needs bam_barcodes.tsv (produced in barcode prep)"
-  [[ -s "$STAR_BAM"     ]] || die "needs the STAR BAM from the STAR step"
+  [[ -f "$BAM_BARCODES" ]] || die "This optional step (splitting the aligned results file into one file per sample) needs the per-sample barcode list ($BAM_BARCODES), which is normally produced by the earlier 'barcode prep' step. That earlier step apparently did not produce it in this run — see its messages in the run's pipeline.log for the reason. Fix that earlier step's problem and re-run (use --resume auto so steps that already finished are not redone)."
+  [[ -s "$STAR_BAM"     ]] || die "This optional step (splitting the aligned results file into one file per sample) needs the aligned reads file produced by the STAR step ($STAR_BAM), but it is missing or empty. That points to a problem in the STAR alignment step itself — see its messages in the run's pipeline.log for the reason. Fix that and re-run (use --resume auto so steps that already finished are not redone)."
   done_bam="${DMUX_BAM_DIR}/_done"
   if [[ "$RESUME" == "auto" && -s "$done_bam" ]]; then
     log "SKIP BAM demux (done marker present: $done_bam)"
@@ -1051,7 +1092,7 @@ if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
       touch "$done_bam"
       log "per-sample BAMs in: $DMUX_BAM_DIR"
     else
-      warn "optional step skipped: 'picard' not in PATH (see --conda-env or install)" 
+      warn "This optional step (splitting the aligned-results file into one file per sample) cannot run because 'picard' is not installed in the current environment. It ships inside the 'brbseq' Conda environment — activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it). The rest of the pipeline will continue as normal; only this per-sample split will be missing from this run's output."
     fi
   fi
 else
@@ -1074,11 +1115,11 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
         -o "$DMUX_FQ_DIR" \
         -u "unmatched" \
         -t "$THREADS" \
-        || warn "fqtk reported non-zero exit (check log)" 
+        || warn "'fqtk' (the tool that splits the combined FASTQ into one file per sample) finished, but it reported a problem along the way. In plain terms: the per-sample FASTQ files it managed to write are still in $DMUX_FQ_DIR and can be used, but some samples may be missing or incomplete. If you expected every sample to be present, check that folder and compare against your sample list; if something is missing, you can re-run just this step (it is safe to re-run)."
       touch "$DONE_FQ"
       log "per-sample FASTQs in: $DMUX_FQ_DIR"
     else
-      warn "optional step skipped: 'fqtk' not in PATH (see --conda-env or install)" 
+      warn "This optional step (splitting the raw sequence files into one per sample) cannot run because 'fqtk' is not installed in the current environment. It ships inside the 'brbseq' Conda environment — activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it). The rest of the pipeline will continue as normal; only this per-sample split will be missing from this run's output."
     fi
   fi
 else
@@ -1096,7 +1137,8 @@ log "  barcodes               = ${WHITELIST}  ($(wc -l < "$WHITELIST" 2>/dev/nul
 [[ -s "$STAR_BAM"     ]] && log "  STAR BAM             = ${STAR_BAM}"
 [[ -d "$RAW_DIR"      ]] && log "  Gene/raw mtx         = ${RAW_DIR}"
 [[ -s "$DUP_CSV"      ]] && log "  dup stats            = ${DUP_CSV}"
-[[ -s "$PCA_OUT_CSV"  ]] && log "  PCA-ready CSV        = ${PCA_OUT_CSV}"
+[[ -s "$UMI_MATRIX_CSV"  ]] && log "  UMI matrix CSV       = ${UMI_MATRIX_CSV}"
+[[ -s "$READS_MATRIX_CSV" ]] && log "  Reads matrix CSV     = ${READS_MATRIX_CSV}"
 [[ -s "${DMUX_DIR:-/nonexistent}"     ]] && :
 [[ -d "${DMUX_BAM_DIR}/_done" && -s "${DMUX_BAM_DIR}/_done" ]] && log "  demux BAM              = ${DMUX_BAM_DIR}"
 [[ -d "${DMUX_FQ_DIR}/_done"  && -s "${DMUX_FQ_DIR}/_done"  ]] && log "  demux FASTQ            = ${DMUX_FQ_DIR}"

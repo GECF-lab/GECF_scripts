@@ -88,24 +88,27 @@ while [[ $# -gt 0 ]]; do
     --sjdbOverhang) SJDB_OVERHANG="$2"; shift 2 ;;
     --large-genome) LARGE_GENOME=1; shift ;;
     -h|--help) usage ;;
-    *) echo "ERROR: unknown argument: $1" >&2; usage ;;
+    *) echo "ERROR: I don't recognise the option '$1'. The full list of options is printed by:  build_star_index.sh --help" >&2; usage ;;
   esac
 done
 
-[[ -n "$FASTA" && -n "$GTF" && -n "$OUTDIR" ]] || { echo "ERROR: --fasta, --gtf and --outdir are required." >&2; usage; }
+if [[ -z "$FASTA" || -z "$GTF" || -z "$OUTDIR" ]]; then
+  echo "ERROR: This script needs three things to run, and one or more of them is missing: --fasta (the reference genome file), --gtf (the gene annotation file), and --outdir (where to save the built index). The full list of options, with a worked example, is printed by:  build_star_index.sh --help" >&2
+  usage
+fi
 if [[ ( -n "$ERCC_FASTA" && -z "$ERCC_GTF" ) || ( -z "$ERCC_FASTA" && -n "$ERCC_GTF" ) ]]; then
-  echo "ERROR: --ercc-fasta and --ercc-gtf must be passed together (got only one)." >&2
+  echo "ERROR: The two ERCC spike-in options come as a pair: --ercc-fasta and --ercc-gtf must be given together (one adds the spike-in DNA sequences to your genome file, the other adds the matching gene entries to your annotation — either one on its own would leave a mismatched reference). Give both, or omit both, and re-run." >&2
   usage
 fi
 
 # --- sanity checks -----------------------------------------------------------
 for f in "$FASTA" "$GTF" ${ERCC_FASTA:+"$ERCC_FASTA"} ${ERCC_GTF:+"$ERCC_GTF"}; do
-  [[ -f "$f" ]] || { echo "ERROR: input file not found: $f" >&2; exit 1; }
+  [[ -f "$f" ]] || { echo "ERROR: One of the reference files you supplied could not be found: $f. Check that the file name and folder are spelled exactly right (file names are case-sensitive), then re-run." >&2; exit 1; }
 done
-[[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || { echo "ERROR: --threads must be a positive integer." >&2; exit 1; }
-[[ "$SJDB_OVERHANG" =~ ^[0-9]+$ && "$SJDB_OVERHANG" -ge 20 ]] || { echo "ERROR: --sjdbOverhang must be >= 20 (read 2 length minus 1)." >&2; exit 1; }
+[[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -gt 0 ]] || { echo "ERROR: The value given for --threads must be a whole number greater than zero (it sets how many CPU cores STAR is allowed to use at once). For example: --threads 8. Re-run with a valid number." >&2; exit 1; }
+[[ "$SJDB_OVERHANG" =~ ^[0-9]+$ && "$SJDB_OVERHANG" -ge 20 ]] || { echo "ERROR: The value given for --sjdbOverhang must be a whole number of at least 20. In plain terms: this number should be your R2 (genomic) read length minus 1 — for the 90 bp R2 reads used by BRB-seq, that is 89, which is also the default this script already uses, so you can usually just leave --sjdbOverhang out entirely. Re-run with a valid number (or omit the option) for a non-standard read length." >&2; exit 1; }
 if [[ -e "$OUTDIR" && -n "$(ls -A "$OUTDIR" 2>/dev/null)" ]]; then
-  echo "ERROR: outdir '$OUTDIR' already exists and is not empty. STAR refuses to build into an existing index directory — pick a new directory." >&2
+  echo "ERROR: The folder you asked to use as the new index location ($OUTDIR) already exists and already contains files. The index-building tool (STAR) refuses to build into a folder that is not brand-new or empty, to avoid mixing a fresh build with old files. Delete or rename that folder first, or pick a different folder name for --outdir, then re-run." >&2
   exit 1
 fi
 
@@ -114,15 +117,21 @@ fi
 # (e.g. conda activate brbseq), or make sure STAR is otherwise reachable
 # on PATH.
 STAR_BIN="$(command -v STAR || true)"
-[[ -n "$STAR_BIN" ]] || { echo "ERROR: STAR not found on PATH. Activate the brb conda environment first (e.g. 'conda activate brbseq') and re-run." >&2; exit 1; }
-[[ -x "$STAR_BIN" ]] || { echo "ERROR: STAR binary not executable: $STAR_BIN" >&2; exit 1; }
+if [[ -z "$STAR_BIN" ]]; then
+  echo "ERROR: The STAR program (the tool that both builds this index and, later, aligns your reads to it) is not installed or not currently active where this script can reach it. It ships inside the 'brbseq' Conda environment: activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it), then re-run this script. Everything else about the reference files you supplied is fine — this is purely an environment setup issue." >&2
+  exit 1
+fi
+if [[ ! -x "$STAR_BIN" ]]; then
+  echo "ERROR: A STAR program was found at $STAR_BIN, but it is not currently permitted to be run (its file permissions are set to 'not executable'). This is a file-permission problem on this computer, not a problem with your reference files. If you set up this install yourself, check the file's permissions; otherwise, re-install the 'brbseq' Conda environment and try again." >&2
+  exit 1
+fi
 echo "Using STAR:  $STAR_BIN ($("$STAR_BIN" --version 2>&1 | head -n1))"
 
 # Build into the final directory directly. There is no temporary workdir:
 # the index folder is *created by* this run, so the provenance files (the
 # FASTA/GTF STAR actually read) go right next to the index, under their
 # real names.
-mkdir -p "$OUTDIR" || { echo "ERROR: cannot create output directory: $OUTDIR" >&2; exit 1; }
+mkdir -p "$OUTDIR" || { echo "ERROR: Could not create or open the output folder ($OUTDIR) that was to hold the new STAR index. This is a file-system permission problem on this computer (for example the parent folder is not writable by whoever is running this script), not a problem with your reference files. Check permissions on that path, or choose a different --outdir location, and re-run." >&2; exit 1; }
 rm -rf -- "${OUTDIR:?}"
 mkdir -p "$OUTDIR"
 
@@ -148,8 +157,8 @@ materialize() {
     mv -f -- "$src" "$dst"
   else
     case "$src" in
-      *.gz) gzip -dc -- "$src" > "$dst" || { echo "ERROR: failed to decompress $src" >&2; exit 1; } ;;
-      *)    mv -f -- "$src" "$dst" || { echo "ERROR: failed to move $src into $OUTDIR (check disk space / permissions)" >&2; exit 1; } ;;
+      *.gz) gzip -dc -- "$src" > "$dst" || { echo "ERROR: The zipped reference file '$src' could not be read/unpacked into the index folder. This is usually a file-system permission or disk-space problem on this computer, or the .gz file itself is damaged. Check those two things and re-run." >&2; exit 1; } ;;
+      *)    mv -f -- "$src" "$dst" || { echo "ERROR: The reference file '$src' could not be moved into the index folder ($OUTDIR). Check that the computer has enough free disk space and that the file is not locked or protected, then re-run." >&2; exit 1; } ;;
     esac
   fi
 }
@@ -176,10 +185,10 @@ if [[ -n "$ERCC_FASTA" && -n "$ERCC_GTF" ]]; then
   # Append ERCC spike-in sequences to the reference FASTA (plain concatenation;
   # STAR is fine with the two blocks back to back).
   cat "$OUTDIR/$(strip_suffix "$FASTA")" "$OUTDIR/$(strip_suffix "$ERCC_FASTA")" > "$REF_FASTA" \
-    || { echo "ERROR: failed to build $REF_FASTA" >&2; exit 1; }
+    || { echo "ERROR: Could not combine your main reference genome and the ERCC spike-in sequences into the single merged file ($REF_FASTA) that STAR needs. This points to a file-system problem (permissions or disk space) on this computer, not to a problem with the two source files themselves (which are both readable, since they were placed into the index folder just now). Check permissions/disk space and re-run." >&2; exit 1; }
   # Append ERCC gene/transcript/exon records to the annotation GTF.
   cat "$OUTDIR/$(strip_suffix "$GTF")" "$OUTDIR/$(strip_suffix "$ERCC_GTF")" > "$GTF_PLAIN" \
-    || { echo "ERROR: failed to build $GTF_PLAIN" >&2; exit 1; }
+    || { echo "ERROR: Could not combine your main gene annotation and the ERCC spike-in annotation into the single merged file ($GTF_PLAIN) that STAR needs. This points to a file-system problem (permissions or disk space) on this computer, not to a problem with the two source files themselves (which are both readable, since they were placed into the index folder just now). Check permissions/disk space and re-run." >&2; exit 1; }
   echo "ERCC merged: $(basename "$FASTA") + $(basename "$ERCC_FASTA")   ->   $(basename "$REF_FASTA")"
   echo "ERCC merged: $(basename "$GTF") + $(basename "$ERCC_GTF")        ->   $(basename "$GTF_PLAIN")"
 fi
@@ -200,15 +209,15 @@ echo "Running: $STAR_BIN ${STAR_ARGS[*]}"
 "$STAR_BIN" "${STAR_ARGS[@]}"
 star_rc=$?
 if [[ "$star_rc" -ne 0 ]]; then
-  echo "ERROR: STAR genomeGenerate failed (rc=$star_rc). Index directory with partial contents left at: $OUTDIR" >&2
+  echo "ERROR: STAR finished the index build, but it reported that something went wrong part-way through (its own log files hold the specific reason). The folder $OUTDIR was left in place with everything STAR did manage to build before it stopped — you can open the file Log.out inside it (or Log.final.out, if present) to see STAR's own words on what failed, which usually pinpoints the real cause (for example an unrecognised chromosome line in your FASTA, or a gene/exon line in your GTF that STAR does not understand). Fix whatever that log points at, delete or rename the half-built $OUTDIR folder (STAR refuses to build into a folder that already has files in it), and re-run this script. Your original reference files are safe — they have only been copied into $OUTDIR, never modified in their original location." >&2
   exit "$star_rc"
 fi
 
 # --- verification ------------------------------------------------------------
 for f in Genome SA SAindex genomeParameters.txt Log.out; do
-  [[ -e "$OUTDIR/$f" ]] || { echo "ERROR: expected index file missing: $OUTDIR/$f" >&2; exit 1; }
+  [[ -e "$OUTDIR/$f" ]] || { echo "ERROR: STAR said it finished, but one of the files a fully working STAR index must contain is missing from $OUTDIR (expected: $f). This means the build did not actually complete on STAR's side, even if no clear error was printed — the most reliable place to look for the real reason is STAR's own log file, Log.out, inside $OUTDIR. Read through it, fix whatever it points at (common culprits: an odd line in the FASTA or GTF, insufficient disk space), delete or rename the half-built folder, and re-run." >&2; exit 1; }
 done
-grep -q "finished successfully" "$OUTDIR/Log.out" || { echo "ERROR: STAR Log.out does not report a successful build." >&2; exit 1; }
+grep -q "finished successfully" "$OUTDIR/Log.out" || { echo "ERROR: The file inside $OUTDIR where STAR records how its build went (Log.out) does not say the build finished successfully — which means, even though the expected files are all there, STAR's own report does not confirm a clean finish. Open Log.out and read it for the specific reason, fix what it points at, delete or rename the half-built folder, and re-run." >&2; exit 1; }
 echo
 echo "OK — STAR genome index built in: $OUTDIR"
 SJDB_USED="$(awk -F'\t' '$1=="sjdbOverhang"{print $2}' "$OUTDIR/genomeParameters.txt")"

@@ -18,8 +18,11 @@ dependencies:
   - star=2.7.11b
   - samtools=1.24
 
-  # GTF -> BED12 reference conversion (gffread --bed)
-  - gffread
+  # GTF -> BED12 reference conversion (UCSC genePred chain — RSeQC-recommended;
+  # faithful CDS: leaves thickStart=thickEnd empty for transcripts without a
+  # CDS feature, unlike gffread which fills the whole transcript span)
+  - ucsc-gtftogenepred
+  - ucsc-genepredtobed
 
   # Read quality control and FASTQ demultiplexing
   - fastqc=0.12.1
@@ -35,3 +38,6 @@ dependencies:
   - pandas>=2.3.3
   - scipy>=1.15.3
   - numpy>=2.1
+
+  # Lib-prep workbook (xlsx) manifest parsing
+  - openpyxl>=3.1
