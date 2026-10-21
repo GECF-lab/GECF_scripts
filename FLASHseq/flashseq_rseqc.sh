@@ -140,6 +140,10 @@ BEDREF_ARG=""   # --refbed: explicit ready housekeeping-gene BED for GBCOV
 GBCOV_REFBED="";    GBCOV_FALLBACK_GTF=""
 RDIST_BED12="";     RDIST_GTF=""
 BAKED_BED=""        # set by bake_bed12 (last GTF->BED12 conversion)
+# BAKED_BEDS: set of genome-wide BED12 intermediates produced (or reused) by
+# bake_bed12 THIS run, so we can remove them after use (post-run cleanup).
+# A ready housekeeping BED (GBCOV_REFBED) is NOT baked and is left untouched.
+BAKED_BEDS=()
 # GBCOV_BED12: the final reference actually passed to geneBody_coverage
 #               (set at runtime; equals the ready housekeeping BED, or a
 #               baked genome-wide BED12 if no ready housekeeping BED exists).
@@ -601,6 +605,10 @@ bake_bed12() {
   local gtf="$1"
   local bed="$OUT/rseqc/$(basename "${gtf%.gz}").bed12"
   BAKED_BED="$bed"
+  # Track this genome-wide BED12 for post-run cleanup (dedup). It is a BAKED
+  # intermediate in every case that reaches here (both rdist and the gbcov
+  # fallback call this function) — never a ready housekeeping BED.
+  if [[ " ${BAKED_BEDS[*]:-} " != *" $bed "* ]]; then BAKED_BEDS+=("$bed"); fi
   if [[ -s "$bed" ]]; then
     info "baking BED12: using existing (skip): $bed"
     return 0
@@ -1293,6 +1301,23 @@ run_in_batch() {
 run_in_batch
 
 
+#--- post-run cleanup: remove baked genome-wide BED12 intermediates ----------
+# read_distribution / geneBody_coverage have now consumed every reference we
+# baked, so the (often hundreds-of-MB) genome-wide BED12 intermediates are
+# removed to keep the out dir lean. Only files bake_bed12 produced THIS run
+# are touched (BAKED_BEDS) — a ready housekeeping BED (GBCOV_REFBED) is a
+# user asset and is never in this list. Resume-safe: the .bed12 is a pure
+# function of the GTF, so re-baking on a future run is fast and identical.
+if [[ ${#BAKED_BEDS[@]} -gt 0 ]]; then
+  for _bed in "${BAKED_BEDS[@]}"; do
+    if [[ -f "$_bed" ]]; then
+      rm -f "$_bed"
+      info "removed baked BED12 intermediate (cleaned up after use): $_bed"
+    fi
+  done
+  unset _bed
+fi
+
 ELAPSED=$(( SECONDS - START ))
 failed=""
 [[ -f "$OUT/logs/_failed.samples" ]] && failed="$(sort -u "$OUT/logs/_failed.samples" 2>/dev/null | tr '\n' ' ')"
@@ -1305,7 +1330,7 @@ SUMMARY="$(
     info "out dir : $OUT"
     info "samples : ${#SAMPLES_LIST[@]}"
     info "failed  : ${failed:-none}"
-    info "rseqc   : $OUT/rseqc/  (geneBody_coverage, read_distribution, BED12)"
+    info "rseqc   : $OUT/rseqc/  (geneBody_coverage, read_distribution; baked BED12 intermediates removed after use)"
     info "logs    : $OUT/logs/  (per-sample <label>.rseqc.log)"
     info "DONE"
   } 2>&1
