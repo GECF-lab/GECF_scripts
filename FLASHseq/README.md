@@ -29,7 +29,8 @@ conda env create -f flashseq-env.yaml
 ```
 
 Core tools provided by the environment: STAR, samtools, featureCounts,
-fastqc, RSeQC, gffread, R, and Python (with plotly for HTML output). The
+fastqc, RSeQC, UCSC genePred chain (gtfToGenePred + genePredToBed for the
+GTF->BED12 bake), R, and Python (with plotly for HTML output). The
 scripts hard-fail at startup, naming any missing tool, so nothing half-starts.
 
 ## Input requirements
@@ -147,7 +148,7 @@ no alignment, no counting. For each sample it runs:
   *housekeeping-gene* BED (`--refbed` to override)
 - **`read_distribution.py`** — reads per region (exon, 5′/3′ UTR, intron,
   intergenic; TSS/TES ±10/500 bp) — reference = the genome-wide GTF baked to
-  a BED12 once per run (`--gtf` to override)
+  a BED12 once per run via the UCSC genePred chain (`--gtf` to override)
 
 The script discovers every BAM under `<run dir>/bam/`, auto-creates a missing
 `.bam.bai` with `samtools index`, is resume-safe (samples with existing
@@ -210,7 +211,7 @@ bash flashseq_rseqc.sh --species human --outdir <RUN DIR> --per-sample
 | `rseqc/geneBodyCombined.curves.{png,pdf,html}` | Merged coverage curves |
 | `rseqc/coverage/<label>/` | Per-sample mode: `<label>.geneBodyCoverage.txt` + plots per sample |
 | `rseqc/<label>.readDistribution.txt` | `read_distribution.py` report per sample |
-| `rseqc/<gtf basename>.bed12` | BED12 reference baked once per run (shared) |
+| `rseqc/<gtf basename>.bed12` | BED12 reference baked once per run (shared) via UCSC genePred chain |
 | `logs/<label>.rseqc.log` | Full per-sample RSeQC stdout/stderr |
 | `logs/rseqc_run.log` | Master RSeQC run log + SUMMARY |
 | `bam/*.bam.bai` | Index auto-created for any BAM that lacked one |

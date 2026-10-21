@@ -27,8 +27,11 @@ dependencies:
   # pysam and its dependencies are pulled in automatically.
   - rseqc=5.0.5
 
-  # GTF -> BED12 reference conversion (gffread --bed)
-  - gffread
+  # GTF -> BED12 reference conversion (UCSC genePred chain -- RSeQC-recommended;
+  # faithful CDS: leaves thickStart=thickEnd empty for transcripts without a
+  # CDS feature, unlike gffread which fills the whole transcript span)
+  - ucsc-gtftogenepred
+  - ucsc-genepredtobed
 
   # R environment for matrix operations and RSeQC plotting
   - r-base=4.5

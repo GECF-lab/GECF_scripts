@@ -34,8 +34,9 @@
 #       human  -> .../current_human_star/hg38.HouseKeepingGenes.bed
 #       mouse  -> .../current_mouse_star/mm39.HouseKeepingGenes.bed
 #   read_distribution  -> the GENOME-WIDE gene model, BAKED to BED12 with
-#                         gffread from the species GTF (REFS table). NEVER
-#                         the housekeeping set -- read_distribution needs
+#                         the UCSC genePred chain (gtfToGenePred |
+#                         genePredToBed) from the species GTF (REFS table).
+#                         NEVER the housekeeping set -- read_distribution
 #                         exons + introns to split reads into CDS/5'UTR/
 #                         3'UTR/intron/intergenic.
 # Override with --refbed PATH (ready housekeeping BED) and/or --gtf PATH
@@ -68,15 +69,16 @@
 #     samtools index if missing)
 #   * reference MUST be a 12-column gene-model BED (BED12). Per-species gbcov
 #     default = the housekeeping BED in its STAR-references dir (REFBEDS);
-#     --refbed overrides it; --gtf bakes a BED12 from a GTF via gffread --bed
-#     for rdist (gffread silently returns EMPTY output when the input name
-#     ends in .gz, so .gz references are decompressed first). A non-12-column
-#     reference is WARNed about because geneBody_coverage.py skips such rows.
+#     --refbed overrides it; --gtf bakes a BED12 from a GTF via the UCSC
+#     genePred chain (gtfToGenePred -> genePredToBed) for rdist (.gz
+#     references are decompressed first -- UCSC tools don't auto-inflate them).
+#     A non-12-column reference is WARNed about because geneBody_coverage.py
+#     skips such rows.
 #=============================================================================
 set -uo pipefail
 
 # --- defaults ---------------------------------------------------------------
-SCRIPT_VERSION="1.3.0"   # Bump on any change that alters outputs/behaviour.
+SCRIPT_VERSION="1.4.0"   # Bump on any change that alters outputs/behaviour.
 SPECIES=""
 GTF_ARG=""
 OUT=""
@@ -114,8 +116,8 @@ REFBEDS=(
 )
 
 # Built-in GTF references (kept in sync with flashseq_pipeline.sh) -- the
-# GENOME-WIDE gene model, used to BAKE the read_distribution BED12 (gffread
-# --bed), or via --gtf as an override:
+# GENOME-WIDE gene model, used to BAKE the read_distribution BED12 (UCSC
+# genePred chain), or via --gtf as an override:
 #   <species>|<gtf path>|<gene-set label>
 REFS=(
   "human|/home/gecf/references/STAR_references/FLASHseq/current_human_star/Homo_sapiens.GRCh38.116.gtf|GRCh38.116"
@@ -173,19 +175,26 @@ die()  { err "$1"; exit 1; }
 # so the provenance of every run is recorded. Each tool self-reports via its
 # --version flag:
 #   geneBody_coverage.py / read_distribution.py --version   (RSeQC)
-#   gffread --version
+#   gtfToGenePred / genePredToBed                    (UCSC; no --version flag --
+#                                                     self-identified by no-arg usage)
 #   samtools --version                    (optional -- only for .bam.bai)
 #   Rscript (drives geneBody_coverage plotting)            (optional)
 log_tool_versions() {
   local v lbl
   info "=== tool versions (provenance) ==="
   lbl=$(printf '%-21s: ' 'flashseq_rseqc.sh'); info "${lbl}${SCRIPT_VERSION}"
-  # RSeQC python tools + gffread (required); samtools + R (gbcov plotting)
-  # are optional here. Pad each label to 21 chars so the colon + value
-  # align in one column no matter the label length.
-  for t in geneBody_coverage.py read_distribution.py gffread samtools; do
+  # RSeQC python tools + UCSC genePred chain (required); samtools + R
+  # (gbcov plotting) are optional here. Pad each label to 21 chars so the
+  # colon + value align in one column no matter the label length.
+  # gtfToGenePred/genePredToBed don't take --version (they print usage to
+  # stderr), so capture the name line from a no-arg invocation instead --
+  # proves they are present + runnable, which is what matters here.
+  for t in geneBody_coverage.py read_distribution.py gtfToGenePred genePredToBed samtools; do
     if command -v "$t" >/dev/null 2>&1; then
-      v=$("$t" --version 2>&1 | head -1)
+      case "$t" in
+        gtfToGenePred|genePredToBed) v=$("$t" 2>&1 | head -1) ;;
+        *) v=$("$t" --version 2>&1 | head -1) ;;
+      esac
       lbl=$(printf '%-21s: ' "$t"); info "${lbl}${v}"
     else
       lbl=$(printf '%-21s: ' "$t"); info "${lbl}not in PATH"
@@ -237,7 +246,8 @@ OPTIONAL
                        BED (BED12); a bed/bedGraph region list would be skipped.
                        Does NOT change the read_distribution reference.
   --gtf PATH           gene model GTF used by read_distribution (baked to
-                       BED12 via gffread --bed); used for custom species or to
+                       BED12 via UCSC genePred chain: gtfToGenePred |
+                       genePredToBed); used for custom species or to
                        override the per-species default.
   --samples a,b        process only these sample labels (from bam/ names)
   --max-jobs N         samples in parallel (default 4)
@@ -330,21 +340,30 @@ STEPS_LABEL="gbcov"
 
 # --- tool resolution --------------------------------------------------------
 # RSeQC 5.0.5 entry points must be on PATH (or the known envs get prepended).
-# Rscript for plots is optional; samtools/gffread/gzip are required-ish.
+# Rscript for plots is optional; samtools/UCSC-genePred/gzip are required-ish.
 _prepend_if_present() {
   local d="$1"
   [[ -d "$d" ]] || return 0
   case ":$PATH:" in *":$d:"*) : ;; *) export PATH="$d:$PATH" ;; esac
 }
 if command -v geneBody_coverage.py >/dev/null 2>&1 \
- && command -v read_distribution.py >/dev/null 2>&1 \
- && command -v gffread              >/dev/null 2>&1; then
+ && command -v read_distribution.py  >/dev/null 2>&1 \
+ && command -v gtfToGenePred         >/dev/null 2>&1 \
+ && command -v genePredToBed         >/dev/null 2>&1; then
   :
 else
   if   [[ -n "${CONDA_PREFIX:-}" ]]; then _prepend_if_present "$CONDA_PREFIX/bin"; fi
   _prepend_if_present "/home/hermes/.conda/envs/flashseq/bin"        # drafting box
   _prepend_if_present "/home/gecf/softwares/anaconda/envs/flashseq/bin"  # ptegsrv3
 fi
+# UCSC genePred chain (gtfToGenePred + genePredToBed): prepend a hand
+# installation if present (harmless -- _prepend_if_present skips an already
+# active dir). Covers envs built before the ucsc-* blocks were added. See
+# flashseq-env.yaml.
+for _ucsc_dir in "${UCSC_TOOLS_DIR:-}" "$HOME/.local/bin/ucsc"; do
+  [[ -n "$_ucsc_dir" ]] && _prepend_if_present "$_ucsc_dir"
+done
+unset _ucsc_dir
 # conda_env_hint -- shared guidance when an RSeQC-env tool is missing.
 # The user should be in the 'flashseq' conda env; if it doesn't exist yet,
 # build it from the env file that ships next to this script.
@@ -353,7 +372,8 @@ fi
 conda_env_hint() {
   # Print guidance telling the user to activate (or create) the 'flashseq'
   # conda env, which provides geneBody_coverage.py / read_distribution.py /
-  # gffread. The caller prints the specific missing tool on the [ERROR] line.
+  # gtfToGenePred / genePredToBed (UCSC chain). The caller prints the specific
+  # missing tool on the [ERROR] line.
   cat <<HINT
 You are probably not in the 'flashseq' conda env. Fix:
 
@@ -371,7 +391,8 @@ HINT
 _missing=""
 command -v geneBody_coverage.py >/dev/null 2>&1 || _missing="$_missing geneBody_coverage.py"
 command -v read_distribution.py >/dev/null 2>&1 || _missing="$_missing read_distribution.py"
-command -v gffread              >/dev/null 2>&1 || _missing="$_missing gffread"
+command -v gtfToGenePred        >/dev/null 2>&1 || _missing="$_missing gtfToGenePred"
+command -v genePredToBed        >/dev/null 2>&1 || _missing="$_missing genePredToBed"
 [[ -n "$_missing" ]] && {
   err "RSeQC tool(s) not found on PATH:$_missing"
   conda_env_hint
@@ -379,7 +400,7 @@ command -v gffread              >/dev/null 2>&1 || _missing="$_missing gffread"
 }
 command -v Rscript   >/dev/null 2>&1 || warn "Rscript not found -- geneBody_coverage plots skipped (tabular output still produced)"
 command -v samtools  >/dev/null 2>&1 || warn "samtools not found -- cannot auto-index missing .bam.bai (pipeline normally writes it)"
-for _t in geneBody_coverage.py read_distribution.py gffread; do
+for _t in geneBody_coverage.py read_distribution.py gtfToGenePred genePredToBed; do
   info "${_t} -> $(command -v "$_t" 2>/dev/null || echo MISSING)"
 done
 
@@ -524,8 +545,9 @@ ensure_index() {
 
 # rseqc_preflight -- hard-stop if any required tool is absent.
 # Runs once in the parent before sample work (also during --dry-run).
-# gffread/gzip are only needed if we will actually bake a BED12 (RDIST always
-# bakes; GBCOV only if no ready housekeeping BED was found).
+# gtfToGenePred/genePredToBed/gzip are only needed if we will actually bake a
+# BED12 (RDIST always bakes; GBCOV only if no ready housekeeping BED was
+# found).
 rseqc_preflight() {
   local miss=""
   command -v geneBody_coverage.py  >/dev/null 2>&1 || miss="$miss geneBody_coverage.py"
@@ -533,14 +555,18 @@ rseqc_preflight() {
   [[ -n "$miss" ]] && { err "--rseqc stage missing: $miss"; conda_env_hint; exit 1; }
   # RDIST always needs to bake (we always have an GTF; GBCOV only if falling back).
   if [[ -n "$RDIST_GTF" ]]; then
-    command -v gffread >/dev/null 2>&1 || { err "gffread not found -- needed to bake BED12 from GTF ($RDIST_GTF) for read_distribution"; conda_env_hint; exit 1; }
+    for _t in gtfToGenePred genePredToBed; do
+      command -v "$_t" >/dev/null 2>&1 || { err "$_t not found -- needed to bake BED12 from GTF ($RDIST_GTF) for read_distribution"; conda_env_hint; exit 1; }
+    done
     case "$RDIST_GTF" in
       *.gz)  command -v gzip  >/dev/null 2>&1 || die "gzip  not found but RDIST GTF is .gz"  ;;
       *.bz2) command -v bzcat >/dev/null 2>&1 || die "bzcat not found but RDIST GTF is .bz2" ;;
     esac
   fi
   if [[ -n "$GBCOV_FALLBACK_GTF" ]]; then
-    command -v gffread >/dev/null 2>&1 || { err "gffread not found -- needed to bake BED12 from GTF ($GBCOV_FALLBACK_GTF) for geneBody_coverage (no ready housekeeping BED found)"; conda_env_hint; exit 1; }
+    for _t in gtfToGenePred genePredToBed; do
+      command -v "$_t" >/dev/null 2>&1 || { err "$_t not found -- needed to bake BED12 from GTF ($GBCOV_FALLBACK_GTF) for geneBody_coverage (no ready housekeeping BED found)"; conda_env_hint; exit 1; }
+    done
     case "$GBCOV_FALLBACK_GTF" in
       *.gz)  command -v gzip  >/dev/null 2>&1 || die "gzip  not found but GBCOV fallback GTF is .gz"  ;;
       *.bz2) command -v bzcat >/dev/null 2>&1 || die "bzcat not found but GBCOV fallback GTF is .bz2" ;;
@@ -548,12 +574,29 @@ rseqc_preflight() {
   fi
 }
 
-# bake_bed12 GTF -- GTF -> BED12 (gffread --bed). Returns the BED path in
-# $BAKED_BED (also echoed). File-level guard is concurrent-safe.
+# bake_bed12 GTF -- GTF -> BED12 (UCSC genePred chain). Returns the BED path
+# in $BAKED_BED (also echoed). File-level guard is concurrent-safe.
 # Shared by the two per-tool reference paths below; safe to call twice in the
 # same run (e.g. once for RDIST, once for a GBCOV fallback) -- the second call
 # will re-bake only if it's a DIFFERENT GTF (different output path), or reuse
 # the existing BED12 if the target file is already there.
+#
+# Chain (minimal -- exactly what UCSC docs recommend, and what we verified
+# deterministic on AVT0551):
+#          gtfToGenePred GTF   gp   (transcript-level genePred, 8 cols)
+#          genePredToBed gp    bed  (12-col BED12)
+#
+# NOT sorted: read_distribution reads the BED12 row-by-row and doesn't need
+# bedtools ordering, so we don't add a third dependency. If you later feed
+# this BED12 to a tool that does, prepend `bedSort` to the pipeline.
+#
+# Why UCSC chain, not gffread --bed: for transcripts whose GTF has no explicit
+# CDS feature (many lncRNAs / pseudogenes), gffread fills thickStart/thickEnd
+# over the WHOLE transcription-unit span -- RSeQC then classifies every exon
+# as "CDS_exons". UCSC leaves thickStart=thickEnd (empty CDS) -- which is the
+# biologically faithful reading of "no CDS in this transcript". Verified on
+# AVT0551 lung_116: identical read totals, different CDS/UTR partition
+# (gffread CDS 146M bases, UCSC CDS 38M -- the difference moved to 5'/3' UTR).
 bake_bed12() {
   local gtf="$1"
   local bed="$OUT/rseqc/$(basename "${gtf%.gz}").bed12"
@@ -567,23 +610,38 @@ bake_bed12() {
     # calls prepare_gbcov_ref; if both resolve to the same GTF (and thus the
     # same output BED) we only want this logged once.
     if [[ -z "${_BAKED_DRYRUN_ANNOUNCED[$bed]:-}" ]]; then
-      if [[ "$gtf" == *.gz ]]; then info "  [dry-run] gzip -dc $gtf | gffread --bed - > $bed"
-      else                           info "  [dry-run] gffread $gtf --bed > $bed"; fi
+      if [[ "$gtf" == *.gz ]]; then
+        info "  [dry-run] gzip -dc   $gtf | gtfToGenePred -  tmp.gp"
+        info "             genePredToBed tmp.gp  $bed     (UCSC chain)"
+      else
+        info "  [dry-run] gtfToGenePred $gtf tmp.gp ; genePredToBed tmp.gp $bed   (UCSC chain)"
+      fi
       _BAKED_DRYRUN_ANNOUNCED["$bed"]=1
     else
       info "  [dry-run] baking (reused from same GTF): $bed"
     fi
     return 0
   fi
-  local tmp rc=1
-  tmp=$(mktemp "${TMPDIR:-/tmp}/rseqc_bed12.XXXXXX")
-  if   [[ "$gtf" == *.gz  ]]; then gzip -dc  "$gtf"  | gffread --bed - >"$tmp"; rc=$?
-  elif [[ "$gtf" == *.bz2 ]]; then bzcat -d  "$gtf"  | gffread --bed - >"$tmp"; rc=$?
-  else                             gffread     "$gtf" --bed          >"$tmp"; rc=$?; fi
-  if (( rc != 0 )); then rm -f "$tmp"; die "gffread --bed failed rc=$rc on $gtf -- check GTF validity / gffread version"; fi
-  [[ -s "$tmp" ]] || { rm -f "$tmp"; die "gffread --bed produced EMPTY output for $gtf -- is it a valid GTF with exon entries?"; }
-  mv -f "$tmp" "$bed"
-  info "$bed: $(wc -l <"$bed") BED12 rows"
+  local tmpdir rc=1
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/rseqc_bed12.XXXXXX")
+  local gp="$tmpdir/genes.gp" bedtmp="$tmpdir/genes.bed"
+  # -- GTF -> genePred -------------------------------------------------
+  if   [[ "$gtf" == *.gz  ]]; then gzip -dc  "$gtf"  | gtfToGenePred -  "$gp"; rc=$?
+  elif [[ "$gtf" == *.bz2 ]]; then bzcat -d  "$gtf"  | gtfToGenePred -  "$gp"; rc=$?
+  else                             gtfToGenePred     "$gtf"           "$gp"; rc=$?; fi
+  (( rc == 0 )) || { rm -rf "$tmpdir"; die "gtfToGenePred failed rc=$rc on $gtf -- check GTF validity / ucsc-gtftogenepred version"; }
+  [[ -s "$gp" ]]  || { rm -rf "$tmpdir"; die "gtfToGenePred produced EMPTY genePred for $gtf -- is it a valid GTF with exon entries?"; }
+  # -- genePred -> BED12 (genePredToBed takes <in.gp> <out.bed>; it prints
+  # usage to stderr and returns 0 in the usage-error case, so we MUST check
+  # the output file size, not just the exit code) ----------------------
+  if ! genePredToBed "$gp" "$bedtmp"; then
+    rm -rf "$tmpdir"
+    die "genePredToBed failed on $gtf (gp=$(du -h "$gp" 2>/dev/null | cut -f1)) -- is the genePred file consistent?";
+  fi
+  [[ -s "$bedtmp" ]] || { rm -rf "$tmpdir"; die "genePredToBed produced EMPTY/missing BED for $gtf (gp=$(du -h "$gp" 2>/dev/null | cut -f1) gp) -- genePred may be corrupt or the tool rejected it"; }
+  mv -f "$bedtmp" "$bed"
+  rm -rf "$tmpdir"
+  info "$bed: $(wc -l <"$bed") BED12 rows (UCSC genePred chain: gtfToGenePred | genePredToBed)"
 }
 
 # prepare_rdist_ref -- resolve RDIST_BED12 (always: bake BED12 from RDIST_GTF).
@@ -1103,8 +1161,8 @@ fi
 # Reference / sample pre-flight check (runs in BOTH real and dry-run modes).
 # Consolidates the per-file existence/readability/non-empty checks into one
 # clear [PASS]/[FAIL] list. Dies with a single actionable message at the end
-# if anything is missing, so we don't walk forward into gffread / RSeQC only
-# to discover the input was 0-byte or on a different machine.
+# if anything is missing, so we don't walk forward into the UCSC chain /
+# RSeQC only to discover the input was 0-byte or on a different machine.
 # ============================================================================
 check_ref_file() {
   # $1 = human label, $2 = path. Reports [ok]/[FAIL]; appends to _REF_FAILS.
