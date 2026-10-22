@@ -508,56 +508,75 @@ else
   log "header   = YES   (first row of $MANIFEST is a header and is skipped)"
 fi
 
-#--- tool discovery ----------------------------------------------------------
+#--- tool discovery (env-first) ----------------------------------------------
+# Tool resolution policy (2026-10-22, user direction): use the pipeline tools
+# from the brbseq Conda environment, not from copies that merely happen to sit
+# on the server/PATH.  Previously the env was only consulted when STAR was NOT
+# already in PATH, so a stray older system python3 won and crashed
+# parse_libprep_xlsx.py (`from __future__ import annotations` needs Python 3.7+).
+# Now the env is tried FIRST even when STAR is already on PATH.
 have() { command -v "$1" >/dev/null 2>&1; }
-# STAR ships in the brbseq conda env (bioconda); autodetect the binary.
-STAR_BIN=""
-for cand in STAR-avx2 STAR-avx STAR; do
-  if have "$cand"; then STAR_BIN="$cand"; break; fi
-done
-HAVE_STAR=0;      [[ -n "$STAR_BIN" ]] && have "$STAR_BIN" && HAVE_STAR=1
-HAVE_FASTQC=0;    have fastqc              && HAVE_FASTQC=1
-HAVE_SAMTOOLS=0;  have samtools            && HAVE_SAMTOOLS=1
-HAVE_RSEQC=0;     have read_distribution.py && HAVE_RSEQC=1
-HAVE_PICARD=0;    have picard              && HAVE_PICARD=1
-HAVE_FQTK=0;      have fqtk                && HAVE_FQTK=1
-have "$PYTHON"    || PYTHON="$(have python3 && echo python3 || echo python)"
-#--- auto-activate the known production env (ptegsrv3) ----------------------
-# The brbseq env on ptegsrv3 lives at this LITERAL prefix — the square
-# brackets are real characters in the path, so it must stay quoted (an
-# unquoted '[' would glob). Override for other hosts via the environment:
-#   BRBSEQ_ENV=<prefix>/envs/brbseq ./brbseq_pipeline.sh ...
-BRBSEQ_ENV="${BRBSEQ_ENV:-/home/gecf/softwares/anaconda/[/home/gecf/softwares/anaconda]/envs/brbseq}"
-if [[ "$HAVE_STAR" -eq 0 && -d "${BRBSEQ_ENV}/bin" ]]; then
-  export PATH="${BRBSEQ_ENV}/bin:${PATH}"
-  [[ -x "${BRBSEQ_ENV}/bin/python" ]] && PYTHON="${BRBSEQ_ENV}/bin/python"
-  # PATH changed: re-run tool discovery so HAVE_* reflects the env.
+_py_has_openpyxl() { [[ -n "$1" ]] && "$1" -c "import openpyxl" >/dev/null 2>&1; }
+_py_modern() {  # True for a Python that supports `from __future__ import annotations`
+  [[ -n "$1" ]] && "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; }
+_detect_tools() {
   STAR_BIN=""
   for cand in STAR-avx2 STAR-avx STAR; do
     if have "$cand"; then STAR_BIN="$cand"; break; fi
   done
   HAVE_STAR=0;      [[ -n "$STAR_BIN" ]] && have "$STAR_BIN" && HAVE_STAR=1
-  HAVE_FASTQC=0;    have fastqc              && HAVE_FASTQC=1
-  HAVE_SAMTOOLS=0;  have samtools            && HAVE_SAMTOOLS=1
+  HAVE_FASTQC=0;    have fastqc               && HAVE_FASTQC=1
+  HAVE_SAMTOOLS=0;  have samtools             && HAVE_SAMTOOLS=1
   HAVE_RSEQC=0;     have read_distribution.py && HAVE_RSEQC=1
-  HAVE_PICARD=0;    have picard              && HAVE_PICARD=1
-  HAVE_FQTK=0;      have fqtk                && HAVE_FQTK=1
-  log "env      = ${BRBSEQ_ENV}"
+  HAVE_PICARD=0;    have picard               && HAVE_PICARD=1
+  HAVE_FQTK=0;      have fqtk                 && HAVE_FQTK=1
+}
+
+# Locate the brbseq conda env; first candidate with a bin/ wins:
+#   1) explicit BRBSEQ_ENV (caller override, highest priority)
+#   2) the active conda env, if it is named brbseq or brb
+#   3) a brb*/brbseq env in the production anaconda envs/ directory — the
+#      known ptegsrv3 path contains LITERAL square brackets, so it must stay
+#      quoted (an unquoted '[' is a glob metacharacter).
+_cands=( "${BRBSEQ_ENV:-}" )
+if [[ ( "${CONDA_DEFAULT_ENV:-}" == "brbseq" || "${CONDA_DEFAULT_ENV:-}" == "brb" ) && -n "${CONDA_PREFIX:-}" ]]; then
+  _cands+=( "$CONDA_PREFIX" )
 fi
-if [[ "$HAVE_STAR" -eq 0 ]]; then
-  die "The Python environment that runs this pipeline cannot be found. This is the set of programs (STAR, samtools, etc.) the pipeline needs. Two ways to fix it: 1) create it once, from this script's folder: conda env create -f ${SCRIPT_DIR}/brbseq-env.yaml, then activate it: conda activate brbseq — then re-run;  2) or, if you already have such an environment, point to it:  BRBSEQ_ENV=<folder>/envs/<name> brbseq_pipeline.sh ..."
+_cands+=( "/home/gecf/softwares/anaconda/[/home/gecf/softwares/anaconda]/envs/brbseq" )
+BRBSEQ_ENV=""
+for _c in "${_cands[@]}"; do
+  [[ -n "$_c" && -d "${_c}/bin" ]] && { BRBSEQ_ENV="$_c"; break; }
+done
+if [[ -z "$BRBSEQ_ENV" ]]; then
+  _ana="/home/gecf/softwares/anaconda/[/home/gecf/softwares/anaconda]"
+  if [[ -d "${_ana}/envs" ]]; then
+    for _base in brbseq brb; do
+      if [[ -d "${_ana}/envs/${_base}/bin" ]]; then BRBSEQ_ENV="${_ana}/envs/${_base}"; break; fi
+    done
+  fi
+fi
+unset _c _cands _ana _base _env 2>/dev/null || true
+
+if [[ -n "$BRBSEQ_ENV" ]]; then
+  export PATH="${BRBSEQ_ENV}/bin:${PATH}"
+  [[ -x "${BRBSEQ_ENV}/bin/python" ]] && PYTHON="${BRBSEQ_ENV}/bin/python"
+  if [[ -n "$PYTHON" && -x "$PYTHON" ]] && ! _py_modern "$PYTHON"; then
+    die "The 'brbseq' Conda environment at ${BRBSEQ_ENV} ships a Python that is too old for this pipeline (needs Python 3.7+, found: $PYTHON). Rebuild the environment with a modern Python:  conda env create -f ${SCRIPT_DIR}/brbseq-env.yaml  then  conda activate brbseq  and re-run; or point the pipeline at a working environment with BRBSEQ_ENV=<path>."
+  fi
+  _detect_tools
+  log "env      = ${BRBSEQ_ENV}  (all pipeline tools resolved from this environment; the caller's PATH is not used for tools)"
+else
+  PYTHON="${PYTHON:-python3}"
+  _detect_tools
+  log "env      = (brbseq Conda environment not found — tools resolved from the current PATH)"
 fi
 
-#--- python with openpyxl (workbook mode) -----------------------------------
-# parse_libprep_xlsx.py needs 'import openpyxl'.  The caller activates their
-# own environment (e.g. 'conda activate brbseq') before launching; this script
-# only verifies the active python has it and fails with a clear message if not.
-py_has_openpyxl() { [[ "$1" != "" ]] && "$1" -c "import openpyxl" >/dev/null 2>&1; }
-if [[ "$LIBPREP_MODE" -eq 1 ]]; then
-  py_has_openpyxl "$PYTHON" || {
-    have python3 || PYTHON="python3"
-  }
-  py_has_openpyxl "$PYTHON" || die "Reading the lib-prep Excel workbook needs a Python setup that includes the 'openpyxl' package, but the Python currently in use does not have it. Usually this is fixed by activating the 'brbseq' Conda environment:  conda activate brbseq  — then re-run the pipeline. If you have never created that environment, create it once from the 'brbseq-env.yaml' file that sits next to this pipeline script:  conda env create -f brbseq-env.yaml  and then 'conda activate brbseq', and re-run."
+if [[ "$HAVE_STAR" -eq 0 ]]; then
+  die "STAR — the program that maps reads to the genome — was not found either in the brbseq Conda environment or on the current PATH. It normally ships inside the 'brbseq' Conda environment. Two ways to fix:  1) create that environment once from this script's folder:  conda env create -f ${SCRIPT_DIR}/brbseq-env.yaml  then  conda activate brbseq  and re-run;  2) or, if the environment already lives elsewhere on this machine, point the pipeline at it:  BRBSEQ_ENV=<path-to-env> brbseq_pipeline.sh ..."
+fi
+
+if [[ "$LIBPREP_MODE" -eq 1 ]] && ! _py_has_openpyxl "$PYTHON"; then
+  die "Reading the lib-prep Excel workbook needs a Python that has the 'openpyxl' package, but the Python currently in use ($PYTHON) does not. The 'brbseq' Conda environment ships it — that environment is normally auto-detected, so this usually means the brbseq environment is missing or incomplete on this machine. Fix: create it once from this script's folder —  conda env create -f ${SCRIPT_DIR}/brbseq-env.yaml  then  conda activate brbseq  and re-run; or point the pipeline at it:  BRBSEQ_ENV=<path-to-env>."
 fi
 
 #--- generate manifest from lib-prep workbook (workbook mode) ----------------
