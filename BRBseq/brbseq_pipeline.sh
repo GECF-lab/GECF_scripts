@@ -73,7 +73,6 @@ BARCODE_TSV=""                   # manifest: Sample_ID<TAB>Barcode
 # Lib-prep workbook mode (alternative to --barcode-tsv):
 LIBPREP_XLSX=""                  # Mercurius lib-prep .xlsx (sample code + Oligo-dT primer well)
 BARCODES_PLATE=""                # well-matched barcode plate (well + 14-nt CB per line); empty = infer from the workbook's 'Kit ref' row
-FORCE_PLATE=0                    # pass --force-plate to the parser (deliberate kit/plate family override)
 EMPTY_WELLS=0                    # pass --empty-wells to the parser (emit unoccupied plate wells)
 SPECIES=""                       # human | mouse | <custom name>
 STAR_INDEX=""                    # STAR --genomeDir; resolved from --species if unset
@@ -133,17 +132,18 @@ REQUIRED FLAGS
          Mercurius lib-prep workbook (sample code + Oligo-dT primer well). The
          barcode plate is joined by well. If --barcodes-plate is omitted, it is
          inferred from the workbook's 'Kit ref' row (V5A/V5D ->
-         barcodes_96_<family>_*.txt next to the xlsx); if given, the file's
-         family is cross-checked against the Kit ref and a mismatch aborts the
-         run (pass --force-plate to override a deliberate re-prep).
+         barcodes_96_<family>_*.txt in the plate directory
+         /home/gecf/NGS_pipelines/BRB-seq/BRB_plates, override: $BRB_PLATE_DIR);
+         if given, it is authoritative — a family disagreement with the
+         workbook's 'Kit ref' only produces a loud warning (the named file is
+         used as-is).
 
 OPTIONAL FLAGS
   --star-genome <dir>   STAR genomeDir (built with build_star_index.sh);
                         required for custom --species, overrides built-in
   --bed-file <bed12>    RSeQC BED12 gene model (override). If omitted, bakes
                         one at run time from the GTF shipped inside the STAR
-                        index dir (build_star_index.sh moves it there) — needs
-                        gtfToGenePred + genePredToBed (UCSC) in PATH
+                        index dir (build_star_index.sh moves it there)
   --out-dir <dir>       root output dir (default /mnt/data/BRB-seq_output)
   --threads <n>         threads (default 8)
   --resume <auto|force> auto = skip completed steps (default); force = rerun
@@ -151,10 +151,6 @@ OPTIONAL FLAGS
   --skip-rseqc          skip read_distribution  (on by default)
   --skip-dmux-bam       skip picard BAM demux  (on by default)
   --skip-dmux-fq        skip fqtk FASTQ demux  (on by default)
-  --force-plate         suppress the kit/plate family cross-check in workbook
-                        mode (override a deliberate re-prep where the
-                        --barcodes-plate family differs from the workbook's
-                        'Kit ref' row)
   --empty-wells         workbook mode: also emit every unoccupied plate well as
                         an empty_well_<WELL> column (old-pipeline convention)
                         so all plate wells show up in the STARsolo matrix.
@@ -197,7 +193,6 @@ while [[ $# -gt 0 ]]; do
     --barcode-tsv)  BARCODE_TSV="${2:?missing --barcode-tsv value}"; shift 2;;
     --libprep-xlsx) LIBPREP_XLSX="${2:?missing --libprep-xlsx value}"; shift 2;;
     --barcodes-plate) BARCODES_PLATE="${2:?missing --barcodes-plate value}"; shift 2;;
-    --force-plate)    FORCE_PLATE=1;                                           shift;;
     --empty-wells)    EMPTY_WELLS=1;                                           shift;;
     --species)      SPECIES="${2:?missing --species value}";          shift 2;;
     --star-genome)   STAR_INDEX="${2:?missing --star-genome value}";   shift 2;;
@@ -230,8 +225,8 @@ done
 #   --libprep-xlsx  (+ optional --barcodes-plate).
 # The plate is optional in workbook mode: parse_libprep_xlsx.py infers it from
 # the workbook's 'Kit ref' row (barcodes_96_<family>_*.txt next to the
-# workbook) — or cross-checks an explicitly given plate against it (exit 4 on
-# a family mismatch, --force-plate to override).
+# workbook); an explicitly given plate is authoritative (a family mismatch with
+# the Kit ref is a loud warning, not an abort).
 if [[ -n "$BARCODE_TSV" && -n "$LIBPREP_XLSX" ]]; then
   die "You specified both --barcode-tsv and --libprep-xlsx, but only one of them can be used (both define the sample ↔ barcode mapping).  Remove one of the two flags and re-run."
 fi
@@ -562,9 +557,6 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   if [[ -n "$BARCODES_PLATE" ]]; then
     parse_args+=( --plate "$BARCODES_PLATE" )
   fi
-  if [[ "$FORCE_PLATE" -eq 1 ]]; then
-    parse_args+=( --force-plate )
-  fi
   if [[ "$EMPTY_WELLS" -eq 1 ]]; then
     parse_args+=( --empty-wells )
   fi
@@ -574,9 +566,6 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   parse_rc=0
   "$PYTHON" "$PARSE_LIBPREP" "${parse_args[@]}" || parse_rc=$?
   if [[ "$parse_rc" -ne 0 ]]; then
-    if [[ "$parse_rc" -eq 4 ]]; then
-      die "The barcode plate file you are using does not match the 'Kit ref' recorded in the Excel workbook — in other words, the well positions / barcode families look like they belong to a different plate than the one the workbook expects. Double-check that --barcodes-plate points at the file for the SAME plate as this exact lib-prep workbook (the file name usually includes a family code that must match the 'Kit ref' row). If, after checking, you are certain the plate is actually the right one and the two simply use a different naming scheme, you can force the pipeline to proceed despite this mismatch by adding the  --force-plate  flag — but only do that if you have verified the plate is correct."
-    fi
     die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  saved in the same folder as the workbook. If that file is missing or named differently, either rename/move it into place, or pass it explicitly with  --barcodes-plate <file>. Then re-run."
   fi
   [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
@@ -617,9 +606,7 @@ log "python     = ${PYTHON}"
 if [[ -n "$LIBPREP_PROV" ]]; then
   log "lib-prep   = ${LIBPREP_XLSX}"
   if [[ -n "$BARCODES_PLATE" ]]; then
-    plate_note=""
-    [[ "$FORCE_PLATE" -eq 1 ]] && plate_note="  [--force-plate]"
-    log "plate      = ${BARCODES_PLATE}${plate_note}"
+    log "plate      = ${BARCODES_PLATE}"
   else
     log "plate      = (not given — inferred from the workbook's 'Kit ref' row)"
   fi

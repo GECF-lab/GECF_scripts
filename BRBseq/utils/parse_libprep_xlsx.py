@@ -39,15 +39,15 @@ permissively: 'A01' == 'A1' == 'a01'; barcodes are upper-cased and must be
 [ACGT]{14}.  Any layout with one position + one 14-nt barcode per line is
 accepted (e.g. the 'barcodes_96_*_brb_STAR_solo.txt' well-matched files).
 
-The workbook's 'Kit ref' row cross-checks the plate FAMILY: the same well
-encodes a different 14-nt CB on a V5A plate vs a V5D plate, so a workbook
-label and plate file that disagree on the <family> token (V5A, V5D,
-V5F ...) would silently mis-assign every barcode.  parse_libprep refuses
-to emit a manifest in that case (exit 4) unless --force-plate is given
-(deliberate re-prep / kit swap).  Real-world case this guards (2026-10-16):
+The workbook's 'Kit ref' row records the plate FAMILY: the same well
+encodes a different 14-nt CB on a V5A plate vs a V5D plate.  If the file
+named with --plate disagrees with the Kit ref, that is a LOUD WARNING (not
+an abort): an explicit --plate is authoritative — whoever names the file
+is expected to know which plate was used.  Real-world context (2026-10-16):
 the PHX537/Eleni workbook shipped with its kit-ref cell mislabeled 'V5A,
 Part #10513' even though the V5D plate was used — the cell was corrected
-the same day (original backup in ~/.hermes/cache/scratch).
+the same day (original backup in ~/.hermes/cache/scratch).  The provenance
+TSV records the file actually used, for post-run audit.
 
 Sheet selection:  the first sheet (top to bottom) containing a header row
 with BOTH a sample column (name or code) and a well-position column.  This
@@ -70,14 +70,15 @@ Kit ref cross-check (prevents using a mis-labelled plate file):
     hardcoded PLATE_DIR (prod: /home/gecf/NGS_pipelines/BRB-seq/BRB_plates);
     pass --plate explicitly to use a file in some other location.
 
-  * --plate given: the plate file name's family (V5A / V5D) must be
-    compatible with the workbook's Kit ref, else the script exits with
-    code 4 (family is a hard constraint).  --force-plate suppresses the
-    check for a deliberate re-prep where the plate family intentionally
-    differs from the Kit ref.
+  * --plate given: an explicit selection is AUTHORITATIVE — the file is
+    used as-is.  If its family disagrees with the workbook's Kit ref this
+    is a LOUD WARNING on stderr (visible in the run log), not an abort:
+    whoever names the plate explicitly is expected to know which plate
+    was actually used.
+    WARNING: the same well position encodes a DIFFERENT CB on the two
+    families, so a wrongly-chosen file mis-tags every sample.
 
-Exit codes: 0 ok, 1 bad usage/input, 2 parse failure, 3 bad plate file,
-             4 kit/plate family mismatch.
+Exit codes: 0 ok, 1 bad usage/input, 2 parse failure, 3 bad plate file.
 """
 
 from __future__ import annotations
@@ -275,12 +276,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--plate", default=None,
                    help="well-matched barcode file (well + 14-nt CB per line). "
                         "If omitted (default), the plate is inferred from the "
-                        "workbook's 'Kit ref' row by scanning --xlsx's directory "
-                        "for a matching barcodes_96_<family>_*.txt file.")
-    p.add_argument("--force-plate", action="store_true",
-                   help="suppress the kit/plate family cross-check (use this to "
-                        "override a deliberate re-prep where the plate family "
-                        "intentionally differs from the workbook's Kit ref).")
+                        "workbook's 'Kit ref' row by scanning the plate "
+                        "directory (BRB_PLATE_DIR; prod: "
+                        "/home/gecf/NGS_pipelines/BRB-seq/BRB_plates) for a "
+                        "matching barcodes_96_<family>_*.txt file.")
     p.add_argument("--out", required=True,
                    help="output manifest TSV (Sample_ID<TAB>Barcode, with header)")
     p.add_argument("--empty-wells", action="store_true",
@@ -357,26 +356,37 @@ def main(argv: list[str] | None = None) -> int:
         if not os.path.isfile(plate_path):
             print(f"ERROR: The barcode plate file you asked to use could not be found at: {plate_path}. Check that the file name and folder are spelled exactly right (file names are case-sensitive) and that it is still there, then re-run.", file=sys.stderr)
             return 1
-        # cross-check the explicit plate file against the kit ref
-        if kit_family and not args.force_plate:
+        # cross-check the explicit plate file against the kit ref.
+        # An explicit --plate is AUTHORITATIVE: whoever names the file is
+        # expected to know which plate was used.  A family disagreement is
+        # a loud warning (not an abort) so a truly mislabeled Kit ref does
+        # not block a correct run; the provenance TSV records the file
+        # actually used, for post-run audit.
+        if kit_family:
             plate_fam = _family_from_text(os.path.basename(plate_path))
             if plate_fam and plate_fam != kit_family:
                 print(
-                    f"ERROR: The barcode plate file you named is from the '{plate_fam}' plate "
-                    f"family ({os.path.basename(plate_path)}), but the workbook's 'Kit ref' "
-                    f"row says this preparation used the '{kit_family}' family:\n"
-                    f"  Workbook Kit ref: {kit_raw}\n"
-                    f"  Plate file named: {plate_path}\n"
-                    f"  These must agree: the same well position is printed with a "
-                    f"DIFFERENT 14-base barcode on a V5A plate than on a V5D plate, so "
-                    f"using the wrong one would quietly tag every sample to the wrong "
-                    f"barcode. Please confirm which family really was used in the lab and "
-                    f"use the matching plate file. If it is genuinely a deliberate re-prep "
-                    f"where the two are meant to differ, re-run with --force-plate to let "
-                    f"this mismatch through knowingly.",
+                    f"!! WARNING — KIT / PLATE FAMILY MISMATCH (run continues, "
+                    f"because an explicit --plate is authoritative) !!\n"
+                    f"  Your plate file is from the '{plate_fam}' family "
+                    f"({os.path.basename(plate_path)}), but the workbook's "
+                    f"'Kit ref' row says this preparation used the "
+                    f"'{kit_family}' family:\n"
+                    f"    Workbook Kit ref: {kit_raw}\n"
+                    f"    Plate file used : {plate_path}\n"
+                    f"  RISK: the same well position is printed with a "
+                    f"DIFFERENT 14-base barcode on a V5A plate than on a "
+                    f"V5D plate, so if the file you named was picked by "
+                    f"mistake EVERY sample will silently be tagged with "
+                    f"the wrong barcode.\n"
+                    f"  ACTION REQUIRED: confirm which plate family really "
+                    f"was used in the lab and that {os.path.basename(plate_path)} "
+                    f"is the matching file. If it genuinely is a deliberate "
+                    f"re-prep where the two differ, no flag is needed — "
+                    f"this warning is only a heads-up; the chosen file is "
+                    f"used as-is and the provenance file records it.",
                     file=sys.stderr,
                 )
-                return 4
         print(f"parse_libprep_xlsx: plate     = {plate_path}")
 
     # ---- load plate: well -> barcode ------------------------------------
