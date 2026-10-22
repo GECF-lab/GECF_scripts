@@ -16,13 +16,15 @@
 #   Merge multi-lane FASTQ          [note       ]  pre-merge or comma-list
 #
 # Logging (automatic, no flag)
-#   * Every pipeline message AND the stdout/stderr of the tools it launches
-#     (fastqc, samtools, picard, fqtk, python helpers) is mirrored to
-#     <run-dir>/pipeline.log — no need to wrap the call in `tee`.
-#   * The exact command line of each step is logged (run_or_skip prints
-#     "RUN  <step>: <cmd>"; STAR's full invocation is logged the same way and
-#     is also written as the first line of <run-dir>/star/STAR.log for
-#     provenance). STAR's own runtime output stays in star/STAR.log.
+#   * pipeline.log — supervisor log: every pipeline message (RUN/SKIP/done,
+#     die/warn) + a pointer to each step's own log.  No raw tool output.
+#   * logs/<step>.log — one file per pipeline step; tool stdout + stderr go
+#     here (fastqc, samtools, picard, fqtk, python helpers).  Step name is
+#     sanitised (non-alphanumeric chars → "_").
+#   * star/STAR.log — STAR's own runtime output; the full STAR invocation is
+#     also written as its first line for provenance.  The exact command line
+#     of every other step is logged the same way (run_or_skip prints
+#     "RUN  <step>: <cmd>").
 #
 # Note on the STAR invocation
 #   The STAR request below asks for BOTH dedup methods (NoDedup and
@@ -45,9 +47,9 @@
 #     (helper scripts are resolved from ./utils, shipped with this directory).
 #   * Re-runnable: a step is skipped when its output already exists
 #     (disable skipping with --resume force).
-#   * The optional steps (FASTQ QC, RSeQC, BAM demux, FASTQ demux) are off by
-#     default; a missing tool causes that step to log a warning and skip rather
-#     than abort the run.
+#   * The optional steps (FASTQ QC, RSeQC, BAM demux, FASTQ demux) are ON by
+#     default (disable each with its --skip-* flag); a missing tool causes
+#     that step to log a warning and skip rather than abort the run.
 #=============================================================================
 set -euo pipefail
 
@@ -162,6 +164,11 @@ OPTIONAL FLAGS
        <run>/star/samples_all_wells/   samples + empty_well_* (full plate)
        <run>/star/samples/             samples only — the final UMI/reads
                                        CSVs are built from THIS directory
+   * Per-sample demux output (demux_bam/ , demux_fastq/ ) contains REAL
+     SAMPLES ONLY: empty_well_* rows are filtered out of the demux maps
+     before picard/fqtk see them (each picard FilterSamReads is a
+     full BAM scan, so one per empty well was pure waste).  Empty wells
+     remain in the STAR whitelist and samples_all_wells/ for debugging.
   -h, --help            this help
   --version             print version and exit
 
@@ -458,8 +465,9 @@ DMUX_FQ_DIR="${RUN_DIR}/demux_fastq"
 RENAME_DIR="${STAR_DIR}/samples"
 RENAME_ALL_DIR="${STAR_DIR}/samples_all_wells"
 DUP_CSV="${RUN_DIR}/duplication_statistics.csv"
-UMI_MATRIX_CSV="${RUN_DIR}/${POOL}_umi_matrix.csv"
-READS_MATRIX_CSV="${RUN_DIR}/${POOL}_reads_matrix.csv"
+MATRIX_DIR="${RUN_DIR}/matrices"
+UMI_MATRIX_CSV="${MATRIX_DIR}/${POOL}_umi_matrix.csv"
+READS_MATRIX_CSV="${MATRIX_DIR}/${POOL}_reads_matrix.csv"
 # In --barcode-tsv mode the manifest lives where the user put it (no generation);
 # in lib-prep mode the manifest is generated into <run>/barcodes/ and survives re-runs.
 MANIFEST="$BARCODE_TSV"
@@ -622,8 +630,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     log "  fastqc  --threads 32 --outdir <OUT>/fastqc <R1> <R2>"
   fi
   log "  STAR    (one STARsolo call, both dedup methods in list form)"
-  log "      ${STAR_BIN} --runMode alignReads --runThreadN ${THREADS} --genomeDir ${STAR_INDEX} --readFilesIn <R2> <R1> --soloCBwhitelist <OUT>/barcodes/barcode_whitelist.txt --soloCBlen 14 --soloUMIlen 14 --soloUMIstart 15 --soloUMIdedup NoDedup 1MM_Directional --outSAMattributes '${SAM_ATTRS}' --quantMode GeneCounts ..."
-  log "      consolidate  <prefix>Solo.out/Gene/raw/umiDedup-<method>.mtx -> <OUT>/star/Gene/raw/"
+  log "      ${STAR_BIN} --runMode alignReads --runThreadN ${THREADS} --genomeDir ${STAR_INDEX} --readFilesIn <R2> <R1> --soloCBwhitelist <OUT>/barcodes/barcode_whitelist.txt --soloCBlen 14 --soloUMIlen 14 --soloUMIstart 15 --soloUMIdedup NoDedup 1MM_Directional --outSAMattributes '${SAM_ATTRS}' --quantMode GeneCounts --outFileNamePrefix <OUT>/star/${POOL}_ ...   ->  ${POOL}_Solo.out/Gene/raw/ (raw UMI matrix, kept in place)"
   if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
     if [[ -n "$BED_FILE" ]]; then
       log "  RSeQC   reference (given --bed-file): ${BED_FILE}"
@@ -634,48 +641,64 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     log "      read_distribution.py -i <OUT>/star/${POOL}_Aligned.sortedByCoord.out.bam -r <bed12> > <OUT>/rseqc/${POOL}_read_distribution.txt"
   fi
   log "  dups    ${PYTHON} <UTILS>/get_duplication_statistics.py --raw_dir <OUT>/star/${POOL}_Solo.out/Gene/raw --dedup_method 1MM_Directional --output_csv <OUT>/duplication_statistics.csv"
-  log "  rename  ${PYTHON} <UTILS>/rename_matrix.py --raw_dir <OUT>/star/${POOL}_Solo.out/Gene/raw --mapping <manifest> --out-dir <OUT>/star/samples -> barcodes named by Sample_ID (raw barcode matrix kept untouched in Gene/raw)"
+  log "  rename  ${PYTHON} <UTILS>/rename_matrix.py --raw_dir <OUT>/star/${POOL}_Solo.out/Gene/raw --mapping <manifest> --out-dir <OUT>/star/samples -> barcodes named by Sample_ID (raw barcode matrix kept untouched in ${POOL}_Solo.out/Gene/raw)"
   if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
-    log "  demuxBAM picard FilterSamReads per sample in <OUT>/barcodes/bam_barcodes.tsv (CR tag) -> <OUT>/demux_bam/<sample>.bam"
+    log "  demuxBAM picard FilterSamReads per sample in <OUT>/barcodes/bam_barcodes.tsv MINUS empty_well_* rows (samples only, CR tag) -> <OUT>/demux_bam/<sample>.bam"
   fi
   if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
-    log "  demuxFQ fqtk demux <R1> <R2> --samples <OUT>/barcodes/fastq_sample_metadata.tsv --output <OUT>/demux_fastq"
+    log "  demuxFQ fqtk demux <R1> <R2> --samples fastq_sample_metadata.tsv MINUS empty_well_* rows -> <OUT>/demux_fastq"
   fi
   log "---- DRY RUN: no files modified ----"
   exit 0
 fi
 
 # --- actually mkdir (skipped in dry-run) -----------------------------------
-mkdir -p "$BARCODES_DIR" "$STAR_DIR"
+mkdir -p "$BARCODES_DIR" "$STAR_DIR" "$MATRIX_DIR"
 [[ "$RUN_OPT_FASTQ" -eq 1 ]] && mkdir -p "$FASTQC_DIR"
 [[ "$RUN_OPT_RSEQC" -eq 1 ]] && mkdir -p "$RSEQC_DIR"
 [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]] && mkdir -p "$DMUX_BAM_DIR"
 [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]] && mkdir -p "$DMUX_FQ_DIR"
+LOGS_DIR="${RUN_DIR}/logs"
+mkdir -p "$LOGS_DIR"
 
-#--- automatic pipeline.log ----------------------------------------------------
-# Mirror everything (pipeline messages + tool stdout/stderr) to
-# <RUN_DIR>/pipeline.log in addition to the terminal.  The per-step exact
-# commands are already logged by run_or_skip ("RUN  <step>: <cmd>") and by
-# star_solo (into star/STAR.log); tool chatter now lands in the file too.
+#--- logging layout -------------------------------------------------------------
+# pipeline.log      : supervisor log — RUN/SKIP/done lines, step-log pointers,
+#                     die()/warn() messages.  Does NOT contain raw tool output.
+# logs/<step>.log   : one file per pipeline step — tool stdout + stderr.
+# star/STAR.log     : STAR's own log (already co-located with STAR output; unchanged).
+# rseqc/*.txt etc.  : data products, not logs.
 LOG_FILE="${RUN_DIR}/pipeline.log"
 exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
 # Drain the tee pipes before the shell dies, or the final buffered lines can
 # be lost on exit (process-substitution pipe flush is async).
 trap 'sleep 0.5' EXIT
-log "log file = ${LOG_FILE}  (automatic; exact commands + tool output mirrored here)"
+log "pipeline.log = ${LOG_FILE}  (supervisor — no raw tool output); step logs in ${LOGS_DIR}/"
 
 # --- run_or_skip -------------------------------------------------------------
-# Execute the command ($5...) unless the marker file ($2) already exists in
-# auto mode.  Failure policy: a failing OPTIONAL step logs a warning and does
-# not abort the run; a failing MANDATORY step aborts the pipeline.
+# Execute the command unless the marker file already exists (auto mode).
+# Failure policy: a failing OPTIONAL step logs a warning and does not abort;
+# a failing MANDATORY step aborts the pipeline.
 #   $1=step name  $2=marker file (empty => always run)
 #   $3=tool name  (empty => no tool gate, e.g. a Python helper)
-#   $4=mandatory|optional  $5...=command
+#   $4=mandatory|optional
+#   [$4.5]  optionally the literal word  stdout_to  followed by the product
+#           file path — tells run_or_skip to redirect the command's stdout
+#           to that file (the step's data product) and stderr to the step log.
+#           Without this, both stdout and stderr go to the step log.
+#   $5...=command
 run_or_skip() {
   local name="$1"; shift
   local marker="${1:-}"; shift
   local tool="${1:-}"; shift
   local mode="${1:-mandatory}"; shift
+  # Optional 2-token flag:  stdout_to <path>  → command's stdout is the
+  # step's data product; run_or_skip does both redirects explicitly so the
+  # log calls above it still land in pipeline.log (not the product file).
+  local product_path=""
+  if [[ "${1:-}" == "stdout_to" ]]; then
+    product_path="${2:?run_or_skip: stdout_to requires a file path}"
+    shift 2
+  fi
   local cmd=( "$@" )
   if [[ -n "$marker" && "$RESUME" == "auto" && -s "$marker" ]]; then
     log "SKIP ${name} (already done: ${marker})"
@@ -689,14 +712,26 @@ run_or_skip() {
       return 0
     fi
   fi
+  local step_name_safe
+  step_name_safe="$(printf '%s' "$name" | sed 's/[^[:alnum:]]/_/g')"
+  local step_log="${LOGS_DIR}/${step_name_safe}.log"
   log "RUN  ${name}: ${cmd[*]}"
+  log "  step log -> ${step_log}"
   local rc=0
-  "${cmd[@]}" || rc=$?
+  if [[ -n "$product_path" ]]; then
+    # stdout is the step's data product; stderr -> step log
+    "${cmd[@]}" >"$product_path" 2>"$step_log" || rc=$?
+  else
+    # all output -> step log (removed from pipeline.log)
+    "${cmd[@]}" >"$step_log" 2>&1 || rc=$?
+  fi
   if [[ "$rc" -ne 0 ]]; then
+    log "  step log tail (last 30 lines of ${step_log}):"
+    tail -30 "$step_log" >&2 2>/dev/null || true
     if [[ "$mode" == "mandatory" ]]; then
-      die "The required step '${name}' ran into an error and could not be completed, so the pipeline has stopped. The specific reason is in the messages printed in the lines just above this one (also saved in the run's pipeline.log). Fix that underlying problem, then re-run the pipeline — you can use --resume auto so steps that already finished are not redone."
+      die "The required step '${name}' ran into an error and could not be completed, so the pipeline has stopped. Full output is in the step log: ${step_log}. Re-run with --resume auto so steps that already finished are not redone."
     else
-      warn "The optional step '${name}' ran into an error, so it did not finish — but this does not stop the pipeline; everything else will still run. The likely reason is in the messages printed just above this one (and in the run's pipeline.log). If you want this step's output, fix the underlying problem and re-run (it is safe to re-run just this one)."
+      warn "The optional step '${name}' ran into an error, so it did not finish — but this does not stop the pipeline; everything else will still run. The reason is in the step log: ${step_log}. If you want this step's output, fix the underlying problem and re-run (it is safe to re-run just this one)."
     fi
   else
     [[ -n "$marker" ]] && touch "$marker"
@@ -743,17 +778,18 @@ log ""; log "STARsolo alignment + UMI count matrix (mandatory)"
 [[ -f "${STAR_INDEX}/Genome" ]] || warn "The STAR index folder $STAR_INDEX appears incomplete — the 'Genome' file is missing, and STAR will not be able to start if the index is unfinished. If you are unsure this index is finished, rebuild it with build_star_index.sh, then re-run."
 [[ -f "${STAR_INDEX}/SA"     ]] || warn "The STAR index folder $STAR_INDEX appears incomplete — the 'SA' (sequence-to-genome) file is missing, and STAR will not be able to start if the index is unfinished. If you are unsure this index is finished, rebuild it with build_star_index.sh, then re-run."
 
-# The suffixes appended to --outFileNamePrefix differ across STAR builds:
-#   * older Alithea STAR : <prefix>_Aligned...  /  <prefix>Solo.out
-#   * STAR 2.7.11b       : <prefix>Aligned...   /  <prefix>SOLOout
-# A bare prefix (no trailing underscore) is therefore used, and the resulting
-# BAM and SOLO directories are located by glob after the run.
-#
+# Fixed STAR build (brbseq conda env) => deterministic output names: STAR
+# appends its fixed suffixes to --outFileNamePrefix, and the prefix carries a
+# trailing underscore (<POOL>_) so the names stay legible:
+#   ${STAR_DIR}/${POOL}_Aligned.sortedByCoord.out.bam
+#   ${STAR_DIR}/${POOL}_Solo.out/Gene/raw/   <- the raw UMI matrix, its only location
 # Both deduplication methods are requested in a single invocation via the list
 # form of --soloUMIdedup (NoDedup 1MM_Directional). One alignment pass yields a
-# per-method umiDedup-<method>.mtx under <prefix>SOLOout/Gene/raw/, matching the
-# expected output and avoiding a second, nondeterministic alignment of the same reads.
-STAR_BASE="${STAR_DIR}/${POOL}"
+# per-method umiDedup-<method>.mtx in ${POOL}_Solo.out/Gene/raw/, avoiding a
+# second, nondeterministic alignment of the same reads.
+STAR_BASE="${STAR_DIR}/${POOL}_"
+STAR_BAM="${STAR_DIR}/${POOL}_Aligned.sortedByCoord.out.bam"
+RAW_DIR="${STAR_DIR}/${POOL}_Solo.out/Gene/raw"
 
 #--- helpers: one STAR run, both matrices -------------------------------------
 # The list of --soloUMIdedup methods requested in the single STAR call.
@@ -815,70 +851,18 @@ star_solo() {
   fi
 }
 
-# Consolidate the single STAR run's SOLOout/Gene/raw (already per-method
-# named) into the canonical ${STAR_DIR}/Gene/raw layout the dup-stats step
-# expects:  bars.tsv, features.tsv, umiDedup-NoDedup.mtx,
-# umiDedup-1MM_Directional.mtx.  Symlink when possible, copy as fallback.
-consolidate_solo_output() {
-  local dest="${STAR_DIR}/Gene/raw"
-  mkdir -p "$dest"
-  # consolidate_solo_output(): STAR appends a fixed suffix to --outFileNamePrefix
-  # that is NOT stable across builds
-  # (we have seen <prefix>Solo.out, <prefix>_Solo.out, <prefix>SOLOout).
-  # We glob for the first dir under STAR_DIR matching any of those suffixes
-  # rather than hard-coding one form.
-  local solo_dir
-  solo_dir="$(find "$STAR_DIR" -maxdepth 2 -type d \( -iname 'runSolo.out' -o -iname '*Solo.out' -o -iname '*SOLOout' \) 2>/dev/null | head -1)"
-  [[ -n "$solo_dir" && -d "$solo_dir" ]] || die "STAR finished, but the pipeline did not find its output folder (normally a folder called 'Solo.out' or similar inside $STAR_DIR/). This usually means STAR itself stopped early with an error — check the STAR log files inside $STAR_DIR for the actual reason, then re-run the pipeline (set --resume force to redo every step)."
-  log "consolidation: solo_dir=$solo_dir"
-  local method kind
-  for method in "${DEDUP_METHODS[@]}"; do
-    local src
-    for src in "${solo_dir}/Gene/raw/umiDedup-${method}.mtx" \
-               "${solo_dir}/Gene/umiDedup-${method}.mtx"; do
-      [[ -f "$src" ]] && { ln -f "$src" "${dest}/umiDedup-${method}.mtx" 2>/dev/null || cp -f "$src" "${dest}/umiDedup-${method}.mtx"; break; }
-    done
-    [[ -f "${dest}/umiDedup-${method}.mtx" ]] || die "STAR finished, but the raw UMI count matrix for the '${method}' counting mode was not found inside $solo_dir. This usually means STAR stopped early with an error — check the STAR log files inside $STAR_DIR for the actual reason, then re-run the pipeline (set --resume force to redo every step)."
-    log "consolidate: $src  ->  ${dest}/umiDedup-${method}.mtx"
-  done
-  for kind in barcodes.tsv features.tsv; do
-    for src in "${solo_dir}/Gene/raw/${kind}" "${solo_dir}/Gene/${kind}"; do
-      [[ -f "$src" ]] && { ln -f "$src" "${dest}/${kind}" 2>/dev/null || cp -f "$src" "${dest}/${kind}"; break; }
-    done
-  done
-  log "consolidated both matrices into $dest"
-}
-
-# Helper: find STAR's actual output BAM (any prefix+Aligned+sortedByCoord layout)
-find_star_bam() {
-  local d="$1"
-  local f
-  for f in "$(find "$d" -maxdepth 2 -type f -name '*Aligned.sortedByCoord.out.bam' 2>/dev/null)"; do
-    printf '%s\n' "$f"; return 0
-  done
-  return 1
-}
-
 S14_MARKER="${STAR_DIR}/_s14_done"
 S14_DONE=0
 if [[ -f "$S14_MARKER" && -s "$S14_MARKER" ]]; then S14_DONE=1; fi
-STAR_BAM=""
 
-if [[ "$RESUME" == "auto" && "$S14_DONE" -eq 1 ]]; then
-  log "SKIP STARsolo (already done per marker: $S14_MARKER)"
-  STAR_BAM="$(find_star_bam "$STAR_DIR" | head -n 1)"
-fi
-if [[ "$RESUME" != "auto" || "$S14_DONE" -eq 0 || -z "$STAR_BAM" ]]; then
+if [[ "$RESUME" != "auto" || "$S14_DONE" -eq 0 ]]; then
   # One STAR invocation, --soloUMIdedup in list form (both methods).
   star_solo "${STAR_BASE}"
-  consolidate_solo_output
-  STAR_BAM="$(find_star_bam "$STAR_DIR" | head -n 1)"
-  [[ -n "$STAR_BAM" && -s "$STAR_BAM" ]] || die "The alignment step (STAR) ran to completion, but the aligned reads file it should have produced (Aligned.sortedByCoord.out.bam) was not found or is empty under $STAR_DIR. This usually means STAR itself stopped early with an error — see the STAR log files inside $STAR_DIR (e.g. STAR.log.out, STAR.log) for the specific reason. Fix that, then re-run the pipeline (use --resume auto so earlier steps are not redone)."
+  [[ -s "$STAR_BAM" ]] || die "The alignment step (STAR) ran to completion, but the aligned reads file it should have produced ($STAR_BAM) was not found or is empty. This usually means STAR itself stopped early with an error — see the messages printed just above this line, and the STAR log ($STAR_DIR/STAR.log), for the specific reason. Fix that, then re-run the pipeline (use --resume auto so earlier steps are not redone)."
   echo "$(date +%FT%T)" > "${STAR_DIR}/_s14_done"
 fi
 log "STAR BAM: $STAR_BAM"
-log "consolidated mtx dir: ${STAR_DIR}/Gene/raw"
-SOLO_OUT="${STAR_DIR}/Gene/raw"   # alias used by the dup-stats step
+log "raw UMI matrix dir: $RAW_DIR"
 
 #--- bake helper: GTF -> BED12 (UCSC genePred chain) -------------------------
 # Same conversion as flashseq_rseqc.sh so both pipelines produce identical
@@ -976,7 +960,8 @@ if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
   run_or_skip "samtools index" "${STAR_BAM}.bai" "samtools" "optional" \
     samtools index -@ 16 "$STAR_BAM"
   run_or_skip "read_distribution" "$RSEQC_OUT" "read_distribution.py" "optional" \
-    read_distribution.py -i "$STAR_BAM" -r "$BED_FILE" > "$RSEQC_OUT"
+    stdout_to "$RSEQC_OUT" \
+    read_distribution.py -i "$STAR_BAM" -r "$BED_FILE"
   if [[ -s "$RSEQC_OUT" ]]; then
     log "distribution report: $RSEQC_OUT"
   fi
@@ -994,7 +979,6 @@ fi
 #--- dup-stats helpers (kept here to anchor the section) --------------------
 #=== Duplication statistics  [MANDATORY] ==================================
 log ""; log "duplication statistics (mandatory)"
-RAW_DIR="${STAR_DIR}/Gene/raw"
 for req in "$RAW_DIR/barcodes.tsv" \
            "$RAW_DIR/umiDedup-NoDedup.mtx" \
            "$RAW_DIR/umiDedup-1MM_Directional.mtx"; do
@@ -1013,8 +997,8 @@ if [[ -f "${DUP_CSV%.*}.summary.csv" ]]; then
 fi
 
 #=== Sample-named count matrix  [MANDATORY] =================================
-# Rename the barcode-labelled matrix columns (barcodes.tsv in Gene/raw) to the
-# Sample_IDs from the run manifest:
+# Rename the barcode-labelled matrix columns (barcodes.tsv in
+# ${POOL}_Solo.out/Gene/raw) to the Sample_IDs from the run manifest:
 #   workbook mode (always): two outputs from the SAME single STAR matrix
 #     (one STAR call — the rename is a cheap post-processing step, not a
 #     second alignment):
@@ -1027,8 +1011,8 @@ fi
 #     ${STAR_DIR}/samples/            samples only (there is no plate and no
 #                                     empty-well concept); samples_all_wells
 #                                     is simply absent
-# The raw barcode-labelled matrix in Gene/raw is left untouched — in workbook
-# mode it is the full-plate view (up to 96 barcode columns).
+# The raw barcode-labelled matrix in ${POOL}_Solo.out/Gene/raw is left untouched —
+# in workbook mode it is the full-plate view (up to 96 barcode columns).
 log ""
 log "sample-named count matrix (mandatory)"
 if [[ "$LIBPREP_MODE" -eq 1 ]]; then
@@ -1092,8 +1076,21 @@ if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
     log "SKIP BAM demux (done marker present: $done_bam)"
   else
     if [[ "$HAVE_PICARD" -eq 1 ]]; then
+      # The vendor map (bam_barcodes.tsv) also lists empty_well_<WELL> rows —
+      # and the vendor demultiplex_bam.sh is FROZEN (no skip flag, blindly
+      # demuxes every row; each FilterSamReads is a full BAM scan).  So filter
+      # the map HERE, at our call site: only real samples get a per-sample BAM.
+      # (STAR whitelist + samples_all_wells/ keep the empty wells intact.)
+      local_bam_map="${DMUX_BAM_DIR}/barcodes_samples.tsv"
+      awk -F'\t' 'NR==1 && $1=="sample_id" {print; next} $1 !~ /^empty_well_/ {print}' "$BAM_BARCODES" > "$local_bam_map"
+      ew_bam=$(( $(wc -l < "$BAM_BARCODES") - $(wc -l < "$local_bam_map") ))
+      picard_log="${LOGS_DIR}/demux_bam.log"
       log "RUN  picard FilterSamReads per sample (tag CR)"
-      bash "$DEMUX_BAM" "$DMUX_BAM_DIR" "$STAR_BAM" "$BAM_BARCODES" "CR"
+      log "  demux map: $local_bam_map  ($(wc -l < "$local_bam_map") line(s); ${ew_bam} empty_well row(s) excluded)"
+      log "  step log -> ${picard_log}"
+      bash "$DEMUX_BAM" "$DMUX_BAM_DIR" "$STAR_BAM" "$local_bam_map" "CR" >"$picard_log" 2>&1 \
+        || { tail -20 "$picard_log" >&2 2>/dev/null || true; \
+             warn "picard demux reported an error — see step log: ${picard_log}"; }
       touch "$done_bam"
       log "per-sample BAMs in: $DMUX_BAM_DIR"
     else
@@ -1112,15 +1109,26 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
     log "SKIP FASTQ demux (done marker present: $DONE_FQ)"
   else
     if [[ "$HAVE_FQTK" -eq 1 ]]; then
+      # Same empty-well exclusion as the BAM demux above: the vendor map
+      # (fastq_sample_metadata.tsv) lists empty_well_* rows; fqtk demuxes
+      # every row, so filter the map at our call site (header row kept).
+      local_fq_map="${DMUX_FQ_DIR}/fastq_sample_metadata.tsv"
+      awk -F'\t' 'NR==1 && $1=="sample_id" {print; next} $1 !~ /^empty_well_/ {print}' "$FQ_META" > "$local_fq_map"
+      ew_fq=$(( $(wc -l < "$FQ_META") - $(wc -l < "$local_fq_map") ))
+      fqtk_log="${LOGS_DIR}/demux_fq.log"
       log "RUN  fqtk demux"
+      log "  demux map: $local_fq_map  ($(wc -l < "$local_fq_map") line(s) incl. header; ${ew_fq} empty_well row(s) excluded)"
+      log "  step log -> ${fqtk_log}"
       fqtk demux \
         -i "$R1_BARCODE" \
         -r "14I14I" \
-        -s "$FQ_META" \
+        -s "$local_fq_map" \
         -o "$DMUX_FQ_DIR" \
         -u "unmatched" \
         -t "$THREADS" \
-        || warn "'fqtk' (the tool that splits the combined FASTQ into one file per sample) finished, but it reported a problem along the way. In plain terms: the per-sample FASTQ files it managed to write are still in $DMUX_FQ_DIR and can be used, but some samples may be missing or incomplete. If you expected every sample to be present, check that folder and compare against your sample list; if something is missing, you can re-run just this step (it is safe to re-run)."
+        >"$fqtk_log" 2>&1 \
+        || { tail -20 "$fqtk_log" >&2 2>/dev/null || true; \
+             warn "'fqtk' (the tool that splits the combined FASTQ into one file per sample) reported a problem. See step log: ${fqtk_log}. The per-sample FASTQ files it managed to write are still in $DMUX_FQ_DIR and can be used, but some samples may be missing or incomplete. If you expected every sample to be present, check that folder and compare against your sample list; if something is missing, you can re-run just this step (it is safe to re-run)."; }
       touch "$DONE_FQ"
       log "per-sample FASTQs in: $DMUX_FQ_DIR"
     else
@@ -1135,7 +1143,6 @@ fi
 log ""; log "multi-lane FASTQ merge not auto-run (it is optional;"
 log "              pre-merge per-lane files or pass a comma list as --r1-barcode/--r2-genomic)"
 
-#=== summary =================================================================
 log ""; log "══════ PIPELINE COMPLETE (v${SCRIPT_VERSION}) ══════"
 log "  run directory         = ${RUN_DIR}"
 log "  barcodes               = ${WHITELIST}  ($(wc -l < "$WHITELIST" 2>/dev/null || echo '?') barcodes)"
