@@ -619,7 +619,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   [[ "$MANIFEST_HEADER" -eq 1 ]] && hdr_flag=" -H"
   log "  prepare_barcodes.sh -i <manifest> -w <OUT>/barcodes/barcode_whitelist.txt -f <OUT>/barcodes/fastq_sample_metadata.tsv -b <OUT>/barcodes/bam_barcodes.tsv${hdr_flag}"
   if [[ "$RUN_OPT_FASTQ" -eq 1 ]]; then
-    log "  fastqc  --threads 16 --outdir <OUT>/fastqc <R1> <R2>"
+    log "  fastqc  --threads 32 --outdir <OUT>/fastqc <R1> <R2>"
   fi
   log "  STAR    (one STARsolo call, both dedup methods in list form)"
   log "      ${STAR_BIN} --runMode alignReads --runThreadN ${THREADS} --genomeDir ${STAR_INDEX} --readFilesIn <R2> <R1> --soloCBwhitelist <OUT>/barcodes/barcode_whitelist.txt --soloCBlen 14 --soloUMIlen 14 --soloUMIstart 15 --soloUMIdedup NoDedup 1MM_Directional --outSAMattributes '${SAM_ATTRS}' --quantMode GeneCounts ..."
@@ -729,7 +729,7 @@ if [[ "$RUN_OPT_FASTQ" -eq 1 ]]; then
   log ""; log "fastqc (optional)"
   FQ_MARKER="${FASTQC_DIR}/QC_done"
   run_or_skip "fastqc" "$FQ_MARKER" "fastqc" "optional" \
-    fastqc --threads 16 --outdir "$FASTQC_DIR" "$R1_BARCODE" "$R2_GENOMIC"
+    fastqc --threads 32 --outdir "$FASTQC_DIR" "$R1_BARCODE" "$R2_GENOMIC"
   touch "$FQ_MARKER"  # idempotent completion marker
   log "fastqc outputs in: $FASTQC_DIR"
 else
