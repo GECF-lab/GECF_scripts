@@ -282,13 +282,6 @@ def main(argv: list[str] | None = None) -> int:
                         "matching barcodes_96_<family>_*.txt file.")
     p.add_argument("--out", required=True,
                    help="output manifest TSV (Sample_ID<TAB>Barcode, with header)")
-    p.add_argument("--empty-wells", action="store_true",
-                   help="also emit every unoccupied plate well as an "
-                        "empty_well_<WELL> column (old-pipeline convention, "
-                        "e.g. empty_well_A01) so all plate wells appear in "
-                        "the STARsolo count matrix.  In this mode the "
-                        "'empty_well' name prefix is reserved for those "
-                        "generated IDs.")
     p.add_argument("--provenance", default="",
                    help=("optional provenance TSV (Sample_ID, Sample_raw, Well, Barcode); "
                          "default: same dir as --out, name '<out>_libprep_provenance.tsv'"))
@@ -529,15 +522,13 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.empty_wells and sid.lower().startswith("empty_well"):
+        if sid.lower().startswith("empty_well"):
             print(
                 f"ERROR: Row {row['line']} of the sample table (sheet '{chosen_sheet}') has the name "
                 f"'{raw_name}', which after cleaning becomes '{sid}'. That starts with "
                 f"'empty_well', a label the pipeline reserves for the blank plate wells it "
-                f"generates automatically (in --empty-wells mode), so using it for a real "
-                f"sample would make the two indistinguishable. Please rename this sample (drop "
-                f"the 'empty_well' part) — or, if you do not actually need the automatically "
-                f"generated blank-well columns, re-run without the --empty-wells option.",
+                f"generates automatically, so using it for a real sample would make the "
+                f"two indistinguishable. Please rename this sample (drop the 'empty_well' part).",
                 file=sys.stderr,
             )
             return 2
@@ -611,32 +602,33 @@ def main(argv: list[str] | None = None) -> int:
               f"(for example a V5A workbook paired with a V5D plate). Check that those two describe the same physical plate, fix whichever side is wrong, and re-run to include these samples.",
               file=sys.stderr)
 
-    # ---- empty wells (optional: --empty-wells) ---------------------------
-    # Emit every UNOCCUPIED plate well as empty_well_<WELL> (old-pipeline
-    # convention, e.g. empty_well_A01) so the whole plate appears in the
-    # STARsolo matrix as zero-count columns.  Samples occupying a well
-    # (duplicates included) never become empty wells; the plate's well
-    # ordering is preserved for the generated rows.
-    empty_lines: list[str] = []
-    if args.empty_wells:
-        occupied = set(used_barcodes)
-        for well, bc in plate.items():  # dict preserves the plate file's order
-            if bc in occupied:
-                continue
-            name = f"empty_well_{well}"
-            # belt & braces: the 'empty_well' prefix is already reserved for
-            # generated IDs above, but an alias could still collide in theory
-            if name in {m.split("\t")[0] for m in manifest_lines}:
-                print(
-                    f"ERROR: There is a name clash: a real sample in the workbook has already taken the label '{name}', which the pipeline was about to use for one of the automatically generated blank-well columns (in --empty-wells mode). It cannot create a blank-well column under a name that already belongs to a sample. Please rename that sample so it no longer starts with 'empty_well', or re-run without the --empty-wells option.",
-                    file=sys.stderr,
-                )
-                return 2
-            empty_lines.append(f"{name}\t{bc}")
-        print(f"parse_libprep_xlsx: empty wells -> {len(empty_lines)} "
-              f"(plate {len(plate)} wells, {len(occupied)} occupied by samples; "
-              "reserved 'empty_well' prefix is owned by these generated IDs)")
-    manifest_lines.extend(empty_lines)
+    # ---- empty wells (unconditional: always emitted) ---------------------
+    # Every UNOCCUPIED plate well is emitted as empty_well_<WELL> (e.g.
+    # empty_well_A01) so the whole plate appears in the STARsolo matrix:
+    # empty reads are never dropped by the whitelist and the run gets both a
+    # samples-only and a full-plate (debug) count matrix.  Samples occupying
+    # a well (duplicates included) never become empty wells; the plate's
+    # well ordering is preserved for the generated rows.
+    n_samples = len(manifest_lines)
+    n_empty = 0
+    occupied = set(used_barcodes)
+    for well, bc in plate.items():  # dict preserves the plate file's order
+        if bc in occupied:
+            continue
+        name = f"empty_well_{well}"
+        # belt & braces: the 'empty_well' prefix is already reserved for
+        # generated IDs above, but an alias could still collide in theory
+        if name in {m.split("\t")[0] for m in manifest_lines}:
+            print(
+                f"ERROR: There is a name clash: a real sample in the workbook has already taken the label '{name}', which the pipeline uses for one of the automatically generated blank-well columns. It cannot create a blank-well column under a name that already belongs to a sample. Please rename that sample so it no longer starts with 'empty_well'.",
+                file=sys.stderr,
+            )
+            return 2
+        manifest_lines.append(f"{name}\t{bc}")
+        n_empty += 1
+    print(f"parse_libprep_xlsx: empty wells -> {n_empty} "
+          f"(plate {len(plate)} wells, {len(occupied)} occupied by samples; "
+          "the 'empty_well' name prefix is owned by these generated IDs)")
 
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -651,9 +643,10 @@ def main(argv: list[str] | None = None) -> int:
     with open(prov_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(prov_lines) + "\n")
 
-    print(f"parse_libprep_xlsx: {len(manifest_lines)} sample(s) from sheet '{chosen_sheet}' "
+    print(f"parse_libprep_xlsx: {n_samples} sample(s) from sheet '{chosen_sheet}' "
           f"(header row {header_row}, sample col '{info['sample_header']}' [{info['kind']}], "
-          f"well col '{info['well_header']}'), plate={plate_path}")
+          f"well col '{info['well_header']}') + {n_empty} empty-well row(s), "
+          f"plate={plate_path}")
     print(f"parse_libprep_xlsx: manifest     -> {out_path}")
     print(f"parse_libprep_xlsx: provenance   -> {prov_path}")
     return 0

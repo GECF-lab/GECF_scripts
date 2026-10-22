@@ -73,7 +73,6 @@ BARCODE_TSV=""                   # manifest: Sample_ID<TAB>Barcode
 # Lib-prep workbook mode (alternative to --barcode-tsv):
 LIBPREP_XLSX=""                  # Mercurius lib-prep .xlsx (sample code + Oligo-dT primer well)
 BARCODES_PLATE=""                # well-matched barcode plate (well + 14-nt CB per line); empty = infer from the workbook's 'Kit ref' row
-EMPTY_WELLS=0                    # pass --empty-wells to the parser (emit unoccupied plate wells)
 SPECIES=""                       # human | mouse | <custom name>
 STAR_INDEX=""                    # STAR --genomeDir; resolved from --species if unset
 
@@ -151,12 +150,18 @@ OPTIONAL FLAGS
   --skip-rseqc          skip read_distribution  (on by default)
   --skip-dmux-bam       skip picard BAM demux  (on by default)
   --skip-dmux-fq        skip fqtk FASTQ demux  (on by default)
-  --empty-wells         workbook mode: also emit every unoccupied plate well as
-                        an empty_well_<WELL> column (old-pipeline convention)
-                        so all plate wells show up in the STARsolo matrix.
-                        Reserved prefix: sample names must not start with
-                        'empty_well'
   --dry-run             emit planned commands and exit (no side effects)
+
+  WORKBOOK MODE (libprep-xlsx) — ALWAYS ON, no flag needed:
+   * Every unoccupied plate well is kept in the barcode whitelist and named
+     empty_well_<WELL> (reserved prefix: a real sample name may not start with
+     'empty_well').  This is the debugging/troubleshooting default so empty
+     reads are never silently dropped by the STAR whitelist.
+   * The sample-named count matrix is therefore written twice from the SAME
+     single STAR output (one alignment, no second STAR call):
+       <run>/star/samples_all_wells/   samples + empty_well_* (full plate)
+       <run>/star/samples/             samples only — the final UMI/reads
+                                       CSVs are built from THIS directory
   -h, --help            this help
   --version             print version and exit
 
@@ -193,7 +198,6 @@ while [[ $# -gt 0 ]]; do
     --barcode-tsv)  BARCODE_TSV="${2:?missing --barcode-tsv value}"; shift 2;;
     --libprep-xlsx) LIBPREP_XLSX="${2:?missing --libprep-xlsx value}"; shift 2;;
     --barcodes-plate) BARCODES_PLATE="${2:?missing --barcodes-plate value}"; shift 2;;
-    --empty-wells)    EMPTY_WELLS=1;                                           shift;;
     --species)      SPECIES="${2:?missing --species value}";          shift 2;;
     --star-genome)   STAR_INDEX="${2:?missing --star-genome value}";   shift 2;;
     --run-name)   RUN_NAME="${2:?missing --run-name value}";           shift 2;;
@@ -452,6 +456,7 @@ RSEQC_DIR="${RUN_DIR}/rseqc"
 DMUX_BAM_DIR="${RUN_DIR}/demux_bam"
 DMUX_FQ_DIR="${RUN_DIR}/demux_fastq"
 RENAME_DIR="${STAR_DIR}/samples"
+RENAME_ALL_DIR="${STAR_DIR}/samples_all_wells"
 DUP_CSV="${RUN_DIR}/duplication_statistics.csv"
 UMI_MATRIX_CSV="${RUN_DIR}/${POOL}_umi_matrix.csv"
 READS_MATRIX_CSV="${RUN_DIR}/${POOL}_reads_matrix.csv"
@@ -557,37 +562,31 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   if [[ -n "$BARCODES_PLATE" ]]; then
     parse_args+=( --plate "$BARCODES_PLATE" )
   fi
-  if [[ "$EMPTY_WELLS" -eq 1 ]]; then
-    parse_args+=( --empty-wells )
-  fi
   # Capture the parser's exit code explicitly (a bare "cmd; rc=$?" is killed
   # by set -e before the assignment; "if ! cmd" hides $? behind the inverted
   # status).  "cmd || rc=$?" is the set-e-safe idiom.
   parse_rc=0
   "$PYTHON" "$PARSE_LIBPREP" "${parse_args[@]}" || parse_rc=$?
   if [[ "$parse_rc" -ne 0 ]]; then
-    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  saved in the same folder as the workbook. If that file is missing or named differently, either rename/move it into place, or pass it explicitly with  --barcodes-plate <file>. Then re-run."
+    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  in the plate directory /home/gecf/NGS_pipelines/BRB-seq/BRB_plates (override: \$BRB_PLATE_DIR). If that file is missing or named differently, either fix the plate directory, or pass the file explicitly with  --barcodes-plate <file>. Then re-run."
   fi
   [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
   log "manifest   = ${MANIFEST}  (generated from lib-prep workbook)"
 elif [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 1 ]]; then
   log "manifest   = (workbook mode; would generate from lib-prep workbook — skipped in dry-run)"
 elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
-  # manifest already on disk (resume).  It must match this call:
-  #  - flag set, rows missing  -> stale artifact (resume created without the
-  #    flag).  FAIL rather than regenerate in place: downstream steps of
-  #    --resume may already depend on the existing whitelist.  Re-run with
-  #    --resume force (fresh manifest + full re-run) or start a new run.
-  #  - flag unset, rows present -> same reason, reverse direction.
+  # manifest already on disk (resume).  Workbook mode ALWAYS emits
+  # empty_well_<WELL> rows (unconditionally since 2026-10-22), so a manifest
+  # without them predates that default.  FAIL rather than regenerate in
+  # place: downstream steps of --resume may already depend on the
+  # existing whitelist.  Start a new run (--run-name) to regenerate with
+  # empty wells included.
   ew_in_manifest=0
   grep -q $'^empty_well_[A-H][0-9][0-9]	' "$MANIFEST" && ew_in_manifest=1
-  if [[ "$EMPTY_WELLS" -eq 1 && "$ew_in_manifest" -eq 0 ]]; then
-    die "You asked to include empty wells (--empty-wells), but the sample→barcode list already saved from a previous run of this experiment (file: $MANIFEST) does not include any empty-well entries — it was generated earlier without that option. Mixing the two would give an inconsistent list, so the pipeline is stopping rather than silently proceeding. To fix: delete the stale file (or the whole previous run's output folder) and re-run, and it will regenerate the list including the empty wells."
+  if [[ "$ew_in_manifest" -eq 0 ]]; then
+    die "The sample→barcode list already saved from a previous run of this experiment (file: $MANIFEST) does not include any empty-well entries — it was generated before including unoccupied plate wells became the default behaviour of this pipeline. The current pipeline would rebuild it with empty_well_<WELL> rows and a different barcode whitelist than the one this run directory was already computed with, so mixing would give an inconsistent result. To fix: start a fresh run with a new --run-name (the list will be regenerated including the empty wells), or, if you prefer to keep this run exactly as it was, remove and re-add the old manifest yourself — but the simpler, intended path is the fresh run."
   fi
-  if [[ "$EMPTY_WELLS" -eq 0 && "$ew_in_manifest" -eq 1 ]]; then
-    die "The existing sample→barcode list from a previous run of this experiment (file: $MANIFEST) does include empty-well entries, but this call does not ask for them (no --empty-wells flag). Mixing the two would give an inconsistent list, so the pipeline is stopping rather than silently proceeding. To fix: either add --empty-wells to keep the list as-is, or delete the stale file (or the whole previous run's output folder) and re-run without that flag, and the list will be regenerated without empty wells."
-  fi
-  log "manifest   = ${MANIFEST}  (already present, reusing)"
+  log "manifest   = ${MANIFEST}  (already present, reusing — includes $(grep -c $'^empty_well_' "$MANIFEST" 2>/dev/null || echo '?') empty-well row(s))"
 fi
 
 #--- banner -------------------------------------------------------------------
@@ -610,7 +609,7 @@ if [[ -n "$LIBPREP_PROV" ]]; then
   else
     log "plate      = (not given — inferred from the workbook's 'Kit ref' row)"
   fi
-  [[ "$EMPTY_WELLS" -eq 1 ]] && log "empty wells = ON (unoccupied plate wells emitted as empty_well_<WELL>)"
+  log "empty wells = ON (default: unoccupied plate wells are always emitted as empty_well_<WELL> rows)"
 fi
 
 #--- execute (or dry-run) ----------------------------------------------------
@@ -1015,16 +1014,40 @@ fi
 
 #=== Sample-named count matrix  [MANDATORY] =================================
 # Rename the barcode-labelled matrix columns (barcodes.tsv in Gene/raw) to the
-# Sample_IDs from the run manifest, writing copies to ${STAR_DIR}/samples/.
-# The raw barcode-labelled matrix in Gene/raw is left untouched.
+# Sample_IDs from the run manifest:
+#   workbook mode (always): two outputs from the SAME single STAR matrix
+#     (one STAR call — the rename is a cheap post-processing step, not a
+#     second alignment):
+#     ${STAR_DIR}/samples_all_wells/  samples + empty_well_<WELL> (debug:
+#                                     where the unoccupied-well reads went)
+#     ${STAR_DIR}/samples/            samples only (empty_well_* excluded);
+#                                     the final UMI/reads CSVs are built
+#                                     from THIS directory
+#   --barcode-tsv mode:
+#     ${STAR_DIR}/samples/            samples only (there is no plate and no
+#                                     empty-well concept); samples_all_wells
+#                                     is simply absent
+# The raw barcode-labelled matrix in Gene/raw is left untouched — in workbook
+# mode it is the full-plate view (up to 96 barcode columns).
 log ""
 log "sample-named count matrix (mandatory)"
-run_or_skip "rename matrix" "${RENAME_DIR}/barcodes.tsv" "" "mandatory" \
+if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+  run_or_skip "rename matrix (all wells: samples + empty wells)" "${RENAME_ALL_DIR}/barcodes.tsv" "" "mandatory" \
+    "$PYTHON" "$RENAME_MATRIX" \
+      --raw-dir   "$RAW_DIR" \
+      --mapping   "$MANIFEST" \
+      --out-dir   "$RENAME_ALL_DIR" \
+      --dedup-methods "${DEDUP_METHODS[*]}"
+  [[ -s "${RENAME_ALL_DIR}/barcodes.tsv" ]] || die "The full-plate (all-wells) sample-named matrix (for debugging empty-well reads) did not finish: ${RENAME_ALL_DIR}/barcodes.tsv is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data. Fix and re-run (use --resume auto so steps that already finished are not redone)."
+  log "all-wells matrix dir: ${RENAME_ALL_DIR}  (barcode->sample map: ${RENAME_ALL_DIR}/sample_barcode_map.tsv)"
+fi
+run_or_skip "rename matrix (samples only)" "${RENAME_DIR}/barcodes.tsv" "" "mandatory" \
   "$PYTHON" "$RENAME_MATRIX" \
     --raw-dir   "$RAW_DIR" \
     --mapping   "$MANIFEST" \
     --out-dir   "$RENAME_DIR" \
-    --dedup-methods "${DEDUP_METHODS[*]}"
+    --dedup-methods "${DEDUP_METHODS[*]}" \
+    --exclude-prefix empty_well_
 [[ -s "${RENAME_DIR}/barcodes.tsv" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed barcode list ($RENAME_DIR/barcodes.tsv) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume auto so steps that already finished are not redone)."
 [[ -s "${RENAME_DIR}/umiDedup-1MM_Directional.mtx" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed UMI count table ($RENAME_DIR/umiDedup-1MM_Directional.mtx) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume auto so steps that already finished are not redone)."
 log "sample-named matrix dir: ${RENAME_DIR}"
@@ -1119,6 +1142,8 @@ log "  barcodes               = ${WHITELIST}  ($(wc -l < "$WHITELIST" 2>/dev/nul
 [[ -s "$STAR_BAM"     ]] && log "  STAR BAM             = ${STAR_BAM}"
 [[ -d "$RAW_DIR"      ]] && log "  Gene/raw mtx         = ${RAW_DIR}"
 [[ -s "$DUP_CSV"      ]] && log "  dup stats            = ${DUP_CSV}"
+[[ -d "$RENAME_DIR"   ]] && log "  sample-named mtx     = ${RENAME_DIR}  (samples only)"
+[[ -d "$RENAME_ALL_DIR" ]] && log "  sample-named mtx     = ${RENAME_ALL_DIR}  (all wells, debug)"
 [[ -s "$UMI_MATRIX_CSV"  ]] && log "  UMI matrix CSV       = ${UMI_MATRIX_CSV}"
 [[ -s "$READS_MATRIX_CSV" ]] && log "  Reads matrix CSV     = ${READS_MATRIX_CSV}"
 [[ -s "${DMUX_DIR:-/nonexistent}"     ]] && :
