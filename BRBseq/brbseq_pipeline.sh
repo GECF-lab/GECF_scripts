@@ -119,8 +119,8 @@ MERCURIUS 3' RNA-seq – Data Pre-Processing (BRB-seq / DRUG-seq) pipeline.
 
 REQUIRED FLAGS
   --species <sp>        human | mouse | <custom name>
-  --r1-barcode <fq.gz>  R1 barcode read (14 bp CB + 14 bp UMI)
-  --r2-genomic <fq.gz>  R2 genomic / cDNA read
+  --r1 <fq.gz>          R1 barcode read (14 bp CB + 14 bp UMI)
+  --r2 <fq.gz>          R2 genomic / cDNA read
   --run-name <name>     run label for the output leaf
                         BRBseq_<run-name>_<timestamp>; in lib-prep mode
                         taken from the workbook 'Researcher' row (first
@@ -129,9 +129,9 @@ REQUIRED FLAGS
 
   MANIFEST SOURCE — exactly one of these two:
     (a)  --barcode-tsv <tsv>
-    (b)  --libprep-xlsx <xlsx>   (+ optional --barcodes-plate <file>)
+    (b)  --libprep-xlsx <xlsx>   (+ optional --plate <file>)
          Mercurius lib-prep workbook (sample code + Oligo-dT primer well). The
-         barcode plate is joined by well. If --barcodes-plate is omitted, it is
+         barcode plate is joined by well. If --plate is omitted, it is
          inferred from the workbook's 'Kit ref' row (V5A/V5D ->
          barcodes_96_<family>_*.txt in the plate directory
          /home/gecf/NGS_pipelines/BRB-seq/BRB_plates, override: $BRB_PLATE_DIR);
@@ -146,7 +146,9 @@ OPTIONAL FLAGS
                         one at run time from the GTF shipped inside the STAR
                         index dir (build_star_index.sh moves it there)
   --out-dir <dir>       root output dir (default /mnt/data/BRB-seq_output)
-  --threads <n>         threads (default 8)
+  --threads <n>         CPU threads (default 8); number of parallel threads
+                        used by STAR (alignment) and fqtk (per-sample FASTQ
+                        demux)
   --resume <auto|force> auto = skip completed steps (default); force = rerun
   --skip-fastq          skip fastqc  (on by default)
   --skip-rseqc          skip read_distribution  (on by default)
@@ -154,36 +156,21 @@ OPTIONAL FLAGS
   --skip-dmux-fq        skip fqtk FASTQ demux  (on by default)
   --dry-run             emit planned commands and exit (no side effects)
 
-  WORKBOOK MODE (libprep-xlsx) — ALWAYS ON, no flag needed:
-   * Every unoccupied plate well is kept in the barcode whitelist and named
-     empty_well_<WELL> (reserved prefix: a real sample name may not start with
-     'empty_well').  This is the debugging/troubleshooting default so empty
-     reads are never silently dropped by the STAR whitelist.
-   * The sample-named count matrix is therefore written twice from the SAME
-     single STAR output (one alignment, no second STAR call):
-       <run>/star/samples_all_wells/   samples + empty_well_* (full plate)
-       <run>/star/samples/             samples only — the final UMI/reads
-                                       CSVs are built from THIS directory
-   * Per-sample demux output (demux_bam/ , demux_fastq/ ) contains REAL
-     SAMPLES ONLY: empty_well_* rows are filtered out of the demux maps
-     before picard/fqtk see them (each picard FilterSamReads is a
-     full BAM scan, so one per empty well was pure waste).  Empty wells
-     remain in the STAR whitelist and samples_all_wells/ for debugging.
   -h, --help            this help
   --version             print version and exit
 
 EXAMPLES
   # TSV manifest:
   ./brbseq_pipeline.sh --species mouse \
-      --r1-barcode /data/POOL/S1_R1_001.fastq.gz \
-      --r2-genomic /data/POOL/S1_R2_001.fastq.gz \
+      --r1 /data/POOL/S1_R1_001.fastq.gz \
+      --r2 /data/POOL/S1_R2_001.fastq.gz \
       --barcode-tsv /data/POOL/sample_barcode.tsv \
       --run-name Daniel --threads 16 --out-dir /mnt/data/BRB-seq_output
 
   # Lib-prep workbook instead of a TSV (plate inferred from the workbook):
   ./brbseq_pipeline.sh --species mouse \
-      --r1-barcode /data/POOL/S1_R1_001.fastq.gz \
-      --r2-genomic /data/POOL/S1_R2_001.fastq.gz \
+      --r1 /data/POOL/S1_R1_001.fastq.gz \
+      --r2 /data/POOL/S1_R2_001.fastq.gz \
       --libprep-xlsx "Mercurius HS BRB-seq RNA lib prep GECF.xlsx"
 
   # Custom species: build a STAR index once, then pass it:
@@ -200,11 +187,11 @@ EOF
 #--- argument parsing --------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --r1-barcode)   R1_BARCODE="${2:?missing --r1-barcode value}";   shift 2;;
-    --r2-genomic)   R2_GENOMIC="${2:?missing --r2-genomic value}";   shift 2;;
+    --r1)   R1_BARCODE="${2:?missing --r1 value}";   shift 2;;
+    --r2)   R2_GENOMIC="${2:?missing --r2 value}";   shift 2;;
     --barcode-tsv)  BARCODE_TSV="${2:?missing --barcode-tsv value}"; shift 2;;
     --libprep-xlsx) LIBPREP_XLSX="${2:?missing --libprep-xlsx value}"; shift 2;;
-    --barcodes-plate) BARCODES_PLATE="${2:?missing --barcodes-plate value}"; shift 2;;
+    --plate) BARCODES_PLATE="${2:?missing --plate value}"; shift 2;;
     --species)      SPECIES="${2:?missing --species value}";          shift 2;;
     --star-genome)   STAR_INDEX="${2:?missing --star-genome value}";   shift 2;;
     --run-name)   RUN_NAME="${2:?missing --run-name value}";           shift 2;;
@@ -233,7 +220,7 @@ done
 #--- validate required inputs ------------------------------------------------
 # Exactly one manifest source must be provided:
 #   --barcode-tsv  (2-col Sample_ID/Barcode TSV),  OR
-#   --libprep-xlsx  (+ optional --barcodes-plate).
+#   --libprep-xlsx  (+ optional --plate).
 # The plate is optional in workbook mode: parse_libprep_xlsx.py infers it from
 # the workbook's 'Kit ref' row (barcodes_96_<family>_*.txt next to the
 # workbook); an explicitly given plate is authoritative (a family mismatch with
@@ -246,13 +233,13 @@ if [[ -n "$LIBPREP_XLSX" ]]; then
   LIBPREP_MODE=1
 fi
 MISSING=()
-[[ -n "$R1_BARCODE"  ]] || MISSING+=( "--r1-barcode" )
-[[ -n "$R2_GENOMIC"  ]] || MISSING+=( "--r2-genomic" )
+[[ -n "$R1_BARCODE"  ]] || MISSING+=( "--r1" )
+[[ -n "$R2_GENOMIC"  ]] || MISSING+=( "--r2" )
 # manifest source: exactly one of (a) --barcode-tsv  or  (b) --libprep-xlsx.
 if [[ -z "$LIBPREP_XLSX" && -n "$BARCODES_PLATE" ]]; then
-  die "--barcodes-plate only makes sense together with the lib-prep workbook, but --libprep-xlsx was not given. Either add --libprep-xlsx <workbook.xlsx>, or remove --barcodes-plate and let the workbook's 'Kit ref' row choose the plate automatically."
+  die "--plate only makes sense together with the lib-prep workbook, but --libprep-xlsx was not given. Either add --libprep-xlsx <workbook.xlsx>, or remove --plate and let the workbook's 'Kit ref' row choose the plate automatically."
 elif [[ "$LIBPREP_MODE" -ne 1 && -z "$BARCODE_TSV" ]]; then
-  MISSING+=( "manifest source: --barcode-tsv <tsv>   or   --libprep-xlsx <xlsx>  (+ optional --barcodes-plate <file>)" )
+  MISSING+=( "manifest source: --barcode-tsv <tsv>   or   --libprep-xlsx <xlsx>  (+ optional --plate <file>)" )
 fi
 [[ -n "$SPECIES"     ]] || MISSING+=( "--species" )
 [[ -n "$RUN_NAME" || -n "$AVT_ID" || "$LIBPREP_MODE" -eq 1 ]]   || MISSING+=( "--run-name <name>" )
@@ -390,14 +377,14 @@ log "reference = ${SPECIES}  ->  STAR index $STAR_INDEX"
 #--- (end RSeQC reference resolution) -------------------------------------------------
 
 #--- validate file/directory inputs ------------------------------------------
-[[ -f "$R1_BARCODE"  ]] || die "The R1 (barcode-channel) FASTQ file was not found: $R1_BARCODE.  Check that the path in --r1-barcode is correct and the file is still there, then re-run."
-[[ -f "$R2_GENOMIC"  ]] || die "The R2 (genomic-channel) FASTQ file was not found: $R2_GENOMIC.  Check that the path in --r2-genomic is correct and the file is still there, then re-run."
+[[ -f "$R1_BARCODE"  ]] || die "The R1 (barcode-channel) FASTQ file was not found: $R1_BARCODE.  Check that the path in --r1 is correct and the file is still there, then re-run."
+[[ -f "$R2_GENOMIC"  ]] || die "The R2 (genomic-channel) FASTQ file was not found: $R2_GENOMIC.  Check that the path in --r2 is correct and the file is still there, then re-run."
 # In lib-prep mode the manifest is generated later; only validate the workbook
 # here.  The plate is optional: when omitted, the
 # parser infers it from the workbook's 'Kit ref' row.
 if [[ "$LIBPREP_MODE" -eq 1 ]]; then
   [[ -f "$LIBPREP_XLSX" ]] || die "The lib-prep workbook (--libprep-xlsx) file could not be found: $LIBPREP_XLSX. Check the path and re-run."
-  [[ -z "$BARCODES_PLATE" || -f "$BARCODES_PLATE" ]] || die "The barcode plate file (--barcodes-plate) could not be found: $BARCODES_PLATE. Check the path and re-run."
+  [[ -z "$BARCODES_PLATE" || -f "$BARCODES_PLATE" ]] || die "The barcode plate file (--plate) could not be found: $BARCODES_PLATE. Check the path and re-run."
 else
   [[ -f "$BARCODE_TSV" ]] || die "The sample manifest (--barcode-tsv) file could not be found: $BARCODE_TSV. It should be a plain-text file with exactly two tab-separated columns: sample_id  [TAB]  barcode (one sample per line). Check the path and re-run."
 fi
@@ -595,7 +582,7 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   parse_rc=0
   "$PYTHON" "$PARSE_LIBPREP" "${parse_args[@]}" || parse_rc=$?
   if [[ "$parse_rc" -ne 0 ]]; then
-    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  in the plate directory /home/gecf/NGS_pipelines/BRB-seq/BRB_plates (override: \$BRB_PLATE_DIR). If that file is missing or named differently, either fix the plate directory, or pass the file explicitly with  --barcodes-plate <file>. Then re-run."
+    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  in the plate directory /home/gecf/NGS_pipelines/BRB-seq/BRB_plates (override: \$BRB_PLATE_DIR). If that file is missing or named differently, either fix the plate directory, or pass the file explicitly with  --plate <file>. Then re-run."
   fi
   [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
   log "manifest   = ${MANIFEST}  (generated from lib-prep workbook)"
@@ -1264,7 +1251,7 @@ write_run_readme
 
 #=== Merging multi-lane FASTQ =============================================
 log ""; log "multi-lane FASTQ merge not auto-run (it is optional;"
-log "              pre-merge per-lane files or pass a comma list as --r1-barcode/--r2-genomic)"
+log "              pre-merge per-lane files or pass a comma list as --r1/--r2)"
 
 log ""; log "══════ PIPELINE COMPLETE (v${SCRIPT_VERSION}) ══════"
 log "  run directory         = ${RUN_DIR}"
