@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BRB-seq pipeline — How to run it</title>
+<style>
+  :root {
+    --ink: #1f2933; --muted: #5f6b7a; --accent: #0b5fa5; --soft: #eef4fa;
+    --code-bg: #f6f8fa; --border: #d9e2ec; --ok: #1b7f3b; --warn: #a15c00;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color: var(--ink); margin: 0; line-height: 1.55; background: #fff; }
+  main { max-width: 880px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 1.9em; margin: 0 0 4px; }
+  h2 { font-size: 1.3em; margin-top: 2.2em; padding-bottom: 6px; border-bottom: 2px solid var(--soft); }
+  h3 { font-size: 1.05em; margin-top: 1.4em; }
+  p { margin: 0.6em 0; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 20px; font-size: 0.95em; }
+  th, td { text-align: left; padding: 8px 12px; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--soft); }
+  .note, .warn { border-left: 4px solid var(--accent); background: var(--soft);
+                 padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 14px 0; }
+  .warn { border-left-color: var(--warn); background: #fdf6ec; }
+  .smallnote { color: var(--muted); font-size: 0.9em; margin-top: -6px; margin-bottom: 14px; }
+  .note strong, .warn strong { display: inline; }
+  .steps { counter-reset: step; list-style: none; padding: 0; }
+  .steps > li { counter-increment: step; position: relative; padding: 0 0 18px 44px; }
+  .steps > li::before { content: counter(step); position: absolute; left: 0; top: 0;
+                        width: 30px; height: 30px; border-radius: 50%; background: var(--accent);
+                        color: #fff; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+  .toc { background: var(--soft); border-radius: 8px; padding: 14px 20px; margin: 20px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .tag { display: inline-block; font-size: 0.75em; font-weight: 600; padding: 2px 8px;
+         border-radius: 10px; background: var(--accent); color: #fff; vertical-align: middle; margin-left: 6px; }
+  .tag.opt { background: var(--muted); }
+  footer { margin-top: 60px; padding-top: 16px; border-top: 1px solid var(--border);
+           color: var(--muted); font-size: 0.85em; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>BRB-seq pipeline — how to run it</h1>
+<p class="subtitle">A short guide for first-time users: what the analysis does, how to build the STAR index (one-time), how to launch a run, and what the outputs mean.</p>
+
+<div class="toc">
+  <strong>Contents</strong><br>
+  1. <a href="#what">What is BRB-seq?</a> &nbsp;·&nbsp;
+  2. <a href="#setup">One-time setup</a> &nbsp;·&nbsp;
+  3. <a href="#star-index">Building the STAR index</a> &nbsp;·&nbsp;
+  4. <a href="#run">Running a pool</a> &nbsp;·&nbsp;
+  5. <a href="#outputs">Reading the outputs</a> &nbsp;·&nbsp;
+  6. <a href="#faq">Common questions</a>
+</div>
+
+<h2 id="what">1. What is BRB-seq?</h2>
+<p>
+In BRB-seq (barcoded-bulk RNA-seq), cells or samples are loaded into the wells of a
+96-well plate. Every well carries a unique 14-base <strong>cell barcode (CB)</strong> on the
+oligo-dT adapter. After pooling, all wells are sequenced <em>together</em>, and each read is
+tagged with the barcode of the well it came from — so the samples are separated
+<strong>in silico</strong> instead of in separate sequencing files.
+</p>
+<p>Every pool produces exactly <strong>two FASTQ files</strong>:</p>
+<table>
+  <tr><th>File</th><th>Length</th><th>Contains</th></tr>
+  <tr><td>R1</td><td>28 nt</td><td>Well barcode (bases 1–14) + UMI (bases 15–28)</td></tr>
+  <tr><td>R2</td><td>90 nt</td><td>The actual cDNA insert read</td></tr>
+</table>
+<p>
+The pipeline aligns the cDNA reads with <strong>STAR</strong> (using STARsolo's
+<code>CB_UMI_Simple</code> mode) and counts transcripts per well. UMIs let the pipeline
+collapse PCR duplicates, giving you a <strong>molecule-count</strong> matrix as well as a
+raw read-count matrix.
+</p>
+
+<h2 id="setup">2. One-time setup</h2>
+<ol class="steps">
+  <li>
+    <strong>Install the conda environment</strong> (once per machine):
+    <pre><code>conda env create -f brbseq-env.yaml   # env name: brbseq</code></pre>
+    The pipeline finds tools from this environment <em>automatically</em> — you do not
+    need to <code>conda activate</code> before running.
+  </li>
+  <li>
+    <strong>Build the STAR index</strong> for your species (one-time, see next section) —
+    or reuse an existing one.
+  </li>
+  <li>
+    <strong>Gather your run inputs:</strong> the two FASTQ files of your pool, the
+    lib-prep Excel workbook for the plate (or a barcode TSV), and know which species
+    you sequenced (<code>mouse</code> / <code>human</code>).
+  </li>
+</ol>
+
+<h2 id="star-index">3. Building the STAR index <span class="tag">one-time</span></h2>
+<p>
+The index is a searchable data structure of your genome + gene annotation; STAR builds it
+once and reuses it for every subsequent run. It takes a while (hours for a large genome),
+so build it deliberately.
+</p>
+<h3>What you need</h3>
+<ul>
+  <li>A reference genome as a FASTA file (<code>.fa</code> or <code>.fa.gz</code>)</li>
+  <li>A gene-annotation file in GTF format (<code>.gtf</code> or <code>.gtf.gz</code>) with chromosome names matching the FASTA</li>
+  <li>(Optional) ERCC spike-in control sequences: <strong>both</strong> their FASTA and their GTF</li>
+</ul>
+
+<h3>The command</h3>
+<pre><code>conda activate brbseq          # STAR must be on PATH
+./build_star_index.sh \
+  --fasta /path/to/genome.fa \
+  --gtf   /path/to/annotation.gtf \
+  --outdir /path/to/STAR_index \
+  [--ercc-fasta ercc92.fa --ercc-gtf ercc92.gtf]   # optional pair
+  [--threads 8] [--sjdbOverhang 89] [--large-genome]</code></pre>
+
+<h3>Options</h3>
+<table>
+  <tr><th>Flag</th><th>Mandatory</th><th>Meaning</th></tr>
+  <tr><td><code>--fasta</code> <code>--gtf</code></td><td>yes</td><td>Genome and annotation to index</td></tr>
+  <tr><td><code>--outdir</code></td><td>yes</td><td>Where the index is built (must be empty)</td></tr>
+  <tr><td><code>--ercc-fasta</code> + <code>--ercc-gtf</code></td><td class="opt">optional <em>pair</em></td><td>Add ERCC spike-in genes to the index (both or neither — one alone is an error)</td></tr>
+  <tr><td><code>--threads</code></td><td class="opt">optional</td><td>Parallelism for the build</td></tr>
+  <tr><td><code>--sjdbOverhang</code></td><td class="opt">optional</td><td>cDNA read length − 1; leave the default 89 for standard BRB-seq 90-nt R2 reads</td></tr>
+  <tr><td><code>--large-genome</code></td><td class="opt">optional</td><td>Extra RAM limits for very large genomes</td></tr>
+</table>
+
+<div class="warn">
+  <strong>ERCC spike-ins need BOTH files.</strong> STAR counts reads per gene defined in the
+  GTF. If you add the ERCC sequences (FASTA) but not the ERCC gene records (GTF), your
+  spike-in reads will align fine but count under "unassigned" — silently losing all control
+  values. Both files must use the same contig names, and keeping them in sync is your
+  responsibility.
+</div>
+
+<h3>What a finished index looks like</h3>
+<pre><code>STAR_index/
+├── Genome/                # the searchable genome fragments (the "index")
+├── SA                     # suffix-array data structure
+├── SAindex                # suffix-array lookup index
+├── genomeParameters.txt   # full provenance: exact STAR version, build command,
+│                          #   FASTA/GTF used, sjdbOverhang value
+├── Log.out                # build log (must say "finished successfully")
+├── genome.fa              # the input FASTA, kept alongside for reference
+└── annotation.gtf         # the input GTF, kept alongside for reference
+                           (plus …_with_ERCC.fa / …_with_ERCC.gtf if the ERCC pair was used)</code></pre>
+<p>
+<code>genomeGenerate</code> produces no <code>Log.final.out</code> — check
+<code>Log.out</code> for "finished successfully" and confirm <code>Genome</code>,
+<code>SA</code>, <code>SAindex</code>, and <code>genomeParameters.txt</code> exist.
+<code>genomeParameters.txt</code> is your audit trail of exactly what the index was built from.
+</p>
+<p>
+The pipeline also uses the GTF stored in the index directory (at run time) to generate
+QC inputs, so <strong>don't delete the FASTA/GTF copies from a finished index</strong> —
+the dir is a self-contained, shareable blob.
+</p>
+
+<h2 id="run">4. Running a pool</h2>
+<p>
+The main entry point is <code>brbseq_pipeline.sh</code>. One invocation = one pool.
+</p>
+<div class="warn">
+  <strong>The script won't run unless <code>utils/</code> is next to it.</strong>
+  <code>brbseq_pipeline.sh</code> finds its helper scripts (barcode parsing, matrix
+  building, BAM demux, QC) in a <code>utils/</code> folder that must sit in the
+  <strong>same directory</strong> as the main script, like this:
+  <pre><code>BRBseq/
+├── brbseq_pipeline.sh      # the main script
+└── utils/                  # required — keep in the same folder
+    ├── parse_libprep_xlsx.py
+    ├── prepare_barcodes.sh
+    ├── rename_matrix.py
+    ├── prepare_umi_matrix.py
+    ├── get_duplication_statistics.py
+    └── demultiplex_bam.sh</code></pre>
+  If you move <code>brbseq_pipeline.sh</code> somewhere else, move <code>utils/</code>
+  with it (or copy both together) — a missing <code>utils/</code> is the most common
+  "script just dies" cause and isn't a data problem.
+</div>
+<p>
+You provide the samples→wells mapping either as the <strong>lib-prep workbook</strong>
+(recommended — the parser reads well positions, sample names, and infers the barcode
+plate from the workbook's own <em>Kit ref</em> row) or as a handmade
+two-column TSV where the first column is the <code>sample_id</code> and the second
+is the <code>barcode</code>, separated by <strong>one real tab character</strong>
+(i.e. <code>sample_id[tab]barcode</code>, not the word "tab" and not spaces).
+</p>
+<h3>Example: workbook mode</h3>
+<pre><code>./brbseq_pipeline.sh \
+  --species mouse \
+  --libprep-xlsx /path/to/libprep_phxxx.xlsx \
+  --r1 /path/to/Daniel_pool1_S1_R1_001.fastq.gz \
+  --r2 /path/to/Daniel_pool1_S1_R2_001.fastq.gz</code></pre>
+<p class="smallnote">In workbook mode <code>--run-name</code> is optional — it is inferred
+from the sample name in the workbook. No <code>--out-dir</code> needed either — see the
+output-directory note below.</p>
+<h3>Example: barcode-TSV mode</h3>
+<pre><code>./brbseq_pipeline.sh \
+  --species human \
+  --barcode-tsv /path/to/sample_barcodes.tsv \
+  --run-name Daniel_pool1 \
+  --r1 /path/to/Daniel_pool1_S1_R1_001.fastq.gz \
+  --r2 /path/to/Daniel_pool1_S1_R2_001.fastq.gz</code></pre>
+
+<h4>What the TSV file must look like</h4>
+<p>Exactly <strong>two columns separated by one tab character</strong> —
+<code>sample_id</code> and <code>barcode</code> — one sample per line. The header row
+is optional (the script auto-detects it). The barcode is the 14-base BRB-seq cell
+barcode from the plate file. Do not write the word "tab" in the file, do not use
+spaces:</p>
+<pre><code>sample_id	barcode
+W0_WT_DOX_1	CAGGCAAGGCAACG
+W0_SH_DOX_1	CTACCGGAGAATTT
+W1_WT_No_DOX_1	AACGCTGCCGTAAT
+W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
+<div class="warn">
+  <strong>The delimiter must be a real tab character</strong> — press the Tab key
+  between the two fields in your text editor. Each line looks like
+  <code>W1_WT_No_DOX_1[tab]AACGCTGCCGTAAT</code>, where <code>[tab]</code> is a
+  single <code>\t</code> character, <em>not</em> the three characters T-A-B and not
+  spaces — spaces will make the file unreadable to the parser. Save it as
+  <code>.txt</code> or <code>.tsv</code>, plain text.
+</div>
+
+<div class="note">
+  <strong>No <code>--out-dir</code> needed — it has a default.</strong> On the production
+  server runs land in <code>/mnt/data/BRB-seq_output</code> (each run gets its own
+  timestamped subfolder: <code>/mnt/data/BRB-seq_output/BRBseq_&lt;run-name&gt;_&lt;timestamp&gt;/</code>).
+  Pass <code>--out-dir &lt;dir&gt;</code> only if you want to send outputs somewhere else.
+</div>
+
+<div class="note">
+  <strong>No <code>--star-genome</code> needed for the usual case.</strong> On the
+  production server the STAR indexes for <code>mouse</code> and <code>human</code>
+  already exist, so the script picks the right one automatically from
+  <code>--species</code>. Only pass
+  <code>--star-genome /path/to/STAR_index</code> if you are using a custom index
+  (or a new species).
+</div>
+
+<table>
+  <tr><th>Flag</th><th>Mandatory</th><th>Meaning</th></tr>
+  <tr><td><code>--species</code></td><td>yes</td><td><code>mouse</code> or <code>human</code> (not read from the workbook)</td></tr>
+  <tr><td><code>--r1</code> <code>--r2</code></td><td>yes</td><td>Your pool's two FASTQ files — <code>--r1</code> = barcode read (CB+UMI), <code>--r2</code> = cDNA read</td></tr>
+  <tr><td><code>--star-genome</code></td><td class="opt">optional</td><td>Custom STAR index directory. Not needed on the server for <code>mouse</code>/<code>human</code> — the index is inferred from <code>--species</code>. Pass it only for a custom index / new species</td></tr>
+  <tr><td><code>--libprep-xlsx</code> <em>or</em> <code>--barcode-tsv</code></td><td>yes (exactly one)</td><td>Sample→well manifest source</td></tr>
+  <tr><td><code>--run-name</code></td><td>yes in TSV mode</td><td>Name of the run directory (in workbook mode it can also be inferred from the workbook)</td></tr>
+  <tr><td><code>--threads</code></td><td class="opt">optional</td><td>Number of CPU threads (default 8)</td></tr>
+  <tr><td><code>--out-dir</code></td><td class="opt">optional</td><td>Root output dir — defaults to <code>/mnt/data/BRB-seq_output</code> on the server. Use local disk rather than a network share if you override it</td></tr>
+  <tr><td><code>--plate</code></td><td class="opt">optional</td><td>Barcode plate file; normally auto-inferred from the workbook's <em>Kit ref</em> (V5D vs V5A10 chemistry)</td></tr>
+  <tr><td><code>--skip-fastq</code></td><td class="opt">optional</td><td>Skip the FastQC step. The step runs by default; add this flag to turn it off</td></tr>
+  <tr><td><code>--skip-rseqc</code></td><td class="opt">optional</td><td>Skip the RSeQC read-distribution step. The step runs by default; add this flag to turn it off</td></tr>
+  <tr><td><code>--skip-dmux-bam</code></td><td class="opt">optional</td><td>Skip the per-sample BAM demux (picard) — the slowest step. It runs by default; add this flag to turn it off</td></tr>
+  <tr><td><code>--skip-dmux-fq</code></td><td class="opt">optional</td><td>Skip the per-sample FASTQ demux (fqtk). It runs by default; add this flag to turn it off</td></tr>
+  <tr><td><code>--dry-run</code></td><td class="opt">optional</td><td>Show what would happen without creating any files</td></tr>
+  <tr><td><code>--resume-dir</code></td><td class="opt">optional</td><td>Re-run a previous run that finished or failed <em>in its own output folder</em> (pass that folder, e.g. <code>BRBseq_&lt;name&gt;_&lt;timestamp&gt;</code>). Steps whose output already exists are skipped; only the incomplete step(s) re-run. It reuses the sample→barcode list stored in that folder, so do <strong>not</strong> also pass <code>--libprep-xlsx</code>/<code>--barcode-tsv</code>/<code>--plate</code></td></tr>
+  <tr><td><code>--bed-file</code></td><td class="opt">optional</td><td>RSeQC gene-model (BED12) file. Without this, the pipeline builds a BED12 from the GTF file inside the STAR genome index. (If neither is available, only the RSeQC read-distribution step is skipped — the rest of the pipeline still runs)</td></tr>
+</table>
+
+
+<div class="warn">
+  <strong>Plate chemistry (V5D vs V5A10).</strong> The two plate files contain the
+  same 96 barcodes but assigned to <em>different</em> wells — using the wrong one
+  silently swaps every sample's identity. Even when the pipeline reads the chemistry
+  from the Excel file, the value there can be wrong, so
+  <strong>always pass <code>--plate &lt;file&gt;</code> explicitly</strong> to
+  guarantee the correct file is used. The plate files (one per chemistry)
+  live in <code>/home/gecf/NGS_pipelines/BRB-seq/BRB_plates</code> — for example
+  <code>--plate /home/gecf/NGS_pipelines/BRB-seq/BRB_plates/barcodes_96_V5A10_brb.txt</code>
+  when your kit is a V5A10 kit, and the matching <code>V5D</code> file for a V5D kit.
+</div>
+
+<h3>What happens inside a run</h3>
+<ol>
+  <li><strong>Manifest</strong> — samples, wells, and 14-nt barcodes are joined into a whitelist (empty plate wells included as <code>empty_well_XX</code> rows in workbook mode).</li>
+  <li><strong>FastQC</strong> of both FASTQ files.</li>
+  <li><strong>STARsolo alignment + counting</strong> — one alignment pass that strips the 14-nt CB + 14-nt UMI from read 1, aligns the 90-nt cDNA read, and writes per-barcode gene-count matrices (raw and UMI-deduplicated).</li>
+  <li><strong>QC &amp; demux</strong> — RSeQC read distribution, per-sample BAM demux (picard) and per-sample FASTQ demux (fqtk).</li>
+  <li><strong>Final outputs</strong> — you take two things into downstream analysis: (a) the sample-named matrix <em>files</em>, and (b) the per-well duplication statistics. The matrix itself exists in two forms of the <em>same</em> data: the raw STAR output where each barcode column is renamed to its Sample_ID (<code>star/samples/</code>), and the ready-to-use CSV tables built from it (<code>matrices/&lt;pool&gt;_umi_matrix.csv</code> for unique-molecule/UMI counts, <code>&lt;pool&gt;_reads_matrix.csv</code> for raw read counts). Use the UMI CSV for PCA/DE; see section 5.</li>
+</ol>
+<p>
+Every step logs to its own file under <code>logs/</code>; the supervisor log
+(<code>pipeline.log</code>) records each step, its full command line, a pointer to its
+log, and any failure context. Each step is skipped
+when its output file already exists, so re-running the pipeline is safe. To pick up
+an interrupted run, re-run with <code>--resume-dir</code> pointing at the same run
+folder — the steps that already finished are skipped and the rest continue. If a
+specific step's output is stale or wrong, delete that step's output file and re-run
+into the same folder to redo just that step.
+</p>
+
+<h3>How long does a run take?</h3>
+<p>
+Measured on a real production pool (run <strong>AVT0639</strong>: mouse, ~446 M reads,
+39 GB STAR-aligned BAM, 30 samples, 32 threads). These are the per-step wall times
+read from that run's <code>pipeline.log</code>:
+</p>
+<table>
+  <tr><th>Step</th><th>Time (AVT0639)</th><th>Notes</th></tr>
+  <tr><td>Barcode / manifest prep</td><td><strong>&lt; 1 min</strong></td><td>instant — just joins barcodes to wells</td></tr>
+  <tr><td>FastQC (R1 + R2)</td><td><strong>~ 25 min</strong></td><td>scales with read count</td></tr>
+  <tr>
+    <td>STARsolo alignment + UMI counting</td>
+    <td><strong>~ 30 min</strong></td>
+    <td>the core step — includes building the per-barcode count matrices and the BAM</td>
+  </tr>
+  <tr><td>samtools index</td><td><strong>&lt; 1 min</strong></td><td></td></tr>
+  <tr><td>RSeQC read-distribution (QC)</td><td><strong>~ 15 min</strong></td><td>scales with the BAM size</td></tr>
+  <tr><td>Duplication stats + matrix renames + UMI/reads CSVs</td><td><strong>&lt; 1 min</strong></td><td>all fast matrix reshaping</td></tr>
+  <tr><td><strong>BAM demux (picard, 30 samples)</strong></td><td><strong>~ 3.5 h</strong></td><td><em>dominant</em> — one picard pass per sample over the whole BAM</td></tr>
+  <tr><td>FASTQ demux (fqtk, 446 M reads)</td><td><strong>~ 15 min</strong></td><td>single pass, fast</td></tr>
+</table>
+<div class="note">
+  <strong>Rule of thumb:</strong> expect <strong>~ 4–5 hours end-to-end</strong> for a
+  standard pool. About three-fifths of the wall time in AVT0639
+  (17:11 → 22:02) was <strong>the picard BAM demux</strong> — every other step combined
+  took about an hour. It is the one step to budget for; it grows with the number of
+  samples, not the read count. Everything else scales with read count.
+</div>
+<p>
+Times scale with your data: double the reads → FastQC / STAR / RSeQC roughly double;
+double the samples → BAM demux roughly doubles. Plan on the picard step as the long pole —
+if you only need the expression matrices you can skip the demux steps entirely
+(<code>--skip-dmux-bam --skip-dmux-fq</code>) and cut the run to about <strong>1 hour</strong>.
+</p>
+
+<h2 id="outputs">5. Reading the outputs</h2>
+<p>Each run creates one directory: <code>&lt;out-dir&gt;/BRBseq_&lt;run-name&gt;_&lt;timestamp&gt;/</code></p>
+<pre><code>BRBseq_Daniel_pool1_20261023_093000/
+├── matrices/
+│   ├── pool_Daniel_umi_matrix.csv      ★ the table for PCA / DE analysis
+│   └── pool_Daniel_reads_matrix.csv     read counts (duplication context only)
+├── duplication_statistics.csv          per-well UMI/read ratio
+├── star/
+│   ├── pool_Daniel_Solo.out/            raw STAR output (sparse matrices, per barcode)
+│   ├── samples/                        same matrix, columns renamed to sample IDs
+│   ├── samples_all_wells/              full-plate view incl. empty wells (debugging)
+│   ├── pool_Daniel_Aligned.sortedByCoord.out.bam   aligned pool BAM
+│   └── STAR.log
+├── fastqc/                             per-FASTQ reports (.zip / .html)
+├── rseqc/                              read distribution + BED12
+├── demux_bam/   demux_fastq/           per-sample BAM / FASTQ files
+├── barcodes/                           manifest + provenance used for the run
+├── README.html                         per-run folder guide (open in a browser)
+└── pipeline.log   logs/                one log per step</code></pre>
+
+<h3>Which matrix do I use?</h3>
+<table>
+  <tr><th>File</th><th>Counts</th><th>Use for</th></tr>
+  <tr>
+    <td><code>pool_Daniel_umi_matrix.csv</code></td>
+    <td>Unique mRNA molecules (PCRs collapsed by UMI, 1-mismatch-tolerant)</td>
+    <td><strong>PCA, Seurat, edgeR, any expression analysis</strong> — this is the canonical table</td>
+  </tr>
+  <tr>
+    <td><code>pool_Daniel_reads_matrix.csv</code></td>
+    <td>All reads, including PCR duplicates</td>
+    <td>Duplication context only. <em>Not</em> for PCA/DE.</td>
+  </tr>
+</table>
+<p>
+Both CSVs have the layout <code>Gene_id, gene_symbol, &lt;sample&gt;…</code> — key downstream
+analysis on <code>Gene_id</code> (some species references, e.g. mouse, carry a few hundred
+repeated gene symbols, so the ID is the collision-free key).
+</p>
+<p>
+<code>duplication_statistics.csv</code> gives the per-well UMI/read ratio — a healthy
+well typically shows substantial PCR collapse (e.g. ~0.2), while an overloaded or empty
+well may show a ratio near 1.
+</p>
+
+<h2 id="faq">6. Common questions</h2>
+<h3>My sample columns are named <code>A01</code>, <code>B04</code>… — where are my sample names?</h3>
+<p>
+In workbook mode, sample names come from the workbook's sample-name column and appear
+in <code>star/samples/</code> and the final CSVs. If the workbook's name column was
+missing/empty, the parser fell back to well positions and warned about it — check
+<code>pipeline.log</code> and re-check the workbook before trusting those columns.
+</p>
+<h3>I changed something mid-run / it crashed — do I start over?</h3>
+<p>
+No. Re-run the same command with <code>--resume-dir &lt;existing-run-dir&gt;</code> and
+finished steps are skipped. The pipeline decides a step is "done" by looking for
+its <strong>marker file</strong> — which is simply that step's own output file (for
+example <code>barcodes/barcode_whitelist.txt</code> for barcode prep,
+<code>fastqc/QC_done</code> for FastQC,
+<code>duplication_statistics.csv</code> for the dups step, or the
+<code>star/samples/barcodes.tsv</code> rename marker). If a marker + its output
+exist, the step is skipped; if they're missing or empty, the step re-runs. So to
+force a single step to redo, delete its marker/output file and resume — the rest
+still stays skipped.
+</p>
+<h3>Can I skip QC steps to save time?</h3>
+<p>Yes — all four QC/demux steps are default-on but individually skippable via the
+<code>--skip-*</code> flags. The alignment + matrix chain is mandatory and always runs.</p>
+<h3>What if STAR fails with a weird read-count error on 2.7.11b?</h3>
+<p>
+Star versions can differ subtly in accepted flags (<code>STAR 2.7.10b</code> and
+<code>2.7.11b</code> have known divergences in how they parse some BRB input shapes).
+Match the pipeline's STAR build to the one your index was built with — the build is
+recorded in the index's <code>genomeParameters.txt</code>.
+</p>
+
+<footer>
+  BRB-seq pipeline (STARsolo <code>CB_UMI_Simple</code>, pool BAMs) — how-to for first-time users.
+  For protocol details and full flag reference, see the pipeline script's <code>--help</code>
+  and the MERCURIUS 3' RNA-seq user guide (Alithea).
+</footer>
+
+</main>
+</body>
+</html>
