@@ -1110,9 +1110,12 @@ fi
 #=== Sample demultiplex (FASTQ, fqtk)  [OPTIONAL] ==========================
 if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
   log ""; log "FASTQ demultiplex via fqtk (optional)"
-  DONE_FQ="${DMUX_FQ_DIR}/_done"
-  if [[ "$RESUME" == "auto" && -s "$DONE_FQ" ]]; then
-    log "SKIP FASTQ demux (done marker present: $DONE_FQ)"
+  # This step needs BOTH reads: fqtk demuxes off the 14-bp CB in R1 and
+  # emits the cDNA read from R2. If R2 wasn't supplied, fail out clearly now.
+  if [[ -z "$R2_GENOMIC" ]]; then
+    warn "Skipping FASTQ demux: a cDNA read (R2) is required to demultiplex. Re-run with --r2 <R2.fastq.gz>."
+  elif [[ "$RESUME" == "auto" && -s "${DMUX_FQ_DIR}/_done" ]]; then
+    log "SKIP FASTQ demux (done marker present: ${DMUX_FQ_DIR}/_done)"
   else
     if [[ "$HAVE_FQTK" -eq 1 ]]; then
       # Same empty-well exclusion as the BAM demux above: the vendor map
@@ -1124,10 +1127,14 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
       fqtk_log="${LOGS_DIR}/demux_fq.log"
       log "RUN  fqtk demux"
       log "  demux map: $local_fq_map  ($(wc -l < "$local_fq_map") line(s) incl. header; ${ew_fq} empty_well row(s) excluded)"
+      log "  R1 barcode = 14 BP (CB) + 14 BP (UMI)   |   R2 = 90 BP (cDNA)"
       log "  step log -> ${fqtk_log}"
+      # Reads are demultiplexed off the 14-bp CB in R1 (R1 = 14B + 14M; R2 = 90T cDNA),
+      # per the Mercurius BRB-seq guide §1.8. Output: one cDNA FASTQ per sample (named
+      # *_R1.fq.gz by fqtk, despite holding the R2/cDNA bases) + unmatched + demux-metrics.
       fqtk demux \
-        -i "$R1_BARCODE" \
-        -r "14I14I" \
+        -i "$R1_BARCODE" "$R2_GENOMIC" \
+        -r "14B14M" "90T" \
         -s "$local_fq_map" \
         -o "$DMUX_FQ_DIR" \
         -u "unmatched" \
@@ -1135,7 +1142,7 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
         >"$fqtk_log" 2>&1 \
         || { tail -20 "$fqtk_log" >&2 2>/dev/null || true; \
              warn "'fqtk' (the tool that splits the combined FASTQ into one file per sample) reported a problem. See step log: ${fqtk_log}. The per-sample FASTQ files it managed to write are still in $DMUX_FQ_DIR and can be used, but some samples may be missing or incomplete. If you expected every sample to be present, check that folder and compare against your sample list; if something is missing, you can re-run just this step (it is safe to re-run)."; }
-      touch "$DONE_FQ"
+      touch "${DMUX_FQ_DIR}/_done"
       log "per-sample FASTQs in: $DMUX_FQ_DIR"
     else
       warn "This optional step (splitting the raw sequence files into one per sample) cannot run because 'fqtk' is not installed in the current environment. It ships inside the 'brbseq' Conda environment — activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it). The rest of the pipeline will continue as normal; only this per-sample split will be missing from this run's output."
@@ -1223,7 +1230,7 @@ write_run_readme() {
       echo "- \`${_b}/\` — one aligned BAM per sample (split from the pool BAM; real samples only)."
     fi
     if [[ -n "$_f" ]]; then
-      echo "- \`${_f}/\` — one FASTQ pair per sample (split from the raw reads; real samples only), plus \`unmatched/\`."
+      echo "- \`${_f}/\` — one demultiplexed cDNA FASTQ per sample (real samples only): files are named \`Sample_ID_R1.fq.gz\` by fqtk convention but hold the 90-bp **cDNA** read; the 14-bp cell barcode and 14-bp UMI are carried in each read's name. Plus \`unmatched.R1.fq.gz\` (reads with no matching barcode) and \`demux-metrics.txt\` (per-assignment stats)."
     fi
     echo "- \`pipeline.log\` — supervisor log: every step's status and exact command."
     echo "- \`logs/\` — one full output log per pipeline step."
