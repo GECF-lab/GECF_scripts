@@ -741,16 +741,29 @@ run_or_skip() {
   local marker="${1:-}"; shift
   local tool="${1:-}"; shift
   local mode="${1:-mandatory}"; shift
+  # Optional "sentinel" flag: the marker is a pure completion sentinel (empty
+  # file, created by touch) and is tested with -e (exists) rather than -s
+  # (non-empty).  Use it for steps whose marker has no data content.
+  local sentinel=0
+  if [[ "${1:-}" == "sentinel" ]]; then sentinel=1; shift; fi
   # Optional 2-token flag:  stdout_to <path>  → command's stdout is the
   # step's data product; run_or_skip does both redirects explicitly so the
-  # log calls above it still land in pipeline.log (not the product file).
+  # log calls above it still land in pipeline.log, not the product.
   local product_path=""
   if [[ "${1:-}" == "stdout_to" ]]; then
     product_path="${2:?run_or_skip: stdout_to requires a file path}"
     shift 2
   fi
   local cmd=( "$@" )
-  if [[ -n "$marker" && -s "$marker" ]]; then
+  local marker_ok=0
+  if [[ -n "$marker" ]]; then
+    if [[ "$sentinel" -eq 1 ]]; then
+      [[ -e "$marker" ]] && marker_ok=1     # empty sentinel: existence is the signal
+    else
+      [[ -s "$marker" ]] && marker_ok=1     # data marker: must be non-empty
+    fi
+  fi
+  if [[ "$marker_ok" -eq 1 ]]; then
     log "SKIP ${name} (already done: ${marker})"
     return 0
   fi
@@ -819,9 +832,8 @@ log "barcode prep done: whitelist=$(wc -l < "$WHITELIST") barcodes; fastq_meta+b
 if [[ "$RUN_OPT_FASTQ" -eq 1 ]]; then
   log ""; log "fastqc (optional)"
   FQ_MARKER="${FASTQC_DIR}/QC_done"
-  run_or_skip "fastqc" "$FQ_MARKER" "fastqc" "optional" \
+  run_or_skip "fastqc" "$FQ_MARKER" "fastqc" "optional" sentinel \
     fastqc --threads 32 --outdir "$FASTQC_DIR" "$R1_BARCODE" "$R2_GENOMIC"
-  touch "$FQ_MARKER"  # idempotent completion marker
   log "fastqc outputs in: $FASTQC_DIR"
 else
   log ""; log "fastqc — skipped (--skip-fastq)"
