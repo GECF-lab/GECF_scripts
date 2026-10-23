@@ -1,6 +1,6 @@
 # BRB-seq (MERCURIUS DRUG-seq) single-pool RNA-seq pipeline
 
-`brbseq_pipeline.sh` (v1.0.0, pre-production) — end-to-end pre-processing for
+`brbseq_pipeline.sh` (v1.0.2) — end-to-end pre-processing for
 **one pool/run** of MERCURIUS 3' RNA-seq (BRB-seq / DRUG-seq) data:
 barcode prep → STARsolo alignment + gene/UMI counts → mandatory duplication
 statistics → sample-named matrices → optional per-sample demux.
@@ -14,7 +14,7 @@ single alignment.
 
 | File | Purpose |
 |---|---|
-| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.0.0) |
+| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.0.2) |
 | `build_star_index.sh` | One-time STAR genomeDir build (Mercurius guide 1.1; no Ensembl fetch) |
 | `brbseq-env.yaml` | Conda environment (`brbseq`) — STAR, samtools, fastqc, picard, fqtk, RSeQC tools, python/openpyxl |
 | `utils/prepare_barcodes.sh` | Builds `barcode_whitelist.txt` + demux maps from the manifest (TSV `Sample_ID` → `bar`) |
@@ -54,8 +54,8 @@ conda env create -f brbseq-env.yaml   # creates env 'brbseq'
 | `fastqc` | read-quality QC |
 | `samtools` | index/BAM manipulation |
 | `read_distribution.py` | RSeQC read-length distribution |
-| `picard` | MarkDuplicates → duplication statistics |
-| `fqtk` | per-well FASTQ demux (`--demux-*`, optional) |
+| `picard` | `FilterSamReads` — per-sample BAM demux (writes `demux_bam/`) |
+| `fqtk` | per-sample FASTQ demux (writes `demux_fastq/`; on by default, disable with `--skip-dmux-fq`) |
 | `python` + `openpyxl` | workbook mode + UMI dedup (needs Python **3.7+**) |
 
 > **Why env-first?** Previously, with no `conda activate`, the script picked up
@@ -75,8 +75,8 @@ and skips that step rather than aborting.
   `pool_poolA_S1_R1_001.fastq.gz` → pool `pool_poolA`. (No `--pool` flag, no
   `AVT` env override.)
 - **Manifest** — exactly one of:
-  - `--barcode-tsv <tsv>` (TSV of `Sample_ID<TAB>barcode`, header optional;
-    auto-detected; `-H` forces skip), **or**
+  - `--barcode-tsv <tsv>` (TSV of `Sample_ID<TAB>barcode`; a header row is
+    auto-detected and skipped automatically when present), **or**
   - `--libprep-xlsx <xlsx>` — Mercurius lib-prep workbook; the barcode plate
     is joined by well, plate family inferred from the `Kit ref` row
     (V5D / V5A10) unless `--plate <file>` is given.
@@ -108,8 +108,8 @@ Single-level leaf under `--out-dir`:
 
 ```
 OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
-├── barcodes/             barcode_whitelist.txt, fastq_sample_metadata.tsv,
-│                         bam_barcodes.tsv, sample_barcode_map.tsv
+├── barcodes/             barcode_whitelist.txt, manifest*.tsv,
+│                         fastq_sample_metadata.tsv, bam_barcodes.tsv
 ├── star/
 │   ├── STAR.log          STAR invocation + runtime output
 │   ├── <pool>_Aligned.sortedByCoord.out.bam
@@ -119,6 +119,8 @@ OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
 │   │                     to the two matrix CSVs below)
 │   └── samples_all_wells/  Sample_ID-named matrix (SAMPLES + empty_well_*)
 │                         [lib-prep workbook mode only]
+│                         (both also hold sample_barcode_map.tsv and the
+│                          umiDedup-{NoDedup,1MM_Directional}.mtx matrices)
 ├── rseqc/                read_distribution (optional)
 ├── demux_bam/            one BAM per sample (optional)
 ├── demux_fastq/          demuxed FASTQs (optional)
@@ -128,46 +130,77 @@ OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
 │   └── <pool>_reads_matrix.csv  raw-read matrix (duplication context only)
 ├── pipeline.log          supervisor log (step status + exact commands)
 ├── logs/                 one output log per step
-└── README.md             auto-generated folder index — describes every file
-                          above; written at the end of the run, safe to share
-                          with users as the orientation point
+└── README.html           auto-generated folder index — describes every file
+                          above; written at the end of the run, open in a
+                          browser; safe to share with users as the orientation
+                          point
 ```
 
-## v1.0.0 changes (current, not yet in production)
+## Changelog
 
-1. **Logging restructure** — the run dir now has **two** log layers:
-   - `pipeline.log` — supervisor log only: the pipeline's own messages
-     (RUN/SKIP/done, die/warn, resume decisions) + a pointer to each step's
-     log.  No raw tool output.
-   - `logs/<step>.log` — one file per pipeline step; the step's tool stdout
-     + stderr land here (fastqc, samtools, picard, fqtk, python helpers).
-     Step names are sanitised (non-alphanumeric → `_`).
-   - STAR's own `star/STAR.log` is unchanged — STAR runtime output + the full
-     invocation is written there (the invocation is also echoed as the first
-     line of that file for provenance).
-   - `run_or_skip` and the pipeline still emit `RUN  <step>: <cmd>` to
-     stdout (and therefore to `pipeline.log`) so the exact command line of
-     every step is recoverable from the supervisor log.
+Bumped in `SCRIPT_VERSION` in `brbseq_pipeline.sh` (currently **v1.0.2**).
+v1.0.1 was reserved but never shipped — the version went straight from the
+1.0.0 baseline to 1.0.2.
 
-2. **Empty wells are the unconditional default in lib-prep workbook mode**
-   (no flag, no per-run choice) — details in the **Workbook mode** section
-   above.  In `--barcode-tsv` mode the manifest is samples-only (no plate,
-   no empty-well concept).
+### v1.0.0 — baseline single-pool pipeline
 
-3. **Per-sample demux runs over samples only** — `empty_well_*` rows are
-   filtered out of the demux maps before picard/fqtk run.
+First end-to-end version of the MERCURIUS (BRB-seq / DRUG-seq) single-pool
+workflow. Everything below is the shipped baseline:
 
-4. **Matrix CSVs (mandatory) are the two deliverables** — both in the
-   `matrices/` folder at the run root:
-   - `matrices/<pool>_umi_matrix.csv` — **CANONICAL**, from `umiDedup-1MM_Directional.mtx`
-     (UMI molecule counts; the correct input for PCA/DE).
-   - `matrices/<pool>_reads_matrix.csv` — from `umiDedup-NoDedup.mtx` (raw read
-     counts; kept for duplication context, **not** a PCA/DE input).
-   - Both are built by `utils/prepare_umi_matrix.py` from `star/samples/*.mtx`
-     (rows = genes in `features.tsv` order, cols = `Sample_ID`s from the
-     manifest).  `Gene_id` is col 1 (unique per row), `gene_symbol` is col 2
-     (annotation).  No folding, no value change — a 1:1 value-verbatim
-     projection of the matrix rows.
+- **One STARsolo pass, both dedup methods** — `--soloUMIdedup NoDedup
+  1MM_Directional` in a single alignment, so the duplication statistics and
+  the two deliverable matrices all come out of the same run.
+- **Matrix CSVs (mandatory) are the two deliverables** — both in the
+  `matrices/` folder at the run root:
+  - `matrices/<pool>_umi_matrix.csv` — **CANONICAL**, from
+    `umiDedup-1MM_Directional.mtx` (UMI molecule counts; the correct input
+    for PCA / differential expression).
+  - `matrices/<pool>_reads_matrix.csv` — from `umiDedup-NoDedup.mtx` (raw
+    read counts; kept for duplication context, **not** a PCA/DE input).
+  - Built by `utils/prepare_umi_matrix.py` from `star/samples/*.mtx`
+    (rows = genes in `features.tsv` order, cols = `Sample_ID`s from the
+    manifest).  `Gene_id` is col 1 (unique per row), `gene_symbol` is col 2
+    (annotation).  No folding, no value change — a 1:1 value-verbatim
+    projection of the matrix rows.
+- **Empty wells are the default in lib-prep workbook mode** (no flag, no
+  per-run choice) — details in the **Workbook mode** section.  In
+  `--barcode-tsv` mode the manifest is samples-only (no plate, no empty-well
+  concept).
+- **Per-sample demux runs over samples only** — `empty_well_*` rows are
+  filtered out of the demux maps before picard/fqtk run.
+- **Two-layer logging** — the run dir has:
+  - `pipeline.log` — supervisor log only: the pipeline's own messages
+    (RUN/SKIP/done, die/warn) + a pointer to each step's log.  No raw tool
+    output.
+  - `logs/<step>.log` — one file per pipeline step; the step's tool stdout
+    + stderr land here (fastqc, samtools, picard, fqtk, python helpers).
+    Step names are sanitised (non-alphanumeric → `_`).
+  - STAR's own `star/STAR.log` is unchanged — STAR runtime output + the full
+    invocation is written there (the invocation is also echoed as the first
+    line of that file for provenance).
+  - `run_or_skip` and the pipeline still emit `RUN <step>: <cmd>` to stdout
+    (and therefore to `pipeline.log`) so the exact command line of every step
+    is recoverable from the supervisor log.
+- **Env-first tool resolution** (brbseq env located automatically, no
+  `conda activate` needed) and a hard fail on any missing required tool.
+- **Pool label inferred from the FASTQ names** (no `--pool` flag) and the
+  Mercurius **lib-prep workbook mode** (`--libprep-xlsx`).
+
+### v1.0.2 — resume + robustness fixes
+
+- **`--resume-dir`** — continue an earlier run that didn't finish, in its own
+  folder.  Steps with complete output are skipped; only the incomplete step(s)
+  re-run, using the sample→barcode list already stored in that folder.  See
+  the **Resuming an incomplete run** section.
+- **Fixed the FASTQ demux step** so an interrupted/failed attempt is
+  detected and re-run instead of being wrongly skipped.
+- **Sentinel marker logic** (`run_or_skip` "sentinel" mode) — a step only
+  records its done-marker once it truly finished, and a failed optional step
+  (e.g. FastQC) no longer leaves a stale marker; it correctly re-runs on the
+  next pass.
+- **Run-folder index is now `README.html`** — the auto-generated orientation
+  page written at the end of each run is HTML (open in a browser) rather than
+  plain-text Markdown.
 
 ## Quick start
 
@@ -230,13 +263,11 @@ that folder:
 
 ## Status
 
-`SCRIPT_VERSION="1.0.0"` — pre-production.  The first real-pool deployment
-(planned against an AVT0608/AVT0615-style pool) will be the **v1.0.0**
-release; all previously-tagged "v1.1.0–v1.4.0" intermediate versions have been
-retired (2026-10-22) and the features they described (dual-table deliverable,
-1:1 value-verbatim rows keyed on Gene_id, pool label inferred from FASTQ
-names, lib-prep workbook mode) are all shipped in 1.0.0.  Reference them by
-feature or date, not by those version numbers.
+`SCRIPT_VERSION="1.0.2"` (in `brbseq_pipeline.sh`) — the current, working
+version of the pipeline.  The first real-pool deployment (against an
+AVT0608/AVT0615-style pool) is built on top of this baseline.  See **Changelog**
+above for what each release shipped; reference changes by feature or date (not
+by the old intermediate version numbers).
 
 ## Reference (authoritative)
 
