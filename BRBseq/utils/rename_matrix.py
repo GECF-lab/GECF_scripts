@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     methods = [m for m in args.dedup_methods.split() if m]
     for req in ("barcodes.tsv", "features.tsv") + tuple(f"umiDedup-{m}.mtx" for m in methods):
         if not os.path.isfile(os.path.join(args.raw_dir, req)):
-            print(f"ERROR: The step that gives every sample its proper name (matching the Sample_ID from your list) is missing one of the input files it needs — the STAR counting step should have produced a file called '{req}' inside the folder {args.raw_dir}, but it is not there. This points to a problem in the earlier STAR / UMI-counting step (which is why a needed file never appeared), not in this step itself. See the messages printed above for the likely reason in the STAR step, fix that, and re-run the pipeline (using --resume auto so steps that already finished are not redone).",
+            print(f"ERROR: The step that gives every sample its proper name (matching the Sample_ID from your list) is missing one of the input files it needs — the STAR counting step should have produced a file called '{req}' inside the folder {args.raw_dir}, but it is not there. This points to a problem in the earlier STAR / UMI-counting step (which is why a needed file never appeared), not in this step itself. See the messages printed above for the likely reason in the STAR step, fix that, and re-run the pipeline (using --resume-dir pointing at this same folder, so steps that already finished are not redone).",
                   file=sys.stderr)
             return 3
 
@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         bcols = [l.strip() for l in fh if l.strip()]
     if not bcols:
         print("ERROR: The list of barcodes that this step needs to rename into proper sample names (file: "
-              f"{os.path.join(args.raw_dir, 'barcodes.tsv')}) is empty — meaning the earlier STAR step did not report a single barcode it found in the data. This almost always means the alignment step itself produced essentially no usable result (for example, the barcode file given to the pipeline did not match the barcodes actually present in the data at all). Check the results of the earlier alignment step and the barcode list you supplied, fix the mismatch, and re-run the pipeline (using --resume auto so steps that already finished are not redone).", file=sys.stderr)
+              f"{os.path.join(args.raw_dir, 'barcodes.tsv')}) is empty — meaning the earlier STAR step did not report a single barcode it found in the data. This almost always means the alignment step itself produced essentially no usable result (for example, the barcode file given to the pipeline did not match the barcodes actually present in the data at all). Check the results of the earlier alignment step and the barcode list you supplied, fix the mismatch, and re-run the pipeline (using --resume-dir pointing at this same folder, so steps that already finished are not redone).", file=sys.stderr)
         return 3
 
     new_cols = [bar2name.get(b, f"UNMATCHED_{b}") for b in bcols]
@@ -276,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     for mth in methods:
         rows, ncols, coords = read_mtx(os.path.join(args.raw_dir, f"umiDedup-{mth}.mtx"))
         if ncols != len(full_barcols):
-            print(f"ERROR: Refusing to write out the renamed count table for the '{mth}' counting method: the count table itself has {ncols} sample columns, but the barcode list it should be renamed against lists {len(full_barcols)} — these two should always agree, and if they disagree the earlier STAR step's output is internally inconsistent. This is not a problem with your sample naming or the mapping file; it points to the STAR step's own result folder. Fix the earlier step and re-run the pipeline (using --resume auto so steps that already finished are not redone).",
+            print(f"ERROR: Refusing to write out the renamed count table for the '{mth}' counting method: the count table itself has {ncols} sample columns, but the barcode list it should be renamed against lists {len(full_barcols)} — these two should always agree, and if they disagree the earlier STAR step's output is internally inconsistent. This is not a problem with your sample naming or the mapping file; it points to the STAR step's own result folder. Fix the earlier step and re-run the pipeline (using --resume-dir pointing at this same folder, so steps that already finished are not redone).",
                   file=sys.stderr)
             return 3
         out_coords = coords

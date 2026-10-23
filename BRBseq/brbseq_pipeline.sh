@@ -46,7 +46,7 @@
 #     conda activate brbseq
 #     (helper scripts are resolved from ./utils, shipped with this directory).
 #   * Re-runnable: a step is skipped when its output already exists
-#     (disable skipping with --resume force).
+#     (re-run the same command to continue; finished steps are skipped).
 #   * The optional steps (FASTQ QC, RSeQC, BAM demux, FASTQ demux) are ON by
 #     default (disable each with its --skip-* flag); a missing tool causes
 #     that step to log a warning and skip rather than abort the run.
@@ -54,7 +54,7 @@
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
@@ -102,7 +102,7 @@ RUN_OPT_DEMUX_FQ="${RUN_OPT_DEMUX_FQ:-1}"
 S_FASTQ=0; S_RSEQC=0; S_DMBAM=0; S_DMFQ=0
 # Alithea BRB-seq production SAM tag set (fixed, not user-configurable).
 SAM_ATTRS="NH HI nM AS CR UR CB UB GX GN sS sQ sM"
-RESUME="${RESUME:-auto}"         # auto | force
+RESUME_DIR="${RESUME_DIR:-}"     # --resume-dir: target an existing run dir in place
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON="${PYTHON:-python3}"
 
@@ -149,7 +149,14 @@ OPTIONAL FLAGS
   --threads <n>         CPU threads (default 8); number of parallel threads
                         used by STAR (alignment) and fqtk (per-sample FASTQ
                         demux)
-  --resume <auto|force> auto = skip completed steps (default); force = rerun
+  --resume-dir <dir>    continue an earlier run that didn't finish, in its
+                        own folder. Steps that already have complete output
+                        are skipped; only the incomplete step(s) re-run,
+                        using the sample→barcode list already stored in that
+                        folder (barcodes/) — so pass --r1 --r2 --species
+                        again, not a new --libprep-xlsx/--barcode-tsv/--plate.
+                        (See the "Resuming an incomplete run" section of
+                        README.md.)
   --skip-fastq          skip fastqc  (on by default)
   --skip-rseqc          skip read_distribution  (on by default)
   --skip-dmux-bam       skip picard BAM demux  (on by default)
@@ -202,7 +209,7 @@ while [[ $# -gt 0 ]]; do
     --skip-fastq)   S_FASTQ=1;                                        shift;;
     --skip-rseqc)   S_RSEQC=1;                                        shift;;
     --skip-dmux-bam)S_DMBAM=1;                                        shift;;
-    --resume)       RESUME="${2:?missing --resume value}";            shift 2;;
+    --resume-dir)   RESUME_DIR="${2:?missing --resume-dir value}";    shift 2;;
     --dry-run)      DRY_RUN=1;                                        shift;;
     -h|--help)      usage; exit 0;;
     --version)      echo "brbseq_pipeline.sh ${SCRIPT_VERSION}"; exit 0;;
@@ -226,24 +233,41 @@ done
 # workbook); an explicitly given plate is authoritative (a family mismatch with
 # the Kit ref is a loud warning, not an abort).
 if [[ -n "$BARCODE_TSV" && -n "$LIBPREP_XLSX" ]]; then
-  die "You specified both --barcode-tsv and --libprep-xlsx, but only one of them can be used (both define the sample ↔ barcode mapping).  Remove one of the two flags and re-run."
+  die "You specified both --barcode-tsv and --libprep-xlsx, but only one of them can be used (both define the sample ↔ barcode mapping).  Remove one of the two flags and re-run. (With --resume-dir the manifest inside the run dir is used — no new manifest source is needed.)"
 fi
 LIBPREP_MODE=0
 if [[ -n "$LIBPREP_XLSX" ]]; then
   LIBPREP_MODE=1
 fi
+# --resume-dir: the run was already STARTED — the sample→barcode list must
+# exist inside that run dir (barcodes/manifest_from_libprep.tsv for workbook
+# mode, or the user TSV for --barcode-tsv mode).  No new manifest source is
+# generated or required for this re-run.
+if [[ -n "$RESUME_DIR" ]]; then
+  LIBPREP_MODE=1
+  if [[ -n "$LIBPREP_XLSX" || -n "$BARCODE_TSV" || -n "$BARCODES_PLATE" ]]; then
+    die "--resume-dir uses the sample→barcode list already stored inside ${RESUME_DIR} — do not also pass --libprep-xlsx / --barcode-tsv / --plate. (If you WANT to regenerate the list from a new workbook that is a fresh run: drop --resume-dir and give --run-name for a new folder.)"
+  fi
+  [[ -d "$RESUME_DIR" ]] || die "--resume-dir folder not found: ${RESUME_DIR} (this should be an existing pipeline output folder named BRBseq_<name>_<timestamp>). Use --help for the full list of options."
+  _rd_manifest=""
+  for _mf in "${RESUME_DIR%/}/barcodes/manifest_from_libprep.tsv" "${RESUME_DIR%/}/barcodes/barcode_manifest.tsv"; do
+    if [[ -s "$_mf" ]]; then _rd_manifest="$_mf"; break; fi
+  done
+  [[ -n "$_rd_manifest" ]] || die "--resume-dir needs the sample→barcode list (${RESUME_DIR}/barcodes/manifest_from_libprep.tsv) which the original run produced, but it is missing or empty there. Either that run never got as far as the barcode step, or the folder was pruned. Check the folder's pipeline.log to see how far it got, then fix that step first (see --help) and re-run into the same folder."
+  RESUME_MANIFEST="$_rd_manifest"
+  [[ -s "${RESUME_DIR%/}/barcodes/barcode_whitelist.txt" ]] || die "--resume-dir needs the barcode whitelist (${RESUME_DIR}/barcodes/barcode_whitelist.txt) which the original run produced, but it is missing or empty — the barcode-prep step did not complete in that run. See its entry in that folder's pipeline.log, fix that step first (see --help), then re-run into the same folder."
+fi
 MISSING=()
 [[ -n "$R1_BARCODE"  ]] || MISSING+=( "--r1" )
 [[ -n "$R2_GENOMIC"  ]] || MISSING+=( "--r2" )
 # manifest source: exactly one of (a) --barcode-tsv  or  (b) --libprep-xlsx.
-if [[ -z "$LIBPREP_XLSX" && -n "$BARCODES_PLATE" ]]; then
+if [[ -z "$LIBPREP_XLSX" && -n "$BARCODES_PLATE" && -z "$RESUME_DIR" ]]; then
   die "--plate only makes sense together with the lib-prep workbook, but --libprep-xlsx was not given. Either add --libprep-xlsx <workbook.xlsx>, or remove --plate and let the workbook's 'Kit ref' row choose the plate automatically."
 elif [[ "$LIBPREP_MODE" -ne 1 && -z "$BARCODE_TSV" ]]; then
   MISSING+=( "manifest source: --barcode-tsv <tsv>   or   --libprep-xlsx <xlsx>  (+ optional --plate <file>)" )
 fi
 [[ -n "$SPECIES"     ]] || MISSING+=( "--species" )
 [[ -n "$RUN_NAME" || -n "$AVT_ID" || "$LIBPREP_MODE" -eq 1 ]]   || MISSING+=( "--run-name <name>" )
-[[ "$RESUME" == "auto" || "$RESUME" == "force" ]] || die "--resume can only be 'auto' (skip steps that already finished) or 'force' (run every step again). Use one of those two and re-run."
 [[ "${#MISSING[@]}" -eq 0 ]] || die "The command is missing required option(s): ${MISSING[*]}. Add the listed option(s) to the command and re-run. (Full list of options: brbseq_pipeline.sh --help)"
 
 #--- pool label ---------------------------------------------------------------
@@ -382,9 +406,11 @@ log "reference = ${SPECIES}  ->  STAR index $STAR_INDEX"
 # In lib-prep mode the manifest is generated later; only validate the workbook
 # here.  The plate is optional: when omitted, the
 # parser infers it from the workbook's 'Kit ref' row.
-if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+if [[ "$LIBPREP_MODE" -eq 1 && -z "$RESUME_DIR" ]]; then
   [[ -f "$LIBPREP_XLSX" ]] || die "The lib-prep workbook (--libprep-xlsx) file could not be found: $LIBPREP_XLSX. Check the path and re-run."
   [[ -z "$BARCODES_PLATE" || -f "$BARCODES_PLATE" ]] || die "The barcode plate file (--plate) could not be found: $BARCODES_PLATE. Check the path and re-run."
+elif [[ "$LIBPREP_MODE" -eq 1 && -n "$RESUME_DIR" ]]; then
+  :   # resume mode: the manifest lives inside the run dir (validated above)
 else
   [[ -f "$BARCODE_TSV" ]] || die "The sample manifest (--barcode-tsv) file could not be found: $BARCODE_TSV. It should be a plain-text file with exactly two tab-separated columns: sample_id  [TAB]  barcode (one sample per line). Check the path and re-run."
 fi
@@ -414,6 +440,12 @@ fi
 # (lib-prep mode only).  In lib-prep mode we ask the parser module for the
 # researcher name now, before the output dir is known, so the leaf can be named;
 # the manifest is generated into <run>/barcodes/ later, after the layout.
+if [[ -z "$RUN_NAME" && -n "$RESUME_DIR" ]]; then
+  _rd_base="$(basename "${RESUME_DIR%/}")"
+  [[ "$_rd_base" =~ ^BRBseq_(.+)_.{15}$ ]] || die "--resume-dir points at '${RESUME_DIR}' which is not named like an existing run folder (expected BRBseq_<name>_<timestamp>). Re-check the path, or pass --run-name explicitly."
+  RUN_NAME="${BASH_REMATCH[1]}"
+  log "run name   = ${RUN_NAME}  (from the --resume-dir folder name; pass --run-name to override)"
+fi
 if [[ -z "$RUN_NAME" ]]; then
   if [[ -n "$AVT_ID" ]]; then
     RUN_NAME="$AVT_ID"
@@ -441,8 +473,16 @@ RUN_NAME="$(tr -dc 'A-Za-z0-9._-' <<<"${RUN_NAME// /_}" )"   # filesystem-safe
 [[ -n "$RUN_NAME" ]] || die "The run name you supplied (--run-name) is made up only of characters that are not allowed in file names, so after cleaning it became an empty name and the pipeline has no way to label the output folder. Please use a run name made of letters, numbers, dots, dashes or underscores (spaces will be turned into underscores) — for example 'PHX537_poolA' — and re-run."
 
 #--- output layout -----------------------------------------------------------
-TS="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="${OUT_DIR%/}/BRBseq_${RUN_NAME}_${TS}"
+if [[ -n "$RESUME_DIR" ]]; then
+  # Re-run an EXISTING run folder in place (no new timestamped dir).
+  # Every step re-checks its own completion state (see the resume
+  # logic per step below), so finished steps are skipped and the one that
+  # did not finish (e.g. the failed fastq demultiplex) is re-run.
+  RUN_DIR="${RESUME_DIR%/}"
+else
+  TS="$(date +%Y%m%d_%H%M%S)"
+  RUN_DIR="${OUT_DIR%/}/BRBseq_${RUN_NAME}_${TS}"
+fi
 BARCODES_DIR="${RUN_DIR}/barcodes"
 FASTQC_DIR="${RUN_DIR}/fastqc"
 STAR_DIR="${RUN_DIR}/star"
@@ -458,7 +498,11 @@ READS_MATRIX_CSV="${MATRIX_DIR}/${POOL}_reads_matrix.csv"
 # In --barcode-tsv mode the manifest lives where the user put it (no generation);
 # in lib-prep mode the manifest is generated into <run>/barcodes/ and survives re-runs.
 MANIFEST="$BARCODE_TSV"
-if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+if [[ -n "${RESUME_MANIFEST:-}" ]]; then
+  # --resume-dir: reuse exactly the sample→barcode list the run was started with.
+  MANIFEST="$RESUME_MANIFEST"
+  LIBPREP_PROV=""
+elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   MANIFEST="${BARCODES_DIR}/manifest_from_libprep.tsv"
   LIBPREP_PROV="${MANIFEST}_provenance.tsv"
 else
@@ -592,7 +636,7 @@ elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   # manifest already on disk (resume).  Workbook mode ALWAYS emits
   # empty_well_<WELL> rows (unconditionally since 2026-10-22), so a manifest
   # without them predates that default.  FAIL rather than regenerate in
-  # place: downstream steps of --resume may already depend on the
+  # place: downstream resume steps may already depend on the
   # existing whitelist.  Start a new run (--run-name) to regenerate with
   # empty wells included.
   ew_in_manifest=0
@@ -604,7 +648,7 @@ elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
 fi
 
 #--- banner -------------------------------------------------------------------
-log "==== MERCURIUS DRUG-seq pipeline v${SCRIPT_VERSION} (resume=${RESUME} dry_run=${DRY_RUN}) ===="
+log "==== MERCURIUS DRUG-seq pipeline v${SCRIPT_VERSION} (dry_run=${DRY_RUN}) ===="
 log "run name   = ${RUN_NAME}"
 log "pool       = ${POOL}"
 log "threads    = ${THREADS}"
@@ -706,7 +750,7 @@ run_or_skip() {
     shift 2
   fi
   local cmd=( "$@" )
-  if [[ -n "$marker" && "$RESUME" == "auto" && -s "$marker" ]]; then
+  if [[ -n "$marker" && -s "$marker" ]]; then
     log "SKIP ${name} (already done: ${marker})"
     return 0
   fi
@@ -735,9 +779,15 @@ run_or_skip() {
     log "  step log tail (last 30 lines of ${step_log}):"
     tail -30 "$step_log" >&2 2>/dev/null || true
     if [[ "$mode" == "mandatory" ]]; then
-      die "The required step '${name}' ran into an error and could not be completed, so the pipeline has stopped. Full output is in the step log: ${step_log}. Re-run with --resume auto so steps that already finished are not redone."
+      die "The required step '${name}' ran into an error and could not be completed, so the pipeline has stopped. Full output is in the step log: ${step_log}. Re-run the pipeline with --resume-dir pointing at this same run folder so the steps that already finished are not redone."
     else
       warn "The optional step '${name}' ran into an error, so it did not finish — but this does not stop the pipeline; everything else will still run. The reason is in the step log: ${step_log}. If you want this step's output, fix the underlying problem and re-run (it is safe to re-run just this one)."
+    fi
+    # A FAILED step must not keep (or gain) its completion marker, otherwise a
+    # later resume would skip a step that never actually finished.
+    if [[ -n "$marker" && -e "$marker" ]]; then
+      rm -f -- "$marker"
+      log "  (completion marker removed on failure: ${marker} — this step will be re-run on the next resume)"
     fi
   else
     [[ -n "$marker" ]] && touch "$marker"
@@ -851,7 +901,7 @@ star_solo() {
   if "${STAR_CMD[@]}" >> "${log_file}" 2>&1; then
     return 0
   else
-    log "The STAR alignment/counting step (STARsolo, UMI counting methods: ${DEDUP_METHODS[*]}) reported that it failed. The last lines of its own log file are printed directly above this line — read them for the specific reason (for example too few reads, an index it cannot read, or a run out of memory). Fix that, then re-run the pipeline with --resume auto so the steps that already finished are not redone."
+    log "The STAR alignment/counting step (STARsolo, UMI counting methods: ${DEDUP_METHODS[*]}) reported that it failed. The last lines of its own log file are printed directly above this line — read them for the specific reason (for example too few reads, an index it cannot read, or a run out of memory). Fix that, then re-run the pipeline with --resume-dir pointing at this same run folder so the steps that already finished are not redone."
     tail -20 "${log_file}" >&2 || true
     return 1
   fi
@@ -861,10 +911,10 @@ S14_MARKER="${STAR_DIR}/_s14_done"
 S14_DONE=0
 if [[ -f "$S14_MARKER" && -s "$S14_MARKER" ]]; then S14_DONE=1; fi
 
-if [[ "$RESUME" != "auto" || "$S14_DONE" -eq 0 ]]; then
+if [[ "$S14_DONE" -eq 0 ]]; then
   # One STAR invocation, --soloUMIdedup in list form (both methods).
   star_solo "${STAR_BASE}"
-  [[ -s "$STAR_BAM" ]] || die "The alignment step (STAR) ran to completion, but the aligned reads file it should have produced ($STAR_BAM) was not found or is empty. This usually means STAR itself stopped early with an error — see the messages printed just above this line, and the STAR log ($STAR_DIR/STAR.log), for the specific reason. Fix that, then re-run the pipeline (use --resume auto so earlier steps are not redone)."
+  [[ -s "$STAR_BAM" ]] || die "The alignment step (STAR) ran to completion, but the aligned reads file it should have produced ($STAR_BAM) was not found or is empty. This usually means STAR itself stopped early with an error — see the messages printed just above this line, and the STAR log ($STAR_DIR/STAR.log), for the specific reason. Fix that, then re-run the pipeline (use --resume-dir pointing at this same folder so earlier steps are not redone)."
   echo "$(date +%FT%T)" > "${STAR_DIR}/_s14_done"
 fi
 log "STAR BAM: $STAR_BAM"
@@ -988,7 +1038,7 @@ log ""; log "duplication statistics (mandatory)"
 for req in "$RAW_DIR/barcodes.tsv" \
            "$RAW_DIR/umiDedup-NoDedup.mtx" \
            "$RAW_DIR/umiDedup-1MM_Directional.mtx"; do
-  [[ -s "$req" ]] || die "The step that measures how duplicated / how 'empty' each sample's reads are needs three input files (the raw UMI count tables STAR produces), and one of them is missing or zero-sized: $req. All three must exist in $RAW_DIR before this step can run — this points to a problem earlier in the pipeline (the STAR / UMI-counting step). See the messages printed above for the likely reason; fix that, then re-run (use --resume auto so steps that already finished are not redone)."
+  [[ -s "$req" ]] || die "The step that measures how duplicated / how 'empty' each sample's reads are needs three input files (the raw UMI count tables STAR produces), and one of them is missing or zero-sized: $req. All three must exist in $RAW_DIR before this step can run — this points to a problem earlier in the pipeline (the STAR / UMI-counting step). See the messages printed above for the likely reason; fix that, then re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
 done
 run_or_skip "duplication stats" "$DUP_CSV" "" "mandatory" \
   "$PYTHON" "$DUP_STATS" \
@@ -996,7 +1046,7 @@ run_or_skip "duplication stats" "$DUP_CSV" "" "mandatory" \
     --dedup_method "1MM_Directional" \
     --manifest "$MANIFEST" \
     --output_csv "$DUP_CSV"
-[[ -s "$DUP_CSV" ]] || die "The step that measures how duplicated / how 'empty' each sample's reads are did not produce its result file ($DUP_CSV). See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume auto so steps that already finished are not redone)."
+[[ -s "$DUP_CSV" ]] || die "The step that measures how duplicated / how 'empty' each sample's reads are did not produce its result file ($DUP_CSV). See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
 log "duplication stats: $DUP_CSV"
 if [[ -f "${DUP_CSV%.*}.summary.csv" ]]; then
   log "summary           : ${DUP_CSV%.*}.summary.csv"
@@ -1028,7 +1078,7 @@ if [[ "$LIBPREP_MODE" -eq 1 ]]; then
       --mapping   "$MANIFEST" \
       --out-dir   "$RENAME_ALL_DIR" \
       --dedup-methods "${DEDUP_METHODS[*]}"
-  [[ -s "${RENAME_ALL_DIR}/barcodes.tsv" ]] || die "The full-plate (all-wells) sample-named matrix (for debugging empty-well reads) did not finish: ${RENAME_ALL_DIR}/barcodes.tsv is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data. Fix and re-run (use --resume auto so steps that already finished are not redone)."
+  [[ -s "${RENAME_ALL_DIR}/barcodes.tsv" ]] || die "The full-plate (all-wells) sample-named matrix (for debugging empty-well reads) did not finish: ${RENAME_ALL_DIR}/barcodes.tsv is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data. Fix and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
   log "all-wells matrix dir: ${RENAME_ALL_DIR}  (barcode->sample map: ${RENAME_ALL_DIR}/sample_barcode_map.tsv)"
 fi
 run_or_skip "rename matrix (samples only)" "${RENAME_DIR}/barcodes.tsv" "" "mandatory" \
@@ -1038,8 +1088,8 @@ run_or_skip "rename matrix (samples only)" "${RENAME_DIR}/barcodes.tsv" "" "mand
     --out-dir   "$RENAME_DIR" \
     --dedup-methods "${DEDUP_METHODS[*]}" \
     --exclude-prefix empty_well_
-[[ -s "${RENAME_DIR}/barcodes.tsv" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed barcode list ($RENAME_DIR/barcodes.tsv) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume auto so steps that already finished are not redone)."
-[[ -s "${RENAME_DIR}/umiDedup-1MM_Directional.mtx" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed UMI count table ($RENAME_DIR/umiDedup-1MM_Directional.mtx) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume auto so steps that already finished are not redone)."
+[[ -s "${RENAME_DIR}/barcodes.tsv" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed barcode list ($RENAME_DIR/barcodes.tsv) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
+[[ -s "${RENAME_DIR}/umiDedup-1MM_Directional.mtx" ]] || die "The step that gives every sample its proper name (matching the Sample_ID from your list) did not finish: the renamed UMI count table ($RENAME_DIR/umiDedup-1MM_Directional.mtx) is missing or empty. See the message(s) printed just above for the specific reason — often a sample in your list does not match any barcode found in the data, or vice versa. Fix the mismatch in your sample list and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
 log "sample-named matrix dir: ${RENAME_DIR}"
 log "  (barcode->sample map: ${RENAME_DIR}/sample_barcode_map.tsv; raw matrix unchanged in ${RAW_DIR})"
 
@@ -1059,7 +1109,7 @@ run_or_skip "UMI matrix (deduplicated UMI counts)" "$UMI_MATRIX_CSV" "" "mandato
     --samples-dir "$RENAME_DIR" \
     --out-csv   "$UMI_MATRIX_CSV" \
     --dedup     "1MM_Directional"
-[[ -s "$UMI_MATRIX_CSV" ]] || die "The final UMI-based gene count table (one row per gene, one column per sample — the primary result table) was not produced at $UMI_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume auto so steps that already finished are not redone)."
+[[ -s "$UMI_MATRIX_CSV" ]] || die "The final UMI-based gene count table (one row per gene, one column per sample — the primary result table) was not produced at $UMI_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
 log "UMI matrix CSV: $UMI_MATRIX_CSV"
 
 log ""
@@ -1069,17 +1119,23 @@ run_or_skip "Reads matrix (NoDedup, all PCR copies)" "$READS_MATRIX_CSV" "" "man
     --samples-dir "$RENAME_DIR" \
     --out-csv   "$READS_MATRIX_CSV" \
     --dedup     "NoDedup"
-[[ -s "$READS_MATRIX_CSV" ]] || die "The final gene count table based on total read counts rather than unique UMIs (one row per gene, one column per sample) was not produced at $READS_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume auto so steps that already finished are not redone)."
+[[ -s "$READS_MATRIX_CSV" ]] || die "The final gene count table based on total read counts rather than unique UMIs (one row per gene, one column per sample) was not produced at $READS_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
 log "Reads matrix CSV: $READS_MATRIX_CSV"
 
 #=== Sample demultiplex (BAM, picard)  [OPTIONAL] ==========================
 if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
   log ""; log "BAM demultiplex via picard (optional)"
-  [[ -f "$BAM_BARCODES" ]] || die "This optional step (splitting the aligned results file into one file per sample) needs the per-sample barcode list ($BAM_BARCODES), which is normally produced by the earlier 'barcode prep' step. That earlier step apparently did not produce it in this run — see its messages in the run's pipeline.log for the reason. Fix that earlier step's problem and re-run (use --resume auto so steps that already finished are not redone)."
-  [[ -s "$STAR_BAM"     ]] || die "This optional step (splitting the aligned results file into one file per sample) needs the aligned reads file produced by the STAR step ($STAR_BAM), but it is missing or empty. That points to a problem in the STAR alignment step itself — see its messages in the run's pipeline.log for the reason. Fix that and re-run (use --resume auto so steps that already finished are not redone)."
+  [[ -f "$BAM_BARCODES" ]] || die "This optional step (splitting the aligned results file into one file per sample) needs the per-sample barcode list ($BAM_BARCODES), which is normally produced by the earlier 'barcode prep' step. That earlier step apparently did not produce it in this run — see its messages in the run's pipeline.log for the reason. Fix that earlier step's problem and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
+  [[ -s "$STAR_BAM"     ]] || die "This optional step (splitting the aligned results file into one file per sample) needs the aligned reads file produced by the STAR step ($STAR_BAM), but it is missing or empty. That points to a problem in the STAR alignment step itself — see its messages in the run's pipeline.log for the reason. Fix that and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
   done_bam="${DMUX_BAM_DIR}/_done"
-  if [[ "$RESUME" == "auto" && -s "$done_bam" ]]; then
-    log "SKIP BAM demux (done marker present: $done_bam)"
+  # Skip only if the step truly finished: per-sample BAMs present (a _done
+  # marker from an OLD failed attempt does not count — see the FASTQ step
+  # below for the same fix).
+  n_bam=$(find "$DMUX_BAM_DIR" -maxdepth 1 -name 'unmatched.bam' -o -name '*.bam' 2>/dev/null | wc -l)
+  if [[ "$n_bam" -gt 0 ]]; then
+    [[ -e "$done_bam" ]] && log "SKIP BAM demux (per-sample BAMs already present: $DMUX_BAM_DIR)" \
+                        || log "SKIP BAM demux (per-sample BAMs already present: $DMUX_BAM_DIR; restoring _done marker)"
+    [[ -e "$done_bam" ]] || touch "$done_bam"
   else
     if [[ "$HAVE_PICARD" -eq 1 ]]; then
       # The vendor map (bam_barcodes.tsv) also lists empty_well_<WELL> rows —
@@ -1112,11 +1168,20 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
   log ""; log "FASTQ demultiplex via fqtk (optional)"
   # This step needs BOTH reads: fqtk demuxes off the 14-bp CB in R1 and
   # emits the cDNA read from R2. If R2 wasn't supplied, fail out clearly now.
+  n_fq=$(find "$DMUX_FQ_DIR" -maxdepth 1 -name 'unmatched.fq.gz' -o -name '*.fq.gz' 2>/dev/null | wc -l)
   if [[ -z "$R2_GENOMIC" ]]; then
     warn "Skipping FASTQ demux: a cDNA read (R2) is required to demultiplex. Re-run with --r2 <R2.fastq.gz>."
-  elif [[ "$RESUME" == "auto" && -s "${DMUX_FQ_DIR}/_done" ]]; then
-    log "SKIP FASTQ demux (done marker present: ${DMUX_FQ_DIR}/_done)"
+  # Skip only if the step TRULY finished: per-sample FASTQs present (a _done
+  # marker left behind by an OLD failed attempt does not count — that was the
+  # very bug that left this run's fastq demux failed).
+  elif [[ "$n_fq" -gt 0 ]]; then
+    [[ -e "${DMUX_FQ_DIR}/_done" ]] && log "SKIP FASTQ demux (per-sample FASTQs already present: $DMUX_FQ_DIR)" \
+                                   || log "SKIP FASTQ demux (per-sample FASTQs already present: $DMUX_FQ_DIR; restoring _done marker)"
+    [[ -e "${DMUX_FQ_DIR}/_done" ]] || touch "${DMUX_FQ_DIR}/_done"
   else
+    # A failed attempt (old code) may have left a marker behind: clear it so
+    # this re-run is not confused with a completed one.
+    [[ -e "${DMUX_FQ_DIR}/_done" ]] && { rm -f -- "${DMUX_FQ_DIR}/_done"; log "  (stale _done marker from an incomplete attempt removed: ${DMUX_FQ_DIR}/_done)"; }
     if [[ "$HAVE_FQTK" -eq 1 ]]; then
       # Same empty-well exclusion as the BAM demux above: the vendor map
       # (fastq_sample_metadata.tsv) lists empty_well_* rows; fqtk demuxes
