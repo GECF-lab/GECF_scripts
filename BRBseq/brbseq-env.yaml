@@ -39,5 +39,9 @@ dependencies:
   - scipy>=1.15.3
   - numpy>=2.1
 
+  # Java for the mandatory FastReadCounter step (the jar ships outside Conda,
+  # but Java itself is a Java program). Also needed by picard.
+  - openjdk>=21
+
   # Lib-prep workbook (xlsx) manifest parsing
   - openpyxl>=3.1

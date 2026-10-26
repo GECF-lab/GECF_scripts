@@ -54,7 +54,7 @@
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
@@ -561,6 +561,7 @@ _detect_tools() {
   HAVE_RSEQC=0;     have read_distribution.py && HAVE_RSEQC=1
   HAVE_PICARD=0;    have picard               && HAVE_PICARD=1
   HAVE_FQTK=0;      have fqtk                 && HAVE_FQTK=1
+  HAVE_JAVA=0;      have java                 && HAVE_JAVA=1
 }
 
 # Locate the brbseq conda env; first candidate with a bin/ wins:
@@ -658,7 +659,7 @@ log "manifest   = ${MANIFEST}  (header-mode=${MANIFEST_HEADER})"
 log "STAR index = ${STAR_INDEX}   (star=${STAR_BIN:-NOT_FOUND})"
 log "output     = ${RUN_DIR}"
 log "optional:  fastqc=${RUN_OPT_FASTQ}  rseqc=${RUN_OPT_RSEQC}  demux_bam=${RUN_OPT_DEMUX_BAM}  demux_fq=${RUN_OPT_DEMUX_FQ}"
-log "tools:     STAR=${HAVE_STAR}  fastqc=${HAVE_FASTQC}  samtools=${HAVE_SAMTOOLS}  rseqc=${HAVE_RSEQC}  picard=${HAVE_PICARD}  fqtk=${HAVE_FQTK}"
+log "tools:     STAR=${HAVE_STAR}  fastqc=${HAVE_FASTQC}  samtools=${HAVE_SAMTOOLS}  rseqc=${HAVE_RSEQC}  picard=${HAVE_PICARD}  fqtk=${HAVE_FQTK}  java=${HAVE_JAVA}"
 log "python     = ${PYTHON}"
 if [[ -n "$LIBPREP_PROV" ]]; then
   log "lib-prep   = ${LIBPREP_XLSX}"
@@ -1105,6 +1106,188 @@ run_or_skip "rename matrix (samples only)" "${RENAME_DIR}/barcodes.tsv" "" "mand
 log "sample-named matrix dir: ${RENAME_DIR}"
 log "  (barcode->sample map: ${RENAME_DIR}/sample_barcode_map.tsv; raw matrix unchanged in ${RAW_DIR})"
 
+#=== FastReadCounter (read-distribution report)  [MANDATORY] ==============
+# FRC + report_stats — port of the legacy BRB-seq pipeline's chain:
+#   FastReadCounter → rename_count_table (barcode → Sample_ID) → report_stats
+# (old pipeline lines 592-618 + the report_stats function).  The invariant:
+# FRC reads the same STAR BAM, the same GTF (the one STAR used), and the same
+# 96-barcode whitelist as the legacy run, so the well grid in
+# <pool>_report_summary.csv stays comparable with legacy runs.
+#
+# Writes:  <run>/fastreadcounter/                    FRC outputs (counts.*)
+#          <run>/files_for_report_and_CLC/<pool>_all_stats.csv
+#          <run>/files_for_report_and_CLC/<pool>_report_summary.csv
+#
+# The jar path is the production location (same as the legacy pipeline);
+# update FRC_JAR here when the jar is upgraded.
+FRC_JAR="/home/gecf/softwares/FastReadCounter/FastReadCounter-1.2.0.jar"
+[[ -f "$FRC_JAR" ]] || die "The FastReadCounter program (the jar counted in the legacy pipeline) could not be found at $FRC_JAR. It normally ships on the production server at that path. If it has moved, update the FRC_JAR line near the 'FastReadCounter' section of the pipeline script, then re-run."
+
+# GTF = the gene annotation STAR itself used (registered in the index);
+# identical to the legacy gtf_file (the .gtf shipped inside the STAR reference).
+FRC_GTF="$(awk '$1=="sjdbGTFfile"{print $2; exit}' "${STAR_INDEX}/genomeParameters.txt" 2>/dev/null || true)"
+[[ -n "$FRC_GTF" && -f "$FRC_GTF" ]] || die "FastReadCounter needs the gene-annotation model (a GTF file) that STAR aligned against, and it could not be found in the STAR index metadata (${STAR_INDEX}/genomeParameters.txt). The STAR index may be incomplete — rebuild it with build_star_index.sh, then re-run."
+
+FRC_DIR="${RUN_DIR}/fastreadcounter"
+REPORTS_DIR="${RUN_DIR}/files_for_report_and_CLC"
+FRC_DETAILED="${FRC_DIR}/counts.detailed.txt"
+FRC_RENAMED="${FRC_DIR}/counts.detailed_withsamplesID.txt"
+ALL_STATS="${REPORTS_DIR}/${POOL}_all_stats.csv"
+REPORT_CSV="${REPORTS_DIR}/${POOL}_report_summary.csv"
+mkdir -p "$FRC_DIR" "$REPORTS_DIR"
+
+log ""
+log "FastReadCounter + report (mandatory)"
+
+#--- FRC call (one line, as in the legacy pipeline) -------------------------
+run_or_skip "FRC FastReadCounter" "$FRC_DETAILED" "java" "mandatory" \
+  java -jar "$FRC_JAR" \
+    --bam    "$STAR_BAM" \
+    --gtf    "$FRC_GTF" \
+    --umi-dedup none \
+    --barcodeFile "$WHITELIST" \
+    -o "$FRC_DIR"
+[[ -s "$FRC_DETAILED" ]] || die "FastReadCounter did not finish cleanly (its result file ${FRC_DETAILED} is missing or empty). See the FRC step log in ${LOGS_DIR} for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so the earlier steps are not redone)."
+
+#--- rename_count_table (ported): barcode columns → Sample_ID ---------------
+# The all-wells barcode→name table from the rename-matrix step already covers
+# all 96 plate barcodes (real samples + empty_well_<well>).  Falls back to
+# the samples-only map in --barcode-tsv mode (no plate / empty-well concept).
+SAMPLE_MAP="${RENAME_ALL_DIR}/sample_barcode_map.tsv"
+if [[ ! -s "$SAMPLE_MAP" ]]; then
+  SAMPLE_MAP="${STAR_DIR}/samples/sample_barcode_map.tsv"
+fi
+[[ -s "$SAMPLE_MAP" ]] || die "The barcode→sample-name table needed to name the FastReadCounter columns is missing: ${SAMPLE_MAP}. It is written by the sample-renaming step earlier in the pipeline — check the messages printed above for why that step did not finish."
+
+if [[ -s "$FRC_RENAMED" ]]; then
+  log "SKIP rename FRC count table (already done: $FRC_RENAMED)"
+else
+  log "RUN  rename FRC count table (barcode -> Sample_ID)"
+  awk -v lookup="$SAMPLE_MAP" '
+  BEGIN {
+    FS = OFS = "\t"
+    while ((getline line < lookup) > 0) {
+      split(line, a, "\t")
+      map[a[1]] = a[2]
+    }
+    close(lookup)
+  }
+  NR == 1 { for (i = 1; i <= NF; i++) if ($i in map) $i = map[$i] }
+  { print }
+  ' "$FRC_DETAILED" > "$FRC_RENAMED"
+  [[ -s "$FRC_RENAMED" ]] || die "The step that names the FastReadCounter columns by sample (barcode → Sample_ID) did not produce a result file ($FRC_RENAMED). See the messages printed above for the reason, fix it, and re-run."
+fi
+
+#--- report_stats (ported), step 1: <pool>_all_stats.csv ---------------------
+# One row per sample column (samples + empty wells + Unknown):
+#   sample_name, __no_feature, __ambiguous, __too_low_aQual,
+#   __not_aligned, __alignment_not_unique, total_mapped_reads
+if [[ -s "$ALL_STATS" ]]; then
+  log "SKIP all_stats (already done: $ALL_STATS)"
+else
+  log "RUN  report_stats all_stats"
+  awk '
+  BEGIN { FS = "\t"; OFS = "," }
+  NR == 1 {
+    n = NF - 2
+    for (i = 3; i <= NF; i++) sample[i-2] = $i
+    next
+  }
+  $1 !~ /^__/ {
+    for (i = 3; i <= NF; i++) total[i-2] += $i
+    next
+  }
+  /^__no_feature/           { for (i=3;i<=NF;i++) nf[i-2]   = $i; next }
+  /^__ambiguous/            { for (i=3;i<=NF;i++) amb[i-2]  = $i; next }
+  /^__too_low_aQual/        { for (i=3;i<=NF;i++) tl[i-2]   = $i; next }
+  /^__not_aligned/          { for (i=3;i<=NF;i++) na[i-2]   = $i; next }
+  /^__alignment_not_unique/ { for (i=3;i<=NF;i++) nu[i-2]   = $i; next }
+  END {
+    print "sample_name","__no_feature","__ambiguous","__too_low_aQual","__not_aligned","__alignment_not_unique","total_mapped_reads"
+    for (i = 1; i <= n; i++)
+      print sample[i], nf[i]+0, amb[i]+0, tl[i]+0, na[i]+0, nu[i]+0, total[i]+0
+  }
+  ' "$FRC_RENAMED" > "$ALL_STATS"
+  [[ -s "$ALL_STATS" ]] || die "report_stats did not produce ${ALL_STATS} (or it is empty). Check that $FRC_RENAMED looks right (a header plus per-gene rows), fix the cause, and re-run."
+  log "  all_stats: $ALL_STATS"
+fi
+
+#--- report_stats (ported), step 2: <pool>_report_summary.csv ----------------
+# Join each sample row with its plate well.  Well source (in order):
+#   * real samples: the lib-prep provenance TSV (Sample_ID <TAB> ... <TAB> Well)
+#   * empty wells  : the well is already embedded in 'empty_well_<well>'
+#   * Unknown / no well available: NA  (same fallback as the legacy pipeline)
+#
+# In --barcode-tsv mode there is no plate or lib-prep provenance, so every
+# sample gets well 'NA' — the legacy pipeline's 'well not found' fallback.
+WLOOKUP="$(mktemp)"
+if [[ -n "${LIBPREP_PROV:-}" && -s "${LIBPREP_PROV}" ]]; then
+  awk '
+  # First file: lib-prep provenance — columns: Sample_ID, Sample_raw, Well, Barcode
+  FNR == NR {
+    # skip header; keep rows whose Well column matches A-H + 2 digits
+    if (FNR > 1) {
+      well = $3
+      if (well ~ /^[A-H][0-9][0-9]$/) well_of[$1] = well
+    }
+    next
+  }
+  # Second file: sample_barcode_map.tsv — barcode<TAB>name
+  {
+    if ($2 ~ /^empty_well_/) well_of[$2] = substr($2, 12)
+    if ($2 == "Unknown")     well_of["Unknown"] = "NA"
+  }
+  END { for (n in well_of) printf "%s\t%s\n", n, well_of[n] }
+  ' FS="\t" OFS="\t" "${LIBPREP_PROV}" "$SAMPLE_MAP" > "$WLOOKUP"
+else
+  awk 'BEGIN{FS="\t"} {print $2 "\tNA"}' "$SAMPLE_MAP" > "$WLOOKUP"
+  echo -e "Unknown\tNA" >> "$WLOOKUP"
+fi
+[[ -s "$WLOOKUP" ]] || { rm -f "$WLOOKUP"; die "The well-lookup table for the report grid could not be built. Inputs checked: lib-prep provenance (\"${LIBPREP_PROV:-<none>}\") and sample map ($SAMPLE_MAP). See earlier messages for why neither was usable. (In --barcode-tsv mode with no plate there is no provenance — the pipeline still writes 'Unknown,NA' + all samples as 'NA'.)"; }
+
+if [[ -s "$REPORT_CSV" ]]; then
+  log "SKIP report_summary (already done: $REPORT_CSV)"
+else
+  log "RUN  report_stats report_summary"
+  awk '
+  BEGIN { FS = OFS = "," }
+  NR == FNR { well_of[$1] = $2; next }
+  FNR == 1 { next }
+  {
+    report_sample_name   = $1
+    no_feature           = $2
+    ambiguous            = $3
+    too_low_aQual        = $4
+    not_aligned          = $5
+    alignment_not_unique = $6
+    total_mapped         = $7
+
+    depth = total_mapped + no_feature + ambiguous + too_low_aQual + not_aligned + alignment_not_unique
+
+    depth_mio       = depth        / 1000000
+    mapped_mio      = total_mapped / 1000000
+    no_feature_mio  = no_feature   / 1000000
+    not_aligned_mio = not_aligned  / 1000000
+
+    report_well = (report_sample_name in well_of) ? well_of[report_sample_name] : "NA"
+
+    printf "%s,%s,%.2f,%.2f,%.2f,%.2f\n", \
+      report_well, report_sample_name, depth_mio, mapped_mio, no_feature_mio, not_aligned_mio
+  }
+  ' FS="	" "$WLOOKUP" FS="," "$ALL_STATS" | \
+  sort -t',' -k1.2,1.3n -k1.1,1.1 | \
+  awk 'BEGIN { print "plate_well,sample_name,depth_mio,mapped_reads_mio,no_feature_mio,not_aligned_mio" } { print }' \
+    > "$REPORT_CSV"
+  rm -f "$WLOOKUP"
+  [[ -s "$REPORT_CSV" ]] || die "report_stats did not produce a usable ${REPORT_CSV}. See the messages printed above for the reason, fix it, and re-run."
+  log "  report_csv: $REPORT_CSV"
+fi
+
+log ""
+log "  FRC:        ${FRC_DIR}  (counts.detailed.txt, counts.txt, …)"
+log "  all_stats:  $ALL_STATS"
+log "  report_csv: $REPORT_CSV"
+
 #=== matrix CSVs  [MANDATORY] ================================================
 # Flatten the sample-named umiDedup matrices into single gene x sample CSVs.
 # Row key: Gene_id (column 1, unique) then gene_symbol (column 2, annotation)
@@ -1254,6 +1437,7 @@ write_run_readme() {
   if [[ "${RUN_OPT_DEMUX_FQ}"  -eq 1 && -e "${DMUX_FQ_DIR}/_done" ]];  then _f="${DMUX_FQ_DIR#"${RUN_DIR}"/}";  fi
   if [[ -s "${RSEQC_DIR}/${POOL}_read_distribution.txt" ]]; then _rseqc=1; fi
   if [[ -d "${FASTQC_DIR}" ]]; then _fastqc=1; fi
+  if [[ -s "${REPORTS_DIR}/${POOL}_report_summary.csv" ]]; then _frc=1; fi
 
   {
     echo '<!DOCTYPE html>'
@@ -1281,6 +1465,10 @@ write_run_readme() {
     echo '<tr><th>File</th><th>Meaning</th><th>Use for</th></tr>'
     echo '<tr><td><code>'"${rel_umi}"'</code></td><td>Gene x sample UMI counts (deduplicated molecules)</td><td class="primary">PCA / differential expression (Seurat, edgeR) — the primary result table</td></tr>'
     echo '<tr><td><code>'"${rel_reads}"'</code></td><td>Gene x sample total read counts (all PCR copies)</td><td>Duplication context only — <strong>not</strong> a PCA/DE input</td></tr>'
+    if [[ $_frc -eq 1 ]]; then
+      echo '<tr><td><code>'"$(echo "${REPORTS_DIR}/${POOL}_report_summary.csv" | sed "s|${RUN_DIR}/||")"'</code></td><td>Per-well sequencing depth / mapped / no-feature / no-alignment read distribution (whole-plate grid + Unknown)</td><td class="primary">Sequencing QC &amp; CLC report — one row per plate well</td></tr>'
+      echo '<tr><td><code>'"$(echo "${REPORTS_DIR}/${POOL}_all_stats.csv" | sed "s|${RUN_DIR}/||")"'</code></td><td>Same read-distribution counts, raw totals per sample (no mio rounding)</td><td>Underlying numbers behind the grid above</td></tr>'
+    fi
     echo '</table>'
     echo '<p>Both tables have one row per gene (columns <code>Gene_id</code> then <code>gene_symbol</code>) and one column per sample (your <code>Sample_ID</code>). <code>empty_well_*</code> columns are unoccupied plate wells — drop them before downstream analysis.</p>'
 
@@ -1315,6 +1503,11 @@ write_run_readme() {
     fi
     if [[ $_rseqc -eq 1 ]]; then
       echo '<li><code>rseqc/'"${POOL}"'_read_distribution.txt</code> — read-coverage distribution across exons (RSeQC).</li>'
+    fi
+    if [[ $_frc -eq 1 ]]; then
+      echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_report_summary.csv</code> — the whole-plate read-distribution grid (depth / mapped / no-feature / no-alignment per well, in millions — the CLC/sequencing report).</li>'
+      echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_all_stats.csv</code> — the same read-distribution counts as raw totals per sample (unrounded).</li>'
+      echo '<li><code>fastreadcounter/</code> — FastReadCounter intermediates (<code>counts.detailed.txt</code> et al.) — the source the two report CSVs above are built from.</li>'
     fi
     if [[ -n "$_b" ]]; then
       echo '<li><code>'"${_b}"'/</code> — one aligned BAM per sample (split from the pool BAM; real samples only).</li>'
@@ -1353,6 +1546,8 @@ log "  barcodes               = ${WHITELIST}  ($(wc -l < "$WHITELIST" 2>/dev/nul
 [[ -d "$RENAME_ALL_DIR" ]] && log "  sample-named mtx     = ${RENAME_ALL_DIR}  (all wells, debug)"
 [[ -s "$UMI_MATRIX_CSV"  ]] && log "  UMI matrix CSV       = ${UMI_MATRIX_CSV}"
 [[ -s "$READS_MATRIX_CSV" ]] && log "  Reads matrix CSV     = ${READS_MATRIX_CSV}"
+[[ -s "$REPORT_CSV"       ]] && log "  report grid (CLC)    = $REPORT_CSV          (per-well depth/mapped/read distribution)"
+[[ -s "$ALL_STATS"        ]] && log "  all_stats (report)   = $ALL_STATS          (raw per-sample read totals)"
 [[ -s "${DMUX_DIR:-/nonexistent}"     ]] && :
 [[ -d "${DMUX_BAM_DIR}/_done" && -s "${DMUX_BAM_DIR}/_done" ]] && log "  demux BAM              = ${DMUX_BAM_DIR}"
 [[ -d "${DMUX_FQ_DIR}/_done"  && -s "${DMUX_FQ_DIR}/_done"  ]] && log "  demux FASTQ            = ${DMUX_FQ_DIR}"

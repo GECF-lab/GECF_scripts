@@ -1,9 +1,10 @@
 # BRB-seq (MERCURIUS DRUG-seq) single-pool RNA-seq pipeline
 
-`brbseq_pipeline.sh` (v1.0.2) — end-to-end pre-processing for
+`brbseq_pipeline.sh` (v1.1.0) — end-to-end pre-processing for
 **one pool/run** of MERCURIUS 3' RNA-seq (BRB-seq / DRUG-seq) data:
 barcode prep → STARsolo alignment + gene/UMI counts → mandatory duplication
-statistics → sample-named matrices → optional per-sample demux.
+statistics → sample-named matrices → FastReadCounter read-distribution report
+→ optional per-sample demux.
 
 The STAR request always requests **both** UMI dedup methods
 (`--soloUMIdedup NoDedup 1MM_Directional` in one pass) so the mandatory
@@ -14,7 +15,7 @@ single alignment.
 
 | File | Purpose |
 |---|---|
-| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.0.2) |
+| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.1.0) |
 | `build_star_index.sh` | One-time STAR genomeDir build (Mercurius guide 1.1; no Ensembl fetch) |
 | `brbseq-env.yaml` | Conda environment (`brbseq`) — STAR, samtools, fastqc, picard, fqtk, RSeQC tools, python/openpyxl |
 | `utils/prepare_barcodes.sh` | Builds `barcode_whitelist.txt` + demux maps from the manifest (TSV `Sample_ID` → `bar`) |
@@ -57,6 +58,7 @@ conda env create -f brbseq-env.yaml   # creates env 'brbseq'
 | `picard` | `FilterSamReads` — per-sample BAM demux (writes `demux_bam/`) |
 | `fqtk` | per-sample FASTQ demux (writes `demux_fastq/`; on by default, disable with `--skip-dmux-fq`) |
 | `python` + `openpyxl` | workbook mode + UMI dedup (needs Python **3.7+**) |
+| `java` (OpenJDK, shipped with the `brbseq` Conda env) | runs **FastReadCounter** (the jar is outside Conda — a production-system file at `/home/gecf/softwares/FastReadCounter/`) |
 
 > **Why env-first?** Previously, with no `conda activate`, the script picked up
 > the server's old system `python3` (< 3.7) for the workbook parser and crashed
@@ -102,6 +104,40 @@ In lib-prep workbook mode:
   scan, so one per empty well would be pure waste).  Empty wells remain in
   the STAR whitelist and in `samples_all_wells/` for debugging.
 
+## Read-distribution report (FastReadCounter)
+
+After the matrices are built (optional demux still to come), the pipeline runs
+**FastReadCounter** over the same STAR BAM and the same 96-barcode whitelist,
+then derives two reports for the CLC / QC side:
+
+- `files_for_report_and_CLC/<pool>_report_summary.csv` — a whole-plate grid.
+  One row per well (A01…H12) plus a trailing `Unknown` row; columns
+  `depth_mio, mapped_reads_mio, no_feature_mio, not_aligned_mio` (millions).
+  This is the sequencing-quality table that reports how much of each sample's
+  reads landed on the expected target vs. not.
+- `files_for_report_and_CLC/<pool>_all_stats.csv` — the same per-sample
+  numbers as raw integer counts (unrounded), including all FRC buckets
+  (`__no_feature`, `__ambiguous`, `__too_low_aQual`, `__not_aligned`,
+  `__alignment_not_unique`, total mapped).
+
+This is a **port of the legacy BRB-seq pipeline's FRC + `report_stats` chain**
+(FastReadCounter → rename columns to Sample_ID → two awk passes), so the
+output is directly comparable with historical runs.  The report is
+**mandatory**; it always uses the STAR BAM already on disk (no second
+alignment), the gene annotation registered in the STAR index
+(`sjdbGTFfile` from `genomeParameters.txt`), and the same 96-barcode
+whitelist STAR used.  The jar itself is **outside** the Conda env — a
+pre-installed Java program shipped on the production server; its path is the
+single hardcoded line `FRC_JAR=` near the top of the FRC section of
+`brbseq_pipeline.sh` (update this one line if the jar ever moves).
+
+> **Note on cross-GTF comparability.**  `depth` and `not_aligned` are
+> annotation-independent and reproduce historical values exactly.  The split
+> between `mapped_reads` and `no_feature` is annotation-dependent: a pool
+> re-run against a newer genome annotation (e.g. GRCm39.114 → GRCm39.116)
+> will shift some reads between those two columns while leaving the two
+> annotation-independent columns identical.  That is expected, not a bug.
+
 ## Output layout
 
 Single-level leaf under `--out-dir`:
@@ -122,6 +158,12 @@ OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
 │                         (both also hold sample_barcode_map.tsv and the
 │                          umiDedup-{NoDedup,1MM_Directional}.mtx matrices)
 ├── rseqc/                read_distribution (optional)
+├── fastreadcounter/      FastReadCounter output (counts.detailed.txt, etc.)
+├── files_for_report_and_CLC/
+│   ├── <pool>_report_summary.csv   per-well read-distribution grid
+│   │                               (depth/mapped/no-feature/no-alignment, in
+│   │                               millions) — one row per plate well + Unknown
+│   └── <pool>_all_stats.csv        same read-distribution, raw totals per sample
 ├── demux_bam/            one BAM per sample (optional)
 ├── demux_fastq/          demuxed FASTQs (optional)
 ├── duplication_statistics.csv
@@ -138,7 +180,8 @@ OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
 
 ## Changelog
 
-Bumped in `SCRIPT_VERSION` in `brbseq_pipeline.sh` (currently **v1.0.2**).
+Bumped in `SCRIPT_VERSION` in `brbseq_pipeline.sh` (currently **v1.1.0** —
+the current release; the latest entry is the v1.1.0 FastReadCounter report).
 v1.0.1 was reserved but never shipped — the version went straight from the
 1.0.0 baseline to 1.0.2.
 
@@ -202,6 +245,30 @@ workflow. Everything below is the shipped baseline:
   page written at the end of each run is HTML (open in a browser) rather than
   plain-text Markdown.
 
+### v1.1.0 — FastReadCounter read-distribution report (CLC)
+
+- **New mandatory `FRC` step** — runs **FastReadCounter** over the STAR
+  BAM (already on disk; no second alignment) and the 96-barcode whitelist,
+  then derives the legacy-style report:
+  - `files_for_report_and_CLC/<pool>_report_summary.csv` — the whole-plate
+    read-distribution grid (one row per well A01…H12 + `Unknown`):
+    `depth_mio, mapped_reads_mio, no_feature_mio, not_aligned_mio`.
+  - `files_for_report_and_CLC/<pool>_all_stats.csv` — the same per-sample
+    numbers as raw integer counts (all FRC buckets).
+- **Port of the legacy pipeline's FRC + `report_stats` chain**
+  (FastReadCounter → rename barcode columns to Sample_ID → two awk passes),
+  reusing the pipeline's own `sample_barcode_map.tsv` (all wells) and the
+  lib-prep provenance for the well column — output is directly comparable
+  with historical runs (validated against AVT0615: identical structure,
+  wells, ordering, `depth`/`not_aligned`; `mapped`/`no_feature` only shift
+  with a different genome annotation, as expected).
+- **No new CLI flags, no new Conda dependency.**  The FastReadCounter jar is
+  read from a single hardcoded path at the top of the FRC section
+  (`FRC_JAR=/home/gecf/softwares/FastReadCounter/FastReadCounter-1.2.0.jar`
+  on the production server); the gene annotation is taken automatically from
+  the STAR index (`sjdbGTFfile` in `genomeParameters.txt`).  Java ships with
+  the `brbseq` Conda env (OpenJDK) — nothing to install.
+
 ## Quick start
 
 ```bash
@@ -263,7 +330,7 @@ that folder:
 
 ## Status
 
-`SCRIPT_VERSION="1.0.2"` (in `brbseq_pipeline.sh`) — the current, working
+`SCRIPT_VERSION="1.1.0"` (in `brbseq_pipeline.sh`) — the current, working
 version of the pipeline.  The first real-pool deployment (against an
 AVT0608/AVT0615-style pool) is built on top of this baseline.  See **Changelog**
 above for what each release shipped; reference changes by feature or date (not

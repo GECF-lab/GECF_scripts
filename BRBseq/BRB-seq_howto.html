@@ -287,7 +287,8 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <li><strong>FastQC</strong> of both FASTQ files.</li>
   <li><strong>STARsolo alignment + counting</strong> — one alignment pass that strips the 14-nt CB + 14-nt UMI from read 1, aligns the 90-nt cDNA read, and writes per-barcode gene-count matrices (raw and UMI-deduplicated).</li>
   <li><strong>QC &amp; demux</strong> — RSeQC read distribution, per-sample BAM demux (picard) and per-sample FASTQ demux (fqtk).</li>
-  <li><strong>Final outputs</strong> — you take two things into downstream analysis: (a) the sample-named matrix <em>files</em>, and (b) the per-well duplication statistics. The matrix itself exists in two forms of the <em>same</em> data: the raw STAR output where each barcode column is renamed to its Sample_ID (<code>star/samples/</code>), and the ready-to-use CSV tables built from it (<code>matrices/&lt;pool&gt;_umi_matrix.csv</code> for unique-molecule/UMI counts, <code>&lt;pool&gt;_reads_matrix.csv</code> for raw read counts). Use the UMI CSV for PCA/DE; see section 5.</li>
+  <li><strong>Read-distribution report (FastReadCounter)</strong> — runs the same STAR BAM (already on disk, no second alignment) through <code>FastReadCounter</code> with the 96-barcode whitelist, then builds the two legacy-compatible QC reports: <code>files_for_report_and_CLC/&lt;pool&gt;_report_summary.csv</code> (the whole-plate grid — depth / mapped / no-feature / no-alignment per well, in millions, plus an <code>Unknown</code> catch-all) and <code>&lt;pool&gt;_all_stats.csv</code> (raw per-sample totals including all FRC buckets). The jar is a pre-installed production file (see the <code>FRC_JAR</code> line near the FRC step in the pipeline); the gene annotation is taken from the STAR index.</li>
+  <li><strong>Final outputs</strong> — you take two things into downstream analysis: (a) the sample-named matrix <em>files</em>, and (b) the per-well duplication statistics. The matrix itself exists in two forms of the <em>same</em> data: the raw STAR output where each barcode column is renamed to its Sample_ID (<code>star/samples/</code>), and the ready-to-use CSV tables built from it (<code>matrices/&lt;pool&gt;_umi_matrix.csv</code> for unique-molecule/UMI counts, <code>&lt;pool&gt;_reads_matrix.csv</code> for raw read counts). Use the UMI CSV for PCA/DE; see section 5. The FastReadCounter reports (above) are for sequencing-quality review, not for PCA/DE.</li>
 </ol>
 <p>
 Every step logs to its own file under <code>logs/</code>; the supervisor log
@@ -318,6 +319,7 @@ read from that run's <code>pipeline.log</code>:
   <tr><td>samtools index</td><td><strong>&lt; 1 min</strong></td><td></td></tr>
   <tr><td>RSeQC read-distribution (QC)</td><td><strong>~ 15 min</strong></td><td>scales with the BAM size</td></tr>
   <tr><td>Duplication stats + matrix renames + UMI/reads CSVs</td><td><strong>&lt; 1 min</strong></td><td>all fast matrix reshaping</td></tr>
+  <tr><td>FastReadCounter report (FRC + two report CSVs)</td><td><strong>~ 10 min</strong></td><td>one pass over the BAM with the 96-barcode whitelist; the two report CSVs themselves are instant</td></tr>
   <tr><td><strong>BAM demux (picard, 30 samples)</strong></td><td><strong>~ 3.5 h</strong></td><td><em>dominant</em> — one picard pass per sample over the whole BAM</td></tr>
   <tr><td>FASTQ demux (fqtk, 446 M reads)</td><td><strong>~ 15 min</strong></td><td>single pass, fast</td></tr>
 </table>
@@ -348,8 +350,12 @@ if you only need the expression matrices you can skip the demux steps entirely
 │   ├── samples_all_wells/              full-plate view incl. empty wells (debugging)
 │   ├── pool_Daniel_Aligned.sortedByCoord.out.bam   aligned pool BAM
 │   └── STAR.log
-├── fastqc/                             per-FASTQ reports (.zip / .html)
-├── rseqc/                              read distribution + BED12
+├── fastqc/                            per-FASTQ reports (.zip / .html)
+├── rseqc/                             read distribution + BED12
+├── fastreadcounter/                   FastReadCounter output (counts.detailed.txt, etc.)
+├── files_for_report_and_CLC/
+│   ├── pool_Daniel_report_summary.csv  ★ whole-plate read-distribution grid (depth/mapped/nf/na per well, in millions)
+│   └── pool_Daniel_all_stats.csv      same read-distribution, raw per-sample totals
 ├── demux_bam/   demux_fastq/           per-sample BAM / FASTQ files
 ├── barcodes/                           manifest + provenance used for the run
 ├── README.html                         per-run folder guide (open in a browser)
@@ -380,6 +386,33 @@ well typically shows substantial PCR collapse (e.g. ~0.2), while an overloaded o
 well may show a ratio near 1.
 </p>
 
+<h3>Which read-distribution report do I use?</h3>
+<p>
+The <code>files_for_report_and_CLC/</code> folder holds the two FastReadCounter-derived
+QC tables for the sequencing side:
+</p>
+<table>
+  <tr><th>Column</th><th>Meaning</th></tr>
+  <tr><td><code>plate_well</code></td><td>Plate well (A01…H12); <code>NA</code> for samples without a well (e.g. <code>--barcode-tsv</code> mode)</td></tr>
+  <tr><td><code>sample_name</code></td><td>Your Sample_ID, <code>empty_well_&lt;WELL&gt;</code> for unoccupied wells, or <code>Unknown</code> for reads with a barcode not in the whitelist</td></tr>
+  <tr><td><code>depth_mio</code></td><td>Total reads for that sample (mapped + unassigned), in millions — the whole sample's sequencing footprint</td></tr>
+  <tr><td><code>mapped_reads_mio</code></td><td>Reads assigned to a gene feature (exon model), in millions</td></tr>
+  <tr><td><code>no_feature_mio</code></td><td>Reads that aligned but did not land on any feature, in millions</td></tr>
+  <tr><td><code>not_aligned_mio</code></td><td>Reads that could not be aligned at all, in millions</td></tr>
+</table>
+<div class="note">
+  <strong>Use case:</strong>
+  <strong>PCA / differential expression — use the UMI matrix CSV (above); the report is the
+  sequencing-quality view</strong>. A healthy well shows most of <code>depth</code>
+  as <code>mapped_reads</code>; a high <code>not_aligned</code> or very low
+  <code>depth</code> points to a sequencing / library issue rather than a biological
+  result. <code>depth</code> and <code>not_aligned</code> are annotation-independent
+  and reproduce the legacy pipeline's numbers exactly; <code>mapped_reads</code> and
+  <code>no_feature</code> reflect the GTF version the STAR index was built with, so a
+  pool re-run against a newer annotation (e.g. GRCm39.114 → .116) will show a small
+  shift between those two columns only.
+</div>
+
 <h2 id="faq">6. Common questions</h2>
 <h3>My sample columns are named <code>A01</code>, <code>B04</code>… — where are my sample names?</h3>
 <p>
@@ -402,8 +435,11 @@ force a single step to redo, delete its marker/output file and resume — the re
 still stays skipped.
 </p>
 <h3>Can I skip QC steps to save time?</h3>
-<p>Yes — all four QC/demux steps are default-on but individually skippable via the
-<code>--skip-*</code> flags. The alignment + matrix chain is mandatory and always runs.</p>
+<p>Yes — the QC and demux steps (FastQC, RSeQC, BAM demux, FASTQ demux) are
+default-on but each is individually skippable via its <code>--skip-*</code> flag.
+The alignment + matrix chain <em>and the FastReadCounter read-distribution
+report</em> are mandatory and always run — the report is the QC deliverable,
+so there is no <code>--skip-frc</code>.</p>
 <h3>What if STAR fails with a weird read-count error on 2.7.11b?</h3>
 <p>
 Star versions can differ subtly in accepted flags (<code>STAR 2.7.10b</code> and
