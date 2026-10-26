@@ -1124,9 +1124,16 @@ FRC_JAR="/home/gecf/softwares/FastReadCounter/FastReadCounter-1.2.0.jar"
 [[ -f "$FRC_JAR" ]] || die "The FastReadCounter program (the jar counted in the legacy pipeline) could not be found at $FRC_JAR. It normally ships on the production server at that path. If it has moved, update the FRC_JAR line near the 'FastReadCounter' section of the pipeline script, then re-run."
 
 # GTF = the gene annotation STAR itself used (registered in the index);
-# identical to the legacy gtf_file (the .gtf shipped inside the STAR reference).
-FRC_GTF="$(awk '$1=="sjdbGTFfile"{print $2; exit}' "${STAR_INDEX}/genomeParameters.txt" 2>/dev/null || true)"
-[[ -n "$FRC_GTF" && -f "$FRC_GTF" ]] || die "FastReadCounter needs the gene-annotation model (a GTF file) that STAR aligned against, and it could not be found in the STAR index metadata (${STAR_INDEX}/genomeParameters.txt). The STAR index may be incomplete — rebuild it with build_star_index.sh, then re-run."
+# STAR writes it VERBATIM — often RELATIVE (e.g. "Mus_musculus.GRCm39.116/...gtf"),
+# unresolvable from our CWD. Fallback: the single .gtf shipped IN the index dir.
+FRC_GTF_RAW="$(awk '$1=="sjdbGTFfile"{print $2; exit}' "${STAR_INDEX}/genomeParameters.txt" 2>/dev/null || true)"
+if [[ -n "$FRC_GTF_RAW" && -f "$FRC_GTF_RAW" ]]; then
+    FRC_GTF="$FRC_GTF_RAW"
+else
+    FRC_GTF="$(ls "${STAR_INDEX}"/*.gtf 2>/dev/null | head -1 || true)"
+fi
+[[ -n "$FRC_GTF" && -f "$FRC_GTF" ]] || die "FastReadCounter needs the gene-annotation model (a GTF file) that STAR aligned against: sjdbGTFfile in ${STAR_INDEX}/genomeParameters.txt is '${FRC_GTF_RAW:-<absent>}' (not resolvable) and no .gtf was found in ${STAR_INDEX}. Put the GTF in the index dir or fix the path in genomeParameters.txt."
+log "FastReadCounter gene model (GTF): $FRC_GTF"
 
 FRC_DIR="${RUN_DIR}/fastreadcounter"
 REPORTS_DIR="${RUN_DIR}/files_for_report_and_CLC"
