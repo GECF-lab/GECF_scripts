@@ -1147,12 +1147,15 @@ log ""
 log "FastReadCounter + report (mandatory)"
 
 #--- FRC call (one line, as in the legacy pipeline) -------------------------
+# FRC 1.2.0 has an explicit thread flag (-t / --threads, default = 1). Hardcode it.
+FRC_THREADS=16
 run_or_skip "FRC FastReadCounter" "$FRC_DETAILED" "java" "mandatory" \
   java -jar "$FRC_JAR" \
     --bam    "$STAR_BAM" \
     --gtf    "$FRC_GTF" \
     --umi-dedup none \
     --barcodeFile "$WHITELIST" \
+    --threads  "$FRC_THREADS" \
     -o "$FRC_DIR"
 [[ -s "$FRC_DETAILED" ]] || die "FastReadCounter did not finish cleanly (its result file ${FRC_DETAILED} is missing or empty). See the FRC step log in ${LOGS_DIR} for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so the earlier steps are not redone)."
 
