@@ -501,7 +501,14 @@ MANIFEST="$BARCODE_TSV"
 if [[ -n "${RESUME_MANIFEST:-}" ]]; then
   # --resume-dir: reuse exactly the sample→barcode list the run was started with.
   MANIFEST="$RESUME_MANIFEST"
-  LIBPREP_PROV=""
+  # If the lib-prep provenance survived the original run, keep it: the report
+  # grid uses Sample_ID→Well to fill the plate_well column (without it every
+  # row falls back to 'NA'). No provenance file → same NA fallback as before.
+  if [[ -s "${RESUME_MANIFEST}_provenance.tsv" ]]; then
+    LIBPREP_PROV="${RESUME_MANIFEST}_provenance.tsv"
+  else
+    LIBPREP_PROV=""
+  fi
 elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   MANIFEST="${BARCODES_DIR}/manifest_from_libprep.tsv"
   LIBPREP_PROV="${MANIFEST}_provenance.tsv"
@@ -1114,9 +1121,10 @@ log "  (barcode->sample map: ${RENAME_DIR}/sample_barcode_map.tsv; raw matrix un
 # 96-barcode whitelist as the legacy run, so the well grid in
 # <pool>_report_summary.csv stays comparable with legacy runs.
 #
-# Writes:  <run>/fastreadcounter/                    FRC outputs (counts.*)
-#          <run>/files_for_report_and_CLC/<pool>_all_stats.csv
+# Writes:  <run>/files_for_report_and_CLC/<pool>_all_stats.csv
 #          <run>/files_for_report_and_CLC/<pool>_report_summary.csv
+# The ~50 MB FRC intermediates (fastreadcounter/counts.*) are deleted after
+# the two report CSVs are built.
 #
 # The jar path is the production location (same as the legacy pipeline);
 # update FRC_JAR here when the jar is upgraded.
@@ -1293,8 +1301,14 @@ else
   log "  report_csv: $REPORT_CSV"
 fi
 
+# FRC intermediates are only needed to build the two report CSVs — remove the
+# ~50 MB fastreadcounter/ folder so the run dir only carries final products.
+if [[ -d "$FRC_DIR" ]]; then
+  rm -rf "$FRC_DIR"
+  log "  removed fastreadcounter/ intermediates ($FRC_DIR) — report CSVs already built"
+fi
+
 log ""
-log "  FRC:        ${FRC_DIR}  (counts.detailed.txt, counts.txt, …)"
 log "  all_stats:  $ALL_STATS"
 log "  report_csv: $REPORT_CSV"
 
@@ -1516,8 +1530,7 @@ write_run_readme() {
     fi
     if [[ $_frc -eq 1 ]]; then
       echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_report_summary.csv</code> — the whole-plate read-distribution grid (depth / mapped / no-feature / no-alignment per well, in millions — the CLC/sequencing report).</li>'
-      echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_all_stats.csv</code> — the same read-distribution counts as raw totals per sample (unrounded).</li>'
-      echo '<li><code>fastreadcounter/</code> — FastReadCounter intermediates (<code>counts.detailed.txt</code> et al.) — the source the two report CSVs above are built from.</li>'
+      echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_all_stats.csv</code> — the same read-distribution counts as raw totals per sample (unrounded). Built from FastReadCounter intermediates (removed after the report is written).</li>'
     fi
     if [[ -n "$_b" ]]; then
       echo '<li><code>'"${_b}"'/</code> — one aligned BAM per sample (split from the pool BAM; real samples only).</li>'

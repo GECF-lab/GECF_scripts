@@ -158,12 +158,13 @@ OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
 │                         (both also hold sample_barcode_map.tsv and the
 │                          umiDedup-{NoDedup,1MM_Directional}.mtx matrices)
 ├── rseqc/                read_distribution (optional)
-├── fastreadcounter/      FastReadCounter output (counts.detailed.txt, etc.)
 ├── files_for_report_and_CLC/
 │   ├── <pool>_report_summary.csv   per-well read-distribution grid
 │   │                               (depth/mapped/no-feature/no-alignment, in
 │   │                               millions) — one row per plate well + Unknown
 │   └── <pool>_all_stats.csv        same read-distribution, raw totals per sample
+│                                   (built from FastReadCounter intermediates,
+│                                    which are deleted after the report is written)
 ├── demux_bam/            one BAM per sample (optional)
 ├── demux_fastq/          demuxed FASTQs (optional)
 ├── duplication_statistics.csv
