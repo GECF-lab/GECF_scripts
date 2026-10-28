@@ -203,8 +203,8 @@ is the <code>barcode</code>, separated by <strong>one real tab character</strong
   --r1 /path/to/Daniel_pool1_S1_R1_001.fastq.gz \
   --r2 /path/to/Daniel_pool1_S1_R2_001.fastq.gz</code></pre>
 <p class="smallnote">In workbook mode <code>--run-name</code> is optional — it is inferred
-from the sample name in the workbook. No <code>--out-dir</code> needed either — see the
-output-directory note below.</p>
+from the workbook's <em>Researcher</em> row. No <code>--out-dir</code> needed
+either — see the output-directory note below.</p>
 <h3>Example: barcode-TSV mode</h3>
 <pre><code>./brbseq_pipeline.sh \
   --species human \
@@ -236,7 +236,9 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
 <div class="note">
   <strong>No <code>--out-dir</code> needed — it has a default.</strong> On the production
   server runs land in <code>/mnt/data/BRB-seq_output</code> (each run gets its own
-  timestamped subfolder: <code>/mnt/data/BRB-seq_output/BRBseq_&lt;run-name&gt;_&lt;timestamp&gt;/</code>).
+  timestamped <em>project</em> subfolder:
+  <code>/mnt/data/BRB-seq_output/BRBseq_&lt;run-name&gt;_&lt;timestamp&gt;/</code>, holding the
+  sample-named data folder and the internal QC folder — see section&nbsp;5).
   Pass <code>--out-dir &lt;dir&gt;</code> only if you want to send outputs somewhere else.
 </div>
 
@@ -255,7 +257,7 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <tr><td><code>--r1</code> <code>--r2</code></td><td>yes</td><td>Your pool's two FASTQ files — <code>--r1</code> = barcode read (CB+UMI), <code>--r2</code> = cDNA read</td></tr>
   <tr><td><code>--star-genome</code></td><td class="opt">optional</td><td>Custom STAR index directory. Not needed on the server for <code>mouse</code>/<code>human</code> — the index is inferred from <code>--species</code>. Pass it only for a custom index / new species</td></tr>
   <tr><td><code>--libprep-xlsx</code> <em>or</em> <code>--barcode-tsv</code></td><td>yes (exactly one)</td><td>Sample→well manifest source</td></tr>
-  <tr><td><code>--run-name</code></td><td>yes in TSV mode</td><td>Name of the run directory (in workbook mode it can also be inferred from the workbook)</td></tr>
+  <tr><td><code>--run-name</code></td><td>yes in TSV mode</td><td>Name of the run folder (in workbook mode it can also be inferred from the workbook's <em>Researcher</em> row)</td></tr>
   <tr><td><code>--threads</code></td><td class="opt">optional</td><td>Number of CPU threads (default 8)</td></tr>
   <tr><td><code>--out-dir</code></td><td class="opt">optional</td><td>Root output dir — defaults to <code>/mnt/data/BRB-seq_output</code> on the server. Use local disk rather than a network share if you override it</td></tr>
   <tr><td><code>--plate</code></td><td class="opt">optional</td><td>Barcode plate file; normally auto-inferred from the workbook's <em>Kit ref</em> (V5D vs V5A10 chemistry)</td></tr>
@@ -264,7 +266,7 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <tr><td><code>--skip-dmux-bam</code></td><td class="opt">optional</td><td>Skip the per-sample BAM demux (picard) — the slowest step. It runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-dmux-fq</code></td><td class="opt">optional</td><td>Skip the per-sample FASTQ demux (fqtk). It runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--dry-run</code></td><td class="opt">optional</td><td>Show what would happen without creating any files</td></tr>
-  <tr><td><code>--resume-dir</code></td><td class="opt">optional</td><td>Re-run a previous run that finished or failed <em>in its own output folder</em> (pass that folder, e.g. <code>BRBseq_&lt;name&gt;_&lt;timestamp&gt;</code>). Steps whose output already exists are skipped; only the incomplete step(s) re-run. It reuses the sample→barcode list stored in that folder, so do <strong>not</strong> also pass <code>--libprep-xlsx</code>/<code>--barcode-tsv</code>/<code>--plate</code></td></tr>
+  <tr><td><code>--resume-dir</code></td><td class="opt">optional</td><td>Re-run a previous run that finished or failed <em>in its own output folder</em>: pass the <strong>sample folder</strong> inside the run, e.g. <code>BRBseq_&lt;name&gt;_&lt;timestamp&gt;/Lib_01</code> (pre-v1.2.0 single-tier <code>BRBseq_&lt;name&gt;_&lt;timestamp&gt;</code> folders also work). Steps whose output already exists are skipped; only the incomplete step(s) re-run. It reuses the sample→barcode list stored in that folder, so do <strong>not</strong> also pass <code>--libprep-xlsx</code>/<code>--barcode-tsv</code>/<code>--plate</code></td></tr>
   <tr><td><code>--bed-file</code></td><td class="opt">optional</td><td>RSeQC gene-model (BED12) file. Without this, the pipeline builds a BED12 from the GTF file inside the STAR genome index. (If neither is available, only the RSeQC read-distribution step is skipped — the rest of the pipeline still runs)</td></tr>
 </table>
 
@@ -289,6 +291,7 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <li><strong>QC &amp; demux</strong> — RSeQC read distribution, per-sample BAM demux (picard) and per-sample FASTQ demux (fqtk).</li>
   <li><strong>Read-distribution report (FastReadCounter)</strong> — runs the same STAR BAM (already on disk, no second alignment) through <code>FastReadCounter</code> with the 96-barcode whitelist, then builds the two legacy-compatible QC reports: <code>files_for_report_and_CLC/&lt;pool&gt;_report_summary.csv</code> (the whole-plate grid — depth / mapped / no-feature / no-alignment per well, in millions, plus an <code>Unknown</code> catch-all) and <code>&lt;pool&gt;_all_stats.csv</code> (raw per-sample totals including all FRC buckets). The jar is a pre-installed production file (see the <code>FRC_JAR</code> line near the FRC step in the pipeline); the gene annotation is taken from the STAR index.</li>
   <li><strong>Final outputs</strong> — you take two things into downstream analysis: (a) the sample-named matrix <em>files</em>, and (b) the per-well duplication statistics. The matrix itself exists in two forms of the <em>same</em> data: the raw STAR output where each barcode column is renamed to its Sample_ID (<code>star/samples/</code>), and the ready-to-use CSV tables built from it (<code>matrices/&lt;pool&gt;_umi_matrix.csv</code> for unique-molecule/UMI counts, <code>&lt;pool&gt;_reads_matrix.csv</code> for raw read counts). Use the UMI CSV for PCA/DE; see section 5. The FastReadCounter reports (above) are for sequencing-quality review, not for PCA/DE.</li>
+  <li><strong>Folder guide + integrity check</strong> — the run folder receives a self-generated <code>README.html</code> (an orientation index of everything produced, open in a browser) and, as the very last step, an MD5 manifest <code>&lt;pool&gt;/&lt;pool&gt;.md5</code> covering every file in the sample folder. Recipient verification: <code>cd &lt;pool&gt;/ &amp;&amp; md5sum -c &lt;pool&gt;.md5</code>.</li>
 </ol>
 <p>
 Every step logs to its own file under <code>logs/</code>; the supervisor log
@@ -321,7 +324,8 @@ read from that run's <code>pipeline.log</code>:
   <tr><td>Duplication stats + matrix renames + UMI/reads CSVs</td><td><strong>&lt; 1 min</strong></td><td>all fast matrix reshaping</td></tr>
   <tr><td>FastReadCounter report (FRC + two report CSVs)</td><td><strong>~ 10 min</strong></td><td>one pass over the BAM with the 96-barcode whitelist; the two report CSVs themselves are instant</td></tr>
   <tr><td><strong>BAM demux (picard, 30 samples)</strong></td><td><strong>~ 3.5 h</strong></td><td><em>dominant</em> — one picard pass per sample over the whole BAM</td></tr>
-  <tr><td>FASTQ demux (fqtk, 446 M reads)</td><td><strong>~ 15 min</strong></td><td>single pass, fast</td></tr>
+  <tr><td>FASTQ demux (fqtk, 446 M reads)</td><td><strong>~ 1–2 min</strong></td><td>single pass, fast (with the run's full thread count)</td></tr>
+  <tr><td>MD5 manifest (md5sum over the sample folder)</td><td><strong>~ 5 min</strong></td><td>estimate — new in v1.2.0, not part of AVT0639's log; the dominant cost is the STAR-aligned BAM</td></tr>
 </table>
 <div class="note">
   <strong>Rule of thumb:</strong> expect <strong>~ 4–5 hours end-to-end</strong> for a
@@ -338,28 +342,31 @@ if you only need the expression matrices you can skip the demux steps entirely
 </p>
 
 <h2 id="outputs">5. Reading the outputs</h2>
-<p>Each run creates one directory: <code>&lt;out-dir&gt;/BRBseq_&lt;run-name&gt;_&lt;timestamp&gt;/</code></p>
-<pre><code>BRBseq_Daniel_pool1_20261023_093000/
-├── matrices/
-│   ├── pool_Daniel_umi_matrix.csv      ★ the table for PCA / DE analysis
-│   └── pool_Daniel_reads_matrix.csv     read counts (duplication context only)
-├── duplication_statistics.csv          per-well UMI/read ratio
-├── star/
-│   ├── pool_Daniel_Solo.out/            raw STAR output (sparse matrices, per barcode)
-│   ├── samples/                        same matrix, columns renamed to sample IDs
-│   ├── samples_all_wells/              full-plate view incl. empty wells (debugging)
-│   ├── pool_Daniel_Aligned.sortedByCoord.out.bam   aligned pool BAM
-│   └── STAR.log
-├── fastqc/                            per-FASTQ reports (.zip / .html)
-├── rseqc/                             read distribution + BED12
-├── fastreadcounter/                   FastReadCounter output (counts.detailed.txt, etc.)
-├── files_for_report_and_CLC/
-│   ├── pool_Daniel_report_summary.csv  ★ whole-plate read-distribution grid (depth/mapped/nf/na per well, in millions)
-│   └── pool_Daniel_all_stats.csv      same read-distribution, raw per-sample totals
-├── demux_bam/   demux_fastq/           per-sample BAM / FASTQ files
-├── barcodes/                           manifest + provenance used for the run
-├── README.html                         per-run folder guide (open in a browser)
-└── pipeline.log   logs/                one log per step</code></pre>
+<p>Each run creates a project parent <code>&lt;out-dir&gt;/BRBseq_&lt;run-name&gt;_&lt;timestamp&gt;/</code> that holds two things: the <strong>sample folder</strong> (named after the pool — e.g. <code>Lib_01</code>, read out of your FASTQ filenames) with the user-ready data inside, and the internal-QC <code>files_for_report_and_CLC/</code> folder beside it. When you hand results to a user, ship the whole parent folder — the MD5 manifest inside the sample folder verifies the files they will actually use:</p>
+<pre><code>BRBseq_Daniel_pool1_20261023_093000/          project parent (timestamped)
+├── Lib_01/                              sample folder (name from your FASTQs)
+│   ├── matrices/
+│   │   ├── Lib_01_umi_matrix.csv        ★ the table for PCA / DE analysis
+│   │   └── Lib_01_reads_matrix.csv      read counts (duplication context only)
+│   ├── duplication_statistics.csv       per-well UMI/read ratio
+│   ├── star/
+│   │   ├── Lib_01_Solo.out/             raw STAR output (sparse matrices, per barcode)
+│   │   ├── samples/                     same matrix, columns renamed to sample IDs
+│   │   ├── samples_all_wells/           full-plate view incl. empty wells (debugging)
+│   │   ├── Lib_01_Aligned.sortedByCoord.out.bam   aligned pool BAM
+│   │   └── STAR.log
+│   ├── fastqc/                          per-FASTQ reports (.zip / .html)
+│   ├── rseqc/                           read distribution + BED12
+│   ├── demux_bam/   demux_fastq/        per-sample BAM / FASTQ files
+│   ├── barcodes/                        manifest + provenance used for the run
+│   ├── logs/                            one log per step
+│   ├── pipeline.log                     supervisor log (step status + commands)
+│   ├── README.html                      folder guide (open in a browser)
+│   └── Lib_01.md5                       ★ MD5 checksums of every file above
+│                                        (verify: cd Lib_01/ &amp;&amp; md5sum -c Lib_01.md5)
+└── files_for_report_and_CLC/            internal QC — sequencing side, not for users
+    ├── Lib_01_report_summary.csv   ★ whole-plate read-distribution grid (depth/mapped/nf/na per well, in millions)
+    └── Lib_01_all_stats.csv        same read-distribution, raw per-sample totals</code></pre>
 
 <h3>Which matrix do I use?</h3>
 <table>
@@ -423,7 +430,7 @@ missing/empty, the parser fell back to well positions and warned about it — ch
 </p>
 <h3>I changed something mid-run / it crashed — do I start over?</h3>
 <p>
-No. Re-run the same command with <code>--resume-dir &lt;existing-run-dir&gt;</code> and
+No. Re-run the same command with <code>--resume-dir &lt;run&gt;/&lt;pool&gt;</code> (the sample folder inside the run, e.g. <code>BRBseq_Alireza_20261022_171136/Lib_01</code>) and
 finished steps are skipped. The pipeline decides a step is "done" by looking for
 its <strong>marker file</strong> — which is simply that step's own output file (for
 example <code>barcodes/barcode_whitelist.txt</code> for barcode prep,

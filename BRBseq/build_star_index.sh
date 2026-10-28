@@ -2,7 +2,7 @@
 #
 # build_star_index.sh — Build a STAR genome index (one-time step)
 #
-# One-time step for the MERCURIUS 3' RNA-seq (BRB-seq/DRUG-seq) pipeline:
+# One-time step for the MERCURIUS 3' BRB-seq pipeline:
 # build the STAR genome index used by brbseq_pipeline.sh.
 #
 # You supply the reference FASTA and GTF; no genome is downloaded here.

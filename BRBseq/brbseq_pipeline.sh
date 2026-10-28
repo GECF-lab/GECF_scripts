@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #=============================================================================
-# brbseq_pipeline.sh — MERCURIUS DRUG-seq (BRB-seq) single-pool pipeline
+# brbseq_pipeline.sh — MERCURIUS BRB-seq single-pool pipeline
 #
-# MERCURIUS 3' RNA-seq (BRB-seq/DRUG-seq) Data Pre-Processing pipeline
+# MERCURIUS 3' BRB-seq Data Pre-Processing pipeline
 # for ONE pool/run, in step order:
 #
 #   STAR genome indexing            (one-time, NOT a pipeline step)
@@ -50,11 +50,18 @@
 #   * The optional steps (FASTQ QC, RSeQC, BAM demux, FASTQ demux) are ON by
 #     default (disable each with its --skip-* flag); a missing tool causes
 #     that step to log a warning and skip rather than abort the run.
+#
+#   Output layout (v1.2.0+)
+#     <out-dir>/BRBseq_<run-name>_<timestamp>/     <- project parent (timestamped)
+#     |- <pool>/                       <- user-ready data (pool = name from the FASTQ files)
+#     `-- files_for_report_and_CLC/   <- <pool>_all_stats.csv, <pool>_report_summary.csv
+#     Integrity: <pool>/<pool>.md5 hashes every file in <pool>/ (verify: cd <pool> && md5sum -c <pool>.md5)
+#     Pre-v1.2.0 single-tier BRBseq_<name>_<timestamp>/ folders remain resumable.
 #=============================================================================
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
@@ -65,7 +72,7 @@ RENAME_MATRIX="${UTILS_DIR}/rename_matrix.py"
 UMI_MATRIX_PREP="${UTILS_DIR}/prepare_umi_matrix.py"
 
 #--- defaults (all overridable via flags) -----------------------------------
-RUN_NAME="${RUN_NAME:-}"         # run label for the output leaf: BRBseq_<run-name>_<timestamp>
+RUN_NAME="${RUN_NAME:-}"         # run label for the output parent: BRBseq_<run-name>_<timestamp>
 AVT_ID="${AVT:-}"                # DEPRECATED: no longer a pipeline parameter; value (if set) is used only as a fallback run name
 POOL=""                           # pool label — inferred from the FASTQ names
 THREADS="${THREADS:-8}"
@@ -113,15 +120,15 @@ warn() { printf '%s [WARN ] %s\n' "$(_ts)" "$*" >&2; }
 die()  { printf '%s [ERROR] %s\n' "$(_ts)" "$*" >&2; exit 1; }
 
 usage() {
-  printf 'brbseq_pipeline.sh — MERCURIUS DRUG-seq (BRB-seq) single-pool pipeline (v%s).\n\n' "$SCRIPT_VERSION"
+  printf 'brbseq_pipeline.sh — MERCURIUS BRB-seq single-pool pipeline (v%s).\n\n' "$SCRIPT_VERSION"
   cat <<'EOF'
-MERCURIUS 3' RNA-seq – Data Pre-Processing (BRB-seq / DRUG-seq) pipeline.
+MERCURIUS 3' BRB-seq Data Pre-Processing pipeline.
 
 REQUIRED FLAGS
   --species <sp>        human | mouse | <custom name>
   --r1 <fq.gz>          R1 barcode read (14 bp CB + 14 bp UMI)
   --r2 <fq.gz>          R2 genomic / cDNA read
-  --run-name <name>     run label for the output leaf
+  --run-name <name>     run label for the output parent
                         BRBseq_<run-name>_<timestamp>; in lib-prep mode
                         taken from the workbook 'Researcher' row (first
                         name) unless given here. Required in --barcode-tsv
@@ -145,7 +152,10 @@ OPTIONAL FLAGS
   --bed-file <bed12>    RSeQC BED12 gene model (override). If omitted, bakes
                         one at run time from the GTF shipped inside the STAR
                         index dir (build_star_index.sh moves it there)
-  --out-dir <dir>       root output dir (default /mnt/data/BRB-seq_output)
+  --out-dir <dir>       root output dir (default /mnt/data/BRB-seq_output);
+                        the run is created inside it as
+                        BRBseq_<run-name>_<timestamp>/ (project parent, holding
+                        the sample folder and files_for_report_and_CLC/)
   --threads <n>         CPU threads (default 8); number of parallel threads
                         used by STAR (alignment) and fqtk (per-sample FASTQ
                         demux)
@@ -157,6 +167,11 @@ OPTIONAL FLAGS
                         again, not a new --libprep-xlsx/--barcode-tsv/--plate.
                         (See the "Resuming an incomplete run" section of
                         README.html.)
+                        New layout: point it at the SAMPLE folder INSIDE
+                        BRBseq_<name>_<timestamp>  (e.g.
+                        .../BRBseq_Alireza_20261022_171136/Lib_01); a
+                        pre-v1.2.0 single-tier BRBseq_<name>_<timestamp>
+                        folder also works.
   --skip-fastq          skip fastqc  (on by default)
   --skip-rseqc          skip read_distribution  (on by default)
   --skip-dmux-bam       skip picard BAM demux  (on by default)
@@ -248,7 +263,7 @@ if [[ -n "$RESUME_DIR" ]]; then
   if [[ -n "$LIBPREP_XLSX" || -n "$BARCODE_TSV" || -n "$BARCODES_PLATE" ]]; then
     die "--resume-dir uses the sample→barcode list already stored inside ${RESUME_DIR} — do not also pass --libprep-xlsx / --barcode-tsv / --plate. (If you WANT to regenerate the list from a new workbook that is a fresh run: drop --resume-dir and give --run-name for a new folder.)"
   fi
-  [[ -d "$RESUME_DIR" ]] || die "--resume-dir folder not found: ${RESUME_DIR} (this should be an existing pipeline output folder named BRBseq_<name>_<timestamp>). Use --help for the full list of options."
+  [[ -d "$RESUME_DIR" ]] || die "--resume-dir folder not found: ${RESUME_DIR} (this should be the sample folder inside a BRBseq_<name>_<timestamp> run, e.g. .../BRBseq_Alireza_20261022_171136/Lib_01, or a pre-v1.2.0 single-tier BRBseq_<name>_<timestamp> folder). Use --help for the full list of options."
   _rd_manifest=""
   for _mf in "${RESUME_DIR%/}/barcodes/manifest_from_libprep.tsv" "${RESUME_DIR%/}/barcodes/barcode_manifest.tsv"; do
     if [[ -s "$_mf" ]]; then _rd_manifest="$_mf"; break; fi
@@ -441,10 +456,19 @@ fi
 # researcher name now, before the output dir is known, so the leaf can be named;
 # the manifest is generated into <run>/barcodes/ later, after the layout.
 if [[ -z "$RUN_NAME" && -n "$RESUME_DIR" ]]; then
-  _rd_base="$(basename "${RESUME_DIR%/}")"
-  [[ "$_rd_base" =~ ^BRBseq_(.+)_.{15}$ ]] || die "--resume-dir points at '${RESUME_DIR}' which is not named like an existing run folder (expected BRBseq_<name>_<timestamp>). Re-check the path, or pass --run-name explicitly."
-  RUN_NAME="${BASH_REMATCH[1]}"
-  log "run name   = ${RUN_NAME}  (from the --resume-dir folder name; pass --run-name to override)"
+  _rd="${RESUME_DIR%/}"
+  _rd_leaf="$(basename "${_rd}")"
+  _rd_parent="$(basename "$(dirname "${_rd}")")"
+  if [[ "$_rd_parent" =~ ^BRBseq_(.+)_.{15}$ ]]; then
+    RUN_NAME="${BASH_REMATCH[1]}"
+    log "run name   = ${RUN_NAME}  (from the --resume-dir PARENT folder name; pass --run-name to override)"
+  elif [[ "$_rd_leaf" =~ ^BRBseq_(.+)_.{15}$ ]]; then
+    # pre-v1.2.0 layout: the resume target itself is the BRBseq_<name>_<ts> folder
+    RUN_NAME="${BASH_REMATCH[1]}"
+    log "run name   = ${RUN_NAME}  (from the --resume-dir folder name; pre-v1.2.0 single-tier layout — pass --run-name to override)"
+  else
+    die "--resume-dir points at '${RESUME_DIR}' which is not a BRBseq run. Expected the sample folder inside a BRBseq_<name>_<timestamp> parent (e.g. .../BRBseq_Alireza_20261022_171136/Lib_01), or a pre-v1.2.0 single-tier BRBseq_<name>_<timestamp> folder. Re-check the path, or pass --run-name explicitly."
+  fi
 fi
 if [[ -z "$RUN_NAME" ]]; then
   if [[ -n "$AVT_ID" ]]; then
@@ -473,16 +497,29 @@ RUN_NAME="$(tr -dc 'A-Za-z0-9._-' <<<"${RUN_NAME// /_}" )"   # filesystem-safe
 [[ -n "$RUN_NAME" ]] || die "The run name you supplied (--run-name) is made up only of characters that are not allowed in file names, so after cleaning it became an empty name and the pipeline has no way to label the output folder. Please use a run name made of letters, numbers, dots, dashes or underscores (spaces will be turned into underscores) — for example 'PHX537_poolA' — and re-run."
 
 #--- output layout -----------------------------------------------------------
+# v1.2.0 layout: <out-dir>/BRBseq_<name>_<timestamp>/ (project parent,
+# timestamped) holds the user-ready sample folder (<pool>, pool = the name
+# read out of the R1/R2 FASTQ names) plus files_for_report_and_CLC/.
+# The integrity manifest <pool>/<pool>.md5 is written LAST (write_run_md5).
+POOL_CLEAN="$(tr -dc 'A-Za-z0-9._-' <<< "${POOL// /_}")"   # filesystem-safe pool label
+[[ -n "$POOL_CLEAN" ]] || die "The pool label derived from the FASTQ names is empty or contains only characters that are not allowed in file names (after cleaning). The sample folder would have no usable name. Rename the FASTQ files so the pool part (everything before _S<lane>) is letters/digits/dots/dashes, then re-run."
+OLD_LAYOUT=0   # 1 = resuming a pre-v1.2.0 single-tier BRBseq_<name>_<timestamp> folder
 if [[ -n "$RESUME_DIR" ]]; then
   # Re-run an EXISTING run folder in place (no new timestamped dir).
   # Every step re-checks its own completion state (see the resume
   # logic per step below), so finished steps are skipped and the one that
   # did not finish (e.g. the failed fastq demultiplex) is re-run.
   RUN_DIR="${RESUME_DIR%/}"
+  PARENT_DIR="$(dirname "${RUN_DIR}")"
+  if [[ "$(basename "${RUN_DIR}")" =~ ^BRBseq_(.+)_.{15}$ ]]; then
+    OLD_LAYOUT=1   # pre-v1.2.0 folder: report grids keep the old placement (inside the leaf)
+  fi
 else
   TS="$(date +%Y%m%d_%H%M%S)"
-  RUN_DIR="${OUT_DIR%/}/BRBseq_${RUN_NAME}_${TS}"
+  PARENT_DIR="${OUT_DIR%/}/BRBseq_${RUN_NAME}_${TS}"
+  RUN_DIR="${PARENT_DIR}/${POOL_CLEAN}"
 fi
+MD5_FILE="${RUN_DIR}/${POOL_CLEAN}.md5"   # integrity manifest (written last)
 BARCODES_DIR="${RUN_DIR}/barcodes"
 FASTQC_DIR="${RUN_DIR}/fastqc"
 STAR_DIR="${RUN_DIR}/star"
@@ -656,7 +693,7 @@ elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
 fi
 
 #--- banner -------------------------------------------------------------------
-log "==== MERCURIUS DRUG-seq pipeline v${SCRIPT_VERSION} (dry_run=${DRY_RUN}) ===="
+log "==== MERCURIUS BRB-seq pipeline v${SCRIPT_VERSION} (dry_run=${DRY_RUN}) ===="
 log "run name   = ${RUN_NAME}"
 log "pool       = ${POOL}"
 log "threads    = ${THREADS}"
@@ -664,7 +701,7 @@ log "R1 (CB+UMI)= ${R1_BARCODE}"
 log "R2 (cDNA)  = ${R2_GENOMIC}"
 log "manifest   = ${MANIFEST}  (header-mode=${MANIFEST_HEADER})"
 log "STAR index = ${STAR_INDEX}   (star=${STAR_BIN:-NOT_FOUND})"
-log "output     = ${RUN_DIR}"
+log "output     = ${RUN_DIR}   (project parent: ${PARENT_DIR})"
 log "optional:  fastqc=${RUN_OPT_FASTQ}  rseqc=${RUN_OPT_RSEQC}  demux_bam=${RUN_OPT_DEMUX_BAM}  demux_fq=${RUN_OPT_DEMUX_FQ}"
 log "tools:     STAR=${HAVE_STAR}  fastqc=${HAVE_FASTQC}  samtools=${HAVE_SAMTOOLS}  rseqc=${HAVE_RSEQC}  picard=${HAVE_PICARD}  fqtk=${HAVE_FQTK}  java=${HAVE_JAVA}"
 log "python     = ${PYTHON}"
@@ -1121,8 +1158,10 @@ log "  (barcode->sample map: ${RENAME_DIR}/sample_barcode_map.tsv; raw matrix un
 # 96-barcode whitelist as the legacy run, so the well grid in
 # <pool>_report_summary.csv stays comparable with legacy runs.
 #
-# Writes:  <run>/files_for_report_and_CLC/<pool>_all_stats.csv
-#          <run>/files_for_report_and_CLC/<pool>_report_summary.csv
+# Writes:  <parent>/files_for_report_and_CLC/<pool>_all_stats.csv
+#          <parent>/files_for_report_and_CLC/<pool>_report_summary.csv
+#          (<parent> = BRBseq_<name>_<timestamp>; pre-v1.2.0 runs keep
+#          <run>/files_for_report_and_CLC/)
 # The ~50 MB FRC intermediates (fastreadcounter/counts.*) are deleted after
 # the two report CSVs are built.
 #
@@ -1144,7 +1183,11 @@ fi
 log "FastReadCounter gene model (GTF): $FRC_GTF"
 
 FRC_DIR="${RUN_DIR}/fastreadcounter"
-REPORTS_DIR="${RUN_DIR}/files_for_report_and_CLC"
+if [[ "${OLD_LAYOUT:-0}" -eq 1 ]]; then
+  REPORTS_DIR="${RUN_DIR}/files_for_report_and_CLC"   # pre-v1.2.0 run folder: keep the old placement
+else
+  REPORTS_DIR="${PARENT_DIR}/files_for_report_and_CLC"
+fi
 FRC_DETAILED="${FRC_DIR}/counts.detailed.txt"
 FRC_RENAMED="${FRC_DIR}/counts.detailed_withsamplesID.txt"
 ALL_STATS="${REPORTS_DIR}/${POOL}_all_stats.csv"
@@ -1461,7 +1504,6 @@ write_run_readme() {
   if [[ "${RUN_OPT_DEMUX_FQ}"  -eq 1 && -e "${DMUX_FQ_DIR}/_done" ]];  then _f="${DMUX_FQ_DIR#"${RUN_DIR}"/}";  fi
   if [[ -s "${RSEQC_DIR}/${POOL}_read_distribution.txt" ]]; then _rseqc=1; fi
   if [[ -d "${FASTQC_DIR}" ]]; then _fastqc=1; fi
-  if [[ -s "${REPORTS_DIR}/${POOL}_report_summary.csv" ]]; then _frc=1; fi
 
   {
     echo '<!DOCTYPE html>'
@@ -1481,18 +1523,14 @@ write_run_readme() {
     echo '  li { margin: .35rem 0; }'
     echo '  .primary { font-weight: 600; }'
     echo '</style></head><body>'
-    echo "<h1>BRB-seq (MERCURIUS DRUG-seq) — run output folder</h1>"
-    echo "<p class=\"meta\">Generated by brbseq_pipeline.sh v${SCRIPT_VERSION} · <code>${RUN_NAME}</code> · pool <code>${POOL}</code> · species <code>${SPECIES:-not specified}</code> · ${DATE_GEN:-$(date +%Y-%m-%d)}</p>"
+    echo "<h1>BRB-seq — run output folder</h1>"
+    echo "<p class=\"meta\">Generated by brbseq_pipeline.sh v${SCRIPT_VERSION} · <code>${RUN_NAME}</code> · pool <code>${POOL}</code> · species <code>${SPECIES:-not specified}</code></p>"
 
     echo '<h2>What to use (the two deliverable tables)</h2>'
     echo '<table>'
     echo '<tr><th>File</th><th>Meaning</th><th>Use for</th></tr>'
     echo '<tr><td><code>'"${rel_umi}"'</code></td><td>Gene x sample UMI counts (deduplicated molecules)</td><td class="primary">PCA / differential expression (Seurat, edgeR) — the primary result table</td></tr>'
     echo '<tr><td><code>'"${rel_reads}"'</code></td><td>Gene x sample total read counts (all PCR copies)</td><td>Duplication context only — <strong>not</strong> a PCA/DE input</td></tr>'
-    if [[ $_frc -eq 1 ]]; then
-      echo '<tr><td><code>'"$(echo "${REPORTS_DIR}/${POOL}_report_summary.csv" | sed "s|${RUN_DIR}/||")"'</code></td><td>Per-well sequencing depth / mapped / no-feature / no-alignment read distribution (whole-plate grid + Unknown)</td><td class="primary">Sequencing QC &amp; CLC report — one row per plate well</td></tr>'
-      echo '<tr><td><code>'"$(echo "${REPORTS_DIR}/${POOL}_all_stats.csv" | sed "s|${RUN_DIR}/||")"'</code></td><td>Same read-distribution counts, raw totals per sample (no mio rounding)</td><td>Underlying numbers behind the grid above</td></tr>'
-    fi
     echo '</table>'
     echo '<p>Both tables have one row per gene (columns <code>Gene_id</code> then <code>gene_symbol</code>) and one column per sample (your <code>Sample_ID</code>). <code>empty_well_*</code> columns are unoccupied plate wells — drop them before downstream analysis.</p>'
 
@@ -1528,10 +1566,6 @@ write_run_readme() {
     if [[ $_rseqc -eq 1 ]]; then
       echo '<li><code>rseqc/'"${POOL}"'_read_distribution.txt</code> — read-coverage distribution across exons (RSeQC).</li>'
     fi
-    if [[ $_frc -eq 1 ]]; then
-      echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_report_summary.csv</code> — the whole-plate read-distribution grid (depth / mapped / no-feature / no-alignment per well, in millions — the CLC/sequencing report).</li>'
-      echo '<li><code>files_for_report_and_CLC/'"${POOL}"'_all_stats.csv</code> — the same read-distribution counts as raw totals per sample (unrounded). Built from FastReadCounter intermediates (removed after the report is written).</li>'
-    fi
     if [[ -n "$_b" ]]; then
       echo '<li><code>'"${_b}"'/</code> — one aligned BAM per sample (split from the pool BAM; real samples only).</li>'
     fi
@@ -1540,6 +1574,7 @@ write_run_readme() {
     fi
     echo "<li><code>pipeline.log</code> — supervisor log: every step's status and exact command.</li>"
     echo '<li><code>logs/</code> — one full output log per pipeline step.</li>'
+    echo "<li><code>${POOL_CLEAN}.md5</code> — MD5 checksums of every file in this folder (this README included). Integrity check: cd into this folder and run <code>md5sum -c ${POOL_CLEAN}.md5</code>.</li>"
     echo '</ul>'
 
     echo '<h2>Notes</h2>'
@@ -1553,13 +1588,42 @@ write_run_readme() {
   log "run README: $README  (written)"
 }
 
+#=== md5 manifest — written LAST; covers the whole sample folder =============
+# ${MD5_FILE} = <pool>/<pool>.md5 : MD5 of every regular file inside the
+# sample folder (manifest itself excluded), sorted, ./-relative — so the
+# recipient verifies the whole handover from one place:
+#     cd <out-dir>/BRBseq_<name>_<ts>/<pool> && md5sum -c <pool>.md5
+# The README in this folder is deterministic (no generation date), so it is
+# safe to hash. Redone on every run/resume — it always reflects the files
+# on disk at the moment it is written (which is why it is the last
+# artifact). Non-fatal by design: a failed manifest never aborts a finished
+# run (the previous manifest, if any, is left in place).
+write_run_md5() {
+  local MAN="${MD5_FILE}"
+  local TMP="${MAN}.tmp.$$"
+  if ! ( cd "$RUN_DIR" && \
+         find . -type f ! -name "$(basename "$MAN")" ! -name "$(basename "$MAN").tmp.*" -printf './%P\n' |
+         LC_ALL=C sort |
+         xargs -d '\n' -r md5sum > "$TMP" ); then
+    rm -f "$TMP"
+    warn "could not generate the md5 manifest in ${RUN_DIR} — the run itself finished; the previous manifest (if any) was left in place"
+    return 0
+  fi
+  mv -f "$TMP" "$MAN"
+  local n
+  n="$(wc -l < "$MAN" 2>/dev/null || echo '?')"
+  log "run md5 : $MAN  (hashed ${n} file(s); verify: cd ${RUN_DIR} && md5sum -c $(basename "$MAN"))"
+}
+
 write_run_readme
+write_run_md5
 
 #=== Merging multi-lane FASTQ =============================================
 log ""; log "multi-lane FASTQ merge not auto-run (it is optional;"
 log "              pre-merge per-lane files or pass a comma list as --r1/--r2)"
 
 log ""; log "══════ PIPELINE COMPLETE (v${SCRIPT_VERSION}) ══════"
+log "  project parent        = ${PARENT_DIR}"
 log "  run directory         = ${RUN_DIR}"
 log "  barcodes               = ${WHITELIST}  ($(wc -l < "$WHITELIST" 2>/dev/null || echo '?') barcodes)"
 [[ -s "$STAR_BAM"     ]] && log "  STAR BAM             = ${STAR_BAM}"
@@ -1569,12 +1633,13 @@ log "  barcodes               = ${WHITELIST}  ($(wc -l < "$WHITELIST" 2>/dev/nul
 [[ -d "$RENAME_ALL_DIR" ]] && log "  sample-named mtx     = ${RENAME_ALL_DIR}  (all wells, debug)"
 [[ -s "$UMI_MATRIX_CSV"  ]] && log "  UMI matrix CSV       = ${UMI_MATRIX_CSV}"
 [[ -s "$READS_MATRIX_CSV" ]] && log "  Reads matrix CSV     = ${READS_MATRIX_CSV}"
-[[ -s "$REPORT_CSV"       ]] && log "  report grid (CLC)    = $REPORT_CSV          (per-well depth/mapped/read distribution)"
+[[ -s "$REPORT_CSV"       ]] && log "  report grid          = $REPORT_CSV          (per-well depth/mapped/read distribution)"
 [[ -s "$ALL_STATS"        ]] && log "  all_stats (report)   = $ALL_STATS          (raw per-sample read totals)"
 [[ -s "${DMUX_DIR:-/nonexistent}"     ]] && :
 [[ -d "${DMUX_BAM_DIR}/_done" && -s "${DMUX_BAM_DIR}/_done" ]] && log "  demux BAM              = ${DMUX_BAM_DIR}"
 [[ -d "${DMUX_FQ_DIR}/_done"  && -s "${DMUX_FQ_DIR}/_done"  ]] && log "  demux FASTQ            = ${DMUX_FQ_DIR}"
 [[ -s "${RUN_DIR}/README.html" ]] && log "  run README           = ${RUN_DIR}/README.html  (folder guide for users; open in a browser)"
+[[ -s "${MD5_FILE}"           ]] && log "  md5 manifest         = ${MD5_FILE}  (verify: cd ${RUN_DIR} && md5sum -c $(basename "${MD5_FILE}"))"
 log ""
 log "Next step (outside this pipeline): downstream analysis (e.g. Seurat/Scanpy)"
 log "clustering) on the produced matrices; this script stops at the"

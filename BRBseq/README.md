@@ -1,10 +1,11 @@
-# BRB-seq (MERCURIUS DRUG-seq) single-pool RNA-seq pipeline
+# BRB-seq single-pool RNA-seq pipeline
 
-`brbseq_pipeline.sh` (v1.1.0) — end-to-end pre-processing for
-**one pool/run** of MERCURIUS 3' RNA-seq (BRB-seq / DRUG-seq) data:
+`brbseq_pipeline.sh` (v1.2.0) — end-to-end pre-processing for
+**one pool/run** of MERCURIUS 3' BRB-seq data:
 barcode prep → STARsolo alignment + gene/UMI counts → mandatory duplication
 statistics → sample-named matrices → FastReadCounter read-distribution report
-→ optional per-sample demux.
+→ optional per-sample demux → run-folder README + MD5 integrity manifest
+(written last, once every other file is final).
 
 The STAR request always requests **both** UMI dedup methods
 (`--soloUMIdedup NoDedup 1MM_Directional` in one pass) so the mandatory
@@ -15,7 +16,7 @@ single alignment.
 
 | File | Purpose |
 |---|---|
-| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.1.0) |
+| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.2.0) |
 | `build_star_index.sh` | One-time STAR genomeDir build (Mercurius guide 1.1; no Ensembl fetch) |
 | `brbseq-env.yaml` | Conda environment (`brbseq`) — STAR, samtools, fastqc, picard, fqtk, RSeQC tools, python/openpyxl |
 | `utils/prepare_barcodes.sh` | Builds `barcode_whitelist.txt` + demux maps from the manifest (TSV `Sample_ID` → `bar`) |
@@ -104,11 +105,11 @@ In lib-prep workbook mode:
   scan, so one per empty well would be pure waste).  Empty wells remain in
   the STAR whitelist and in `samples_all_wells/` for debugging.
 
-## Read-distribution report (FastReadCounter)
+## Read-distribution report (FastReadCounter) — internal QC
 
 After the matrices are built (optional demux still to come), the pipeline runs
 **FastReadCounter** over the same STAR BAM and the same 96-barcode whitelist,
-then derives two reports for the CLC / QC side:
+then derives two reports for the lab's internal QC side (CLC) — **not part of the user deliverables**; they exist for internal sequencing-quality checks only:
 
 - `files_for_report_and_CLC/<pool>_report_summary.csv` — a whole-plate grid.
   One row per well (A01…H12) plus a trailing `Unknown` row; columns
@@ -140,55 +141,75 @@ single hardcoded line `FRC_JAR=` near the top of the FRC section of
 
 ## Output layout
 
-Single-level leaf under `--out-dir`:
+Two levels under `--out-dir`: the **project parent**
+`BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/` (timestamped) holds the user-ready
+**sample folder** `<pool>/` (the pool name read out of the R1/R2 FASTQ
+filenames) and, next to it, `files_for_report_and_CLC/` for the internal QC
+reports.
 
 ```
-OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/
-├── barcodes/             barcode_whitelist.txt, manifest*.tsv,
-│                         fastq_sample_metadata.tsv, bam_barcodes.tsv
-├── star/
-│   ├── STAR.log          STAR invocation + runtime output
-│   ├── <pool>_Aligned.sortedByCoord.out.bam
-│   ├── <pool>_Solo.out/  STARsolo's own output — Gene/raw/ holds the raw
-│   │                     UMI matrix (its ONLY location, no mirror copies)
-│   ├── samples/          Sample_ID-named matrix (SAMPLES ONLY — the input
-│   │                     to the two matrix CSVs below)
-│   └── samples_all_wells/  Sample_ID-named matrix (SAMPLES + empty_well_*)
-│                         [lib-prep workbook mode only]
-│                         (both also hold sample_barcode_map.tsv and the
-│                          umiDedup-{NoDedup,1MM_Directional}.mtx matrices)
-├── rseqc/                read_distribution (optional)
-├── files_for_report_and_CLC/
-│   ├── <pool>_report_summary.csv   per-well read-distribution grid
-│   │                               (depth/mapped/no-feature/no-alignment, in
-│   │                               millions) — one row per plate well + Unknown
-│   └── <pool>_all_stats.csv        same read-distribution, raw totals per sample
-│                                   (built from FastReadCounter intermediates,
-│                                    which are deleted after the report is written)
-├── demux_bam/            one BAM per sample (optional)
-├── demux_fastq/          demuxed FASTQs (optional)
-├── duplication_statistics.csv
-├── matrices/             the two deliverable matrices (canonical PCA/DE input
-│   ├── <pool>_umi_matrix.csv    UMI-deduped — CANONICAL
-│   └── <pool>_reads_matrix.csv  raw-read matrix (duplication context only)
-├── pipeline.log          supervisor log (step status + exact commands)
-├── logs/                 one output log per step
-└── README.html           auto-generated folder index — describes every file
-                          above; written at the end of the run, open in a
-                          browser; safe to share with users as the orientation
-                          point
+OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/     project parent
+├── <pool>/                     user-ready data (pool = name from the FASTQ names)
+│   ├── barcodes/             barcode_whitelist.txt, manifest*.tsv,
+│   │                         fastq_sample_metadata.tsv, bam_barcodes.tsv
+│   ├── star/
+│   │   ├── STAR.log          STAR invocation + runtime output
+│   │   ├── <pool>_Aligned.sortedByCoord.out.bam
+│   │   ├── <pool>_Solo.out/  STARsolo's own output — Gene/raw/ holds the raw
+│   │   │                     UMI matrix (its ONLY location, no mirror copies)
+│   │   ├── samples/          Sample_ID-named matrix (SAMPLES ONLY — the input
+│   │   │                     to the two matrix CSVs below)
+│   │   └── samples_all_wells/  Sample_ID-named matrix (SAMPLES + empty_well_*)
+│   │                           [lib-prep workbook mode only]
+│   │                         (both also hold sample_barcode_map.tsv and the
+│   │                          umiDedup-{NoDedup,1MM_Directional}.mtx matrices)
+│   ├── rseqc/                read_distribution (optional)
+│   ├── demux_bam/            one BAM per sample (optional)
+│   ├── demux_fastq/          demuxed FASTQs (optional)
+│   ├── duplication_statistics.csv
+│   ├── matrices/             the two deliverable matrices (canonical PCA/DE input
+│   │   ├── <pool>_umi_matrix.csv    UMI-deduped — CANONICAL
+│   │   └── <pool>_reads_matrix.csv  raw-read matrix (duplication context only)
+│   ├── pipeline.log          supervisor log (step status + exact commands)
+│   ├── logs/                 one output log per step
+│   ├── README.html           auto-generated folder index — describes every file
+│   │                         above; written near the end of the run, open in a
+│   │                         browser; safe to share with users as the orientation
+│   │                         point (no embedded generation date — deterministic)
+│   └── <pool>.md5            MD5 integrity manifest of every file in this
+│                             folder (manifest excluded; README.html included).
+│                             Verify: cd <pool>/ && md5sum -c <pool>.md5
+└── files_for_report_and_CLC/   [internal QC — NOT a user deliverable]
+    ├── <pool>_report_summary.csv   per-well read-distribution grid
+    │                               (depth/mapped/no-feature/no-alignment, in
+    │                               millions) — one row per plate well + Unknown
+    └── <pool>_all_stats.csv        same read-distribution, raw totals per sample
+                                    (built from FastReadCounter intermediates,
+                                     which are deleted after the report is written)
 ```
+
+Notes:
+
+- `<pool>.md5` is **the last artifact written** — it is regenerated on every
+  run/resume so it always matches the files on disk at the moment it is
+  written (which is also why the README.html next to it carries no
+  generation date).
+- When handing a run to a user, ship the **whole parent folder** (sample
+  folder + `files_for_report_and_CLC/`) — the manifest verifies the sample
+  folder only; the report CSVs are for the sequencing side.
 
 ## Changelog
 
-Bumped in `SCRIPT_VERSION` in `brbseq_pipeline.sh` (currently **v1.1.0** —
-the current release; the latest entry is the v1.1.0 FastReadCounter report).
+Bumped in `SCRIPT_VERSION` in `brbseq_pipeline.sh` (currently **v1.2.0** —
+the current release; the latest entry is the v1.2.0 layout + integrity
+manifest).
 v1.0.1 was reserved but never shipped — the version went straight from the
 1.0.0 baseline to 1.0.2.
 
+
 ### v1.0.0 — baseline single-pool pipeline
 
-First end-to-end version of the MERCURIUS (BRB-seq / DRUG-seq) single-pool
+First end-to-end version of the MERCURIUS BRB-seq single-pool
 workflow. Everything below is the shipped baseline:
 
 - **One STARsolo pass, both dedup methods** — `--soloUMIdedup NoDedup
@@ -246,7 +267,7 @@ workflow. Everything below is the shipped baseline:
   page written at the end of each run is HTML (open in a browser) rather than
   plain-text Markdown.
 
-### v1.1.0 — FastReadCounter read-distribution report (CLC)
+### v1.1.0 — FastReadCounter read-distribution report (internal QC, not a deliverable)
 
 - **New mandatory `FRC` step** — runs **FastReadCounter** over the STAR
   BAM (already on disk; no second alignment) and the 96-barcode whitelist,
@@ -269,6 +290,28 @@ workflow. Everything below is the shipped baseline:
   on the production server); the gene annotation is taken automatically from
   the STAR index (`sjdbGTFfile` in `genomeParameters.txt`).  Java ships with
   the `brbseq` Conda env (OpenJDK) — nothing to install.
+
+
+### v1.2.0 — two-level output layout + MD5 integrity manifest
+
+- **New output layout** — `<out-dir>/BRBseq_<run-name>_<timestamp>/` becomes
+  the **project parent** (timestamped); inside it, the user-ready sample
+  folder `<pool>/` (pool name still inferred from the FASTQ filenames) and,
+  next to it, `files_for_report_and_CLC/` with the FastReadCounter QC grids.
+  Ship the whole parent; the user works inside `<pool>/`.
+- **New final step: `<pool>/<pool>.md5`** — an MD5 manifest of every file in
+  the sample folder (the manifest itself excluded; `README.html` included —
+  it no longer embeds a generation date, so it is deterministic).
+  Unconditional, non-fatal, and **regenerated on every run/resume** so it
+  always reflects what is on disk when written.  Verification on the
+  receiving machine: `cd <pool>/ && md5sum -c <pool>.md5`.
+- **`--resume-dir` on the new layout** — point it at the sample folder
+  INSIDE the parent (e.g.
+  `.../BRBseq_Alireza_20261022_171136/Lib_01`); the run name is read from
+  the parent's folder name.  Single-tier pre-v1.2.0 folders (pointing
+  directly at `BRBseq_<name>_<timestamp>`) are still accepted, with the
+  report grids keeping their old placement inside that folder.
+- **No new CLI flags, no new dependencies** (coreutils `md5sum` only).
 
 ## Quick start
 
@@ -300,23 +343,27 @@ workflow. Everything below is the shipped baseline:
 
 ## Resuming an incomplete run
 
-Every run writes into its own freshly-named folder
-(`OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/`).  If a run stops before
-it finishes — a step failed, the machine ran out of resources, or someone
-stopped it — the folder it started is not lost and you do *not* have to
-start a brand new run from scratch: re-run with `--resume-dir` pointing at
-that folder:
+Every run writes under its own freshly-named project parent
+(`OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/`), with the user-ready data
+in the sample folder `<pool>/` inside it (pool name inferred from the FASTQ
+filenames).  If a run stops before it finishes — a step failed, the machine
+ran out of resources, or someone stopped it — the folder it started is not
+lost and you do *not* have to start a brand new run from scratch: re-run
+with `--resume-dir` pointing at the sample folder inside that parent:
 
 ```bash
 ./brbseq_pipeline.sh \
     --species mouse \
     --r1  /data/POOL/S1_R1_001.fastq.gz \
     --r2  /data/POOL/S1_R2_001.fastq.gz \
-    --resume-dir /data/BRBseq_output/BRBseq_Alireza_20261020_134512
+    --resume-dir /data/BRBseq_output/BRBseq_Alireza_20261020_134512/Lib_01
 ```
 
 - No new timestamped folder is created; the same folder the original run
   used is continued in place.
+- Pre-v1.2.0 single-tier folders (pointing directly at
+  `BRBseq_<name>_<timestamp>`) still work; the script keeps the report
+  grids in their old location inside that folder.
 - Each step checks whether its own output files already exist before doing
   anything, so steps the original run finished are simply skipped — you
   don't need to know which step failed or where to look for it.
@@ -331,7 +378,7 @@ that folder:
 
 ## Status
 
-`SCRIPT_VERSION="1.1.0"` (in `brbseq_pipeline.sh`) — the current, working
+`SCRIPT_VERSION="1.2.0"` (in `brbseq_pipeline.sh`) — the current, working
 version of the pipeline.  The first real-pool deployment (against an
 AVT0608/AVT0615-style pool) is built on top of this baseline.  See **Changelog**
 above for what each release shipped; reference changes by feature or date (not
