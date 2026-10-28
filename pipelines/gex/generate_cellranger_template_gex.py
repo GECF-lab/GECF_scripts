@@ -31,12 +31,19 @@ Key differences from the arc/atac generators:
   * Archive destination:
     `/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count/` (arc: `arc/`,
     atac: `atac/`). The `count/` subfolder already exists on the server.
+  * Parallelism: each sample is a self-contained `count_sample <i>()`
+    function.  The dispatcher runs them either serially
+    (`max_parallel=1`) or in batches of `max_parallel` at a time
+    (`&` + `wait -n`), each sample still capped by its own
+    `--localcores`/`--localmem`.  The default (3) is sized for a
+    128-core / ~500 GB box: 3 x 32 cores, 3 x 126 GB.
 """
 
 import argparse
 import os
 import re
 import sys
+import time
 import unicodedata
 import warnings
 from collections import Counter, defaultdict
@@ -65,8 +72,8 @@ from common.intake import (  # noqa: E402
     NGS_BASE_DIR_TEMPLATE,
     AVT_PATTERN,
     FASTQ_ID_PATTERN,
-    LOCAL_CORES,        # cellranger --localcores (shared default "44")
-    LOCAL_MEM,          # cellranger --localmem   (shared default "150")
+    LOCAL_CORES,        # cellranger --localcores (shared default "32")
+    LOCAL_MEM,          # cellranger --localmem   (shared default "126")
     norm,
     build_merged_cell_lookup,
     get_cell_value,
@@ -75,6 +82,9 @@ from common.intake import (  # noqa: E402
     setup_readline_completer,
     ask_avt_run,
     ask_reference_genome,
+    ask_sample_selection,
+    choose_sample_dir,      # sample-level run-folder disambiguation (AVT0551)
+    list_sample_dirs,       # ... list every candidate sample dir for an AVT
 )
 
 HUMAN_GENOME_PATH = (
@@ -85,6 +95,16 @@ MOUSE_GENOME_PATH = (
     "/home/gecf/references/cellranger_references/current_mouse/"
     "refdata-gex-GRCm39-2024-A"
 )
+# Combined human+mouse reference (single reference usable for a mix of
+# human and mouse samples) — offered as extra choice 3 in the genome
+# prompt.  The directory is a shared convention on the analysis server;
+# if it is absent on the caller's box, choice 3 is still listed (the
+# interactive menu does not probe the filesystem) — the generated script
+# will then fail its reference-genome existence check, which is the same
+# behaviour as choosing a custom path that does not exist yet.
+HUMAN_MOUSE_GENOME_PATH = (
+    "/home/gecf/references/cellranger_references/current_human_and_mouse"
+)
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
 
 # Root on the *analysis* server where cellranger count output + post-processing
@@ -92,6 +112,39 @@ NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
 # path; on the dev box it is not expected to exist. Never derive from $PWD —
 # the script must land in the same place regardless of the caller's cwd.
 SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
+
+# ---------------------------------------------------------------------------
+# TSO% library-quality helper (pipelines/common/TSO_percent.sh)
+# The body of `tso_percent()` is inlined once per generated script so the
+# analysis server needs no runtime dependency on this repo.
+# ---------------------------------------------------------------------------
+_TSO_HELPER_PATH = os.path.join(_PIPELINES_ROOT, "common", "TSO_percent.sh")
+
+
+def _load_tso_helper_body() -> str:
+    """Return the region of ``pipelines/common/TSO_percent.sh`` up to the
+    ``# %%EMBED-END%%`` marker (the ``tso_percent()`` function and its
+    comments, WITHOUT the standalone-runner footer).
+
+    Returns a warning string if the file is absent so the generated script
+    still runs — the TSO% call will be skipped with a clear message.
+    """
+    if not os.path.isfile(_TSO_HELPER_PATH):
+        return (
+            "echo 'WARNING: pipelines/common/TSO_percent.sh not found "
+            f"(expected: {_TSO_HELPER_PATH}); tso_percent() will be a no-op.' >&2\n"
+            "tso_percent() { :; }"
+        )
+    with open(_TSO_HELPER_PATH, encoding="utf-8") as fh:
+        text = fh.read()
+    marker = "# %%EMBED-END%%"
+    pos = text.rfind(marker)  # last occurrence, in case a comment mentions it
+    if pos == -1:
+        return text.rstrip()
+    return text[:pos].rstrip()
+
+
+_TSO_HELPER_BODY = _load_tso_helper_body()
 
 
 def folder_safe(name: str) -> str:
@@ -292,18 +345,21 @@ def print_pairs_table(pairs):
     print(sep)
 
 
-def find_fastq_path(avt_run, fastq_id):
-    """Search recursively under the run base dir for a directory named
-    `fastq_id`. Returns full path if found, else None (so the generated
-    script can fall back to a FIXME_LOCATE_ marker)."""
-    base_dir = NGS_BASE_DIR_TEMPLATE.format(avt_run=avt_run)
-    if not os.path.isdir(base_dir):
-        return None
-    for root, dirnames, _ in os.walk(base_dir):
-        for d in dirnames:
-            if d == fastq_id:
-                return os.path.join(root, d)
-    return None
+def find_fastq_path(avt_run, fastq_id, preferred_sample_dir=None):
+    """Search under the run base dir for a directory named ``fastq_id``.
+
+    ``preferred_sample_dir`` (a sample dir the user picked in the run-folder
+    disambiguation menu, or ``None``) is honoured first: ``preferred/<id>``
+    is checked before falling back to a full walk of the AVT tree.  This is
+    what pins ``avidNNNNN`` into the correct run sub-folder when the same
+    sample name exists under ``1_wrong_index_...`` AND
+    ``2_corrected_indexes_...`` (the AVT0551 case).  Returns the full path
+    if found, else None (so the generated script emits a FIXME_LOCATE_
+    marker).
+    """
+    from common.intake import find_fastq_path_with_pref
+    return find_fastq_path_with_pref(avt_run, fastq_id,
+                                     preferred_sample_dir=preferred_sample_dir)
 
 
 #: Per-sample knobs emitted at the top of the generated bash script.
@@ -311,51 +367,54 @@ def find_fastq_path(avt_run, fastq_id):
 #:  - default_value ""  -> user can fill, blank by default (flag omitted when blank)
 #:  - default_value "true"/"false" -> both values accepted; user flips
 #:  - default_value <number> -> user can change
-#: Old CRcount parity: each of these was a per-sample column in the
-#: ``CR_count_datasheet`` (expect/force-cells mutual exclusion preserved).
+#: Comments are user-facing: they describe what the user may type, so be
+#: explicit about allowed values instead of referring to the flag.
 _PER_SAMPLE_PARAMS = (
-    ("localcores",      LOCAL_CORES, "blank => Unrestricted (no --localcores flag)"),
-    ("localmem",        LOCAL_MEM,   "blank => Unrestricted (no --localmem flag)"),
-    ("include_introns", "true",      "blank => omit (auto) ;  true / false"),
-    ("create_bam",      "true",      "blank => omit (auto) ;  true / false"),
-    ("chemistry",       "",          "blank => auto-detect"),
-    ("expect_cells",    "",          "blank => omit  (MUTUALLY EXCLUSIVE with force_cells)"),
-    ("force_cells",     "",          "blank => omit  (MUTUALLY EXCLUSIVE with expect_cells)"),
-    ("r1_length",       "",          "blank => auto-detect"),
-    ("r2_length",       "",          "blank => auto-detect"),
-    ("custom_options",  "",          "free cellranger flags (old: count_special_settings)"),
+    ("localcores",      LOCAL_CORES,
+     "max cores; blank => cellranger default"),
+    ("localmem",        LOCAL_MEM,
+     "max GB of memory; blank => cellranger default"),
+    ("include_introns", "true",
+     "true = count intronic reads (default); false = exonic reads only"),
+    ("create_bam",      "true",
+     "true = emit aligned BAM to outs/ (default); false = faster + smaller output"),
+    ("chemistry",       "",
+     "blank = auto-detect (default); see header for explicit values"),
+    ("expect_cells",    "",
+     "expected number of cells; blank = cellranger estimates it (default)"),
+    ("force_cells",     "",
+     "keep exactly this many cells (overrides auto cell-calling); "
+     "MUTUALLY EXCLUSIVE with expect_cells"),
+    ("r1_length",       "",
+     "trim Read 1 to this length in bases; blank = full read (default)"),
+    ("r2_length",       "",
+     "trim Read 2 to this length in bases; blank = full read (default)"),
+    ("custom_options",  "",
+     "extra flags passed through as-is; see header for examples"),
 )
 
 
-def build_script_full(reference_genome, pairs, user=""):
+def build_script_full(reference_genome, pairs, user="", source_files=None,
+                      chosen_sample_dirs=None, added_paths=None):
     """Build the complete `cellranger count` bash script (GEX).
 
     Layout (top -> bottom):
-      1. Constants (timestamp, reference genome).
-      2. Per-sample parameter variables (one block per sample),
+      1. Header / constants (timestamp, reference genome).
+      2. RUN-WIDE PARAMETERS — one editable block at the top of the script:
+         keepdata, scratch_root, server_folder_name, NGSruns_archive, and
+         the per-sample FASTQ path_* variables (resolved at generation time).
+      3. Per-sample parameter variables (one block per sample),
          editable in place; blank a value to drop the flag for that sample.
-      3. Validation: ``--expect-cells`` and ``--force-cells`` are mutually
-         exclusive per CRcount v2.4; if both are non-blank for any
-         sample the script exits 1 *before* any side effects.
-      4. Side effects: working dir, NGS-runs archive dir, reference
-         genome existence check, FASTQ path resolution.
-      5. One `cellranger count` call per sample, each using its own
+      4. Validation: ``--expect-cells`` and ``--force-cells`` are mutually
+         exclusive per sample; if both are non-blank the script exits 1
+         *before* any side effects.
+      5. Side effects: working dir + archive dir creation, reference
+         genome existence check (values come from the block in 2.).
+      6. One `cellranger count` call per sample, each using its own
          *_<idx> variables.
-      6. Post-processing: merge per-sample ``summary.csv`` into one
+      7. Post-processing: merge per-sample ``summary.csv`` into one
          ``all_summary.csv`` under ``<avt>_Summaries/``.
-      7. rsync the working dir up to the shared NGS-runs archive.
-
-    Old-CRcount parity (recovered):
-      * ``--cell-annotation-model=auto``
-        (the sibling arc/atac generators already emit this; GEX lost it
-         when it was rewritten to consume the Excel intake)
-      * ``--tenx-cloud-token-path=/home/gecf/.config/txg/credentials``
-      * ``--sample=<name>`` alongside ``--id``
-      * Per-sample ``--chemistry`` / ``--expect-cells`` /
-        ``--force-cells`` / ``--include-introns`` / ``--create-bam`` /
-        ``--localcores`` / ``--localmem`` / ``--r1-length`` /
-        ``--r2-length`` and a free ``--flags`` string
-        (old: ``count_special_settings``)
+      8. rsync the working dir up to the shared NGS-runs archive.
     """
     lines = []
 
@@ -369,104 +428,83 @@ def build_script_full(reference_genome, pairs, user=""):
     n = len(unique_samples)
 
     # ---- 1) header / constants ----
+    gen_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     lines.append("#!/bin/bash")
     lines.append(f"# cellranger count — GEX-only ({main_avt})")
     lines.append("# Generated by generate_cellranger_template_gex.py "
                  f"({n} sample(s)).")
+    lines.append(f"# Generated at: {gen_stamp}")
+    _srcs = source_files or []
+    if _srcs:
+        lines.append("# Source file(s):")
+        for _s in _srcs:
+            lines.append(f"#   {os.path.basename(_s)}")
+    else:
+        lines.append("# Source file(s): (not provided)")
     lines.append(f"# Requester: {user or 'n/a'}")
-    lines.append("# Restored from old CRcount: --cell-annotation-model=auto, "
-                 "--tenx-cloud-token-path, --sample, per-sample knobs,")
-    lines.append("# and the expect-cells / force-cells mutual-exclusion rule.")
     lines.append("")
-    lines.append("TIMESTAMP=$(date +%Y%m%d-%H%M%S)")
+    lines.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
     lines.append(f"reference_genome_used={reference_genome}")
     lines.append("")
 
-    # ---- 2) per-sample parameter variables (editable) ----
-    lines.append("# ============================================================")
-    lines.append("# PER-SAMPLE PARAMETERS  (one block per sample)")
-    lines.append("# ----------------------------------------------------------------")
-    lines.append('#   * blank a value  ( value="" )  -> flag is dropped for that sample')
-    lines.append("#   * number / text -> emitted as --flag=<value>")
-    lines.append("#   * localcores / localmem : blank = Unrestricted  (cellranger default)")
-    lines.append("#   * include_introns / create_bam : blank = omit  (cellranger auto);")
-    lines.append("#                                     default is \"true\" (old behavior)")
-    lines.append("#   * expect_cells and force_cells are MUTUALLY EXCLUSIVE,")
-    lines.append("#     per the old CRcount rule. Both non-blank => this script exit 1s.")
-    lines.append("#   * custom_options: free-form string of extra --flags, untouched")
-    lines.append("#     (blank for none; otherwise passed as-is)")
-    lines.append("# ============================================================")
-    for idx, sn in enumerate(unique_samples, start=1):
-        lines.append("")
-        lines.append(f"# --- Sample {idx}: {sn} ---")
-        for suffix, default, comment in _PER_SAMPLE_PARAMS:
-            base = f'{suffix}_{idx}="{default}"'
-            pad = max(1, 60 - len(base))
-            lines.append(f"{base}   {' ' * pad}# {comment}")
-    lines.append("")
-
-    # ---- 3) validation (MUST run before any side effects) ----
-    lines.append("# ===== VALIDATION: --expect-cells vs --force-cells are mutually exclusive (old CRcount rule) =====")
-    lines.append("_vfail=0")
-    for i in range(1, n + 1):
-        lines.append(f'if [[ -n "${{expect_cells_{i}:-}}" && -n "${{force_cells_{i}:-}}" ]]; then')
-        lines.append(f'    echo "ERROR: sample {i} has both expect_cells_{i} and force_cells_{i} set. Pick one; clear the other." >&2')
-        lines.append("    _vfail=1")
-        lines.append("fi")
-    lines.append("if [[ ${_vfail} -ne 0 ]]; then")
-    lines.append('    echo "Aborting: expect-cells / force-cells are mutually exclusive per sample (old CRcount rule). See errors above." >&2')
-    lines.append("    exit 1")
-    lines.append("fi")
-    lines.append("")
-
-    # ---- 4) side effects (working dirs, archive, reference presence, FASTQ paths) ----
+    # ---- 2) run-wide parameters (defaults, editable at the top) ----
     # Requester tag, reduced to a safe path-segment (accented names like
     # "Cèsar" -> "Cesar").  Empty/sanitized-blank requester -> the whole
-    # " _<user>" segment is omitted so we never emit a stray underscore.
+    # "_<user>" segment is omitted so we never emit a stray underscore.
     folder_user = folder_safe(user)
     user_tag = "_" + folder_user if folder_user else ""
-    # Working dir: FIXED root on the analysis server (see SCRATCH_ROOT),
-    # never derived from $PWD so the output lands identically whichever
-    # directory the script is launched from.
-    lines.append("# Working directory: cellranger count output + post-processing (fixed root, arc convention)")
+    lines.append("# ============================================================")
+    lines.append("# RUN-WIDE PARAMETERS  (defaults — edit here)")
+    lines.append("# ----------------------------------------------------------------")
+    lines.append('#   keepdata : "yes" = keep the local working folder after the run;')
+    lines.append('#               "no"  = delete it (data already rsynced to the archive).')
+    lines.append('keepdata="no"')
+    lines.append('#   max_parallel : how many cellranger counts to run at the same time.')
+    lines.append('#   1 = serial (one sample after another, previous behaviour).')
+    lines.append('#   N>1 = rolling pool of N jobs: sample 1..N start first; whenever one')
+    lines.append('#          finishes the next one starts until all samples are done.')
+    lines.append('#   Each sample still caps its own CPU (--localcores_<#>) and RAM')
+    lines.append('#   (--localmem_<#>): default 32 cores / 126 GB, so max_parallel=3')
+    lines.append('#   tops out at 96 cores and 378 GB — set max_parallel=1 to disable.')
+    lines.append('max_parallel=3')
+    lines.append("#   scratch_root : root on the analysis server where cellranger count")
+    lines.append("#                  output is written (fixed convention — change only if")
+    lines.append("#                  the mount point differs on your server).")
     lines.append(f'scratch_root="{SCRATCH_ROOT}"')
+    lines.append("#   server_folder_name : working + archive leaf folder name.")
+    lines.append("#                  default is <AVT>[_user]_<timestamp>; change only if needed.")
     lines.append(f'server_folder_name="{main_avt}{user_tag}_$TIMESTAMP"')
-    lines.append('Server_folder="${scratch_root}/${server_folder_name}"')
-    lines.append('mkdir -vp "${Server_folder}"')
-    lines.append("")
-    lines.append("# Central archive destination (fixed target, shared with arc/atac)")
-    lines.append("NGSruns_archive=" + NGSruns_ARCHIVE_DIR)
-    lines.append('mkdir -p "${NGSruns_archive}/${server_folder_name}"')
-    lines.append("NGSruns_folder=${NGSruns_archive}/${server_folder_name}")
-    lines.append("")
-    lines.append("# Local workdir cleanup (old CRcount keepdata semantics).")
-    lines.append('#   After deploy to the archive, the local working folder is')
-    lines.append('#   deleted UNLESS keepdata="yes".')
-    lines.append('keepdata=""')
-    lines.append("")
-    lines.append("# Check that the reference genome directory exists")
-    lines.append('if [[ ! -d "${reference_genome_used}" ]]; then')
-    lines.append('    echo "Reference genome ${reference_genome_used} does not exist. Aborting." >&2')
-    lines.append("    exit 1")
-    lines.append("fi")
-    lines.append("")
-    lines.append("# ---- FASTQ path resolution (auto-detected where possible) ----")
-    lines.append("# Generated by the script at generation time:")
-    lines.append("#   /mnt/PTEGraw/AA/NGSruns/AVT/AV240401/<run>/<avt_fastq_id>/")
-    lines.append("# where <run> is the AVT run that carried the sample; if a")
-    lines.append("# sample is in multiple AVT runs, the first one (by pair order)")
-    lines.append("# is used. FIXME_LOCATE_ markers mean the generator could not")
-    lines.append("# find the folder — set those path_*_N variables by hand.")
+    lines.append("#   NGSruns_archive  : central archive destination (shared with arc/atac;")
+    lines.append("#                  fixed target).")
+    lines.append(f'NGSruns_archive="{NGSruns_ARCHIVE_DIR}"')
+    lines.append("#   FASTQ paths : one per (sample, FASTQ) pair, resolved by the generator")
+    lines.append("#                  at generation time under the AVT run tree.")
+    lines.append("#                  If a sample name exists in SEVERAL run sub-folders,")
+    lines.append("#                  the generator asks which folder to use before")
+    lines.append("#                  resolving — the FASTQ then lands inside the chosen")
+    lines.append("#                  folder (e.g. corrected indexes vs other folders).")
+    lines.append("#                  FIXME_LOCATE_ markers mean the generator could not find")
+    lines.append("#                  the folder — set that path_* variable by hand.")
 
     any_missing = False
+    per_sample_dir = {sn: chosen_sample_dirs.get(sn)
+                      for sn in unique_samples} if chosen_sample_dirs else {}
     for idx, sn in enumerate(unique_samples, start=1):
         fastqs = samples_to_fastqs[sn]
         lines.append("")
-        lines.append(f"# --- Sample {idx}: {sn} ({len(fastqs)} FASTQ(s)) ---")
+        lines.append(f"# --- FASTQ paths — Sample {idx}: {sn} ({len(fastqs)} FASTQ(s)) ---")
         for fq, avt in fastqs:
             run_part = avt or main_avt
             base_dir = NGS_BASE_DIR_TEMPLATE.format(avt_run=run_part)
-            resolved = find_fastq_path(run_part, fq)
+            # Per-sample chosen folder pins the run sub-folder (AVT0551's
+            # corrected-vs-other case).  The helper below re-checks that the
+            # chosen dir actually lives under this run's base before using
+            # it, then falls back to a full walk otherwise — so we can pass
+            # the sample's chosen dir unconditionally.
+            chosen = per_sample_dir.get(sn)
+            resolved = added_paths.get(fq) if added_paths else None
+            if not resolved:
+                resolved = find_fastq_path(run_part, fq, chosen)
             if resolved:
                 lines.append(f"path_{idx}_{fq}={resolved}")
             else:
@@ -485,11 +523,102 @@ def build_script_full(reference_genome, pairs, user=""):
         print("  Note: some base dirs are not on this machine —", file=sys.stderr)
         print("  all flagged path_* variables (FIXME_LOCATE_ markers) must be set before running.",
               file=sys.stderr)
+    lines.append("")
 
-    # ---- 5) one cellranger count per sample, each with its old-CRcount
+    # ---- 3) per-sample parameter variables (editable) ----
+    lines.append("# ============================================================")
+    lines.append("# PER-SAMPLE PARAMETERS  (one block per sample)")
+    lines.append("# ----------------------------------------------------------------")
+    lines.append("#   * How to set:")
+    lines.append("#       - blank a value ( value=\"\" )  -> flag DROPPED for that sample")
+    lines.append("#       - number / text -> emitted as --flag=<value>")
+    lines.append("#       - leave a default as-is to keep it")
+    lines.append("#   * Allowed values (chemistry is the only one with a fixed list):")
+    lines.append("#     localcores      : number of cores, or blank")
+    lines.append("#     localmem        : memory in GB, or blank")
+    lines.append("#     include_introns: true | false")
+    lines.append("#     create_bam     : true | false")
+    lines.append("#     chemistry      : threeprime | fiveprime | SC3Pv1 | SC3Pv2 | SC3Pv3 |")
+    lines.append("#                     SC3Pv4 | SC3Pv3HT | SC5P-PE | SC5P-PE-v3 | SC5P-R2 |")
+    lines.append("#                     SC5P-R2-v3 | SC-FB | ARC-v1, or blank (auto-detect)")
+    lines.append("#     expect_cells   : expected number of cells, or blank")
+    lines.append("#     force_cells    : number of cells to keep, or blank")
+    lines.append("#     r1_length      : length for Read 1 in bases, or blank")
+    lines.append("#     r2_length      : length for Read 2 in bases, or blank")
+    lines.append("#     custom_options : extra flags as-is, e.g. --nosecondary --localvmem=300")
+    lines.append("#   * expect_cells and force_cells are MUTUALLY EXCLUSIVE.")
+    lines.append("#     Both non-blank => this script exit 1s.")
+    lines.append("#   * chemistry blank = cellranger auto-detects the assay (recommended).")
+    lines.append("#     Set only if auto-detection fails. ARC (Multiome GEX) = ARC-v1.")
+    lines.append("# ============================================================")
+    for idx, sn in enumerate(unique_samples, start=1):
+        lines.append("")
+        lines.append(f"# --- Sample {idx}: {sn} ---")
+        for suffix, default, comment in _PER_SAMPLE_PARAMS:
+            base = f'{suffix}_{idx}="{default}"'
+            pad = max(1, 60 - len(base))
+            lines.append(f"{base}   {' ' * pad}# {comment}")
+    lines.append("")
+
+    # ---- 4) validation (MUST run before any side effects) ----
+    lines.append("# ===== VALIDATION: --expect-cells vs --force-cells are mutually exclusive =====")
+    lines.append("_vfail=0")
+    for i in range(1, n + 1):
+        lines.append(f'if [[ -n "${{expect_cells_{i}:-}}" && -n "${{force_cells_{i}:-}}" ]]; then')
+        lines.append(f'    echo "ERROR: sample {i} has both expect_cells_{i} and force_cells_{i} set. Pick one; clear the other." >&2')
+        lines.append("    _vfail=1")
+        lines.append("fi")
+    lines.append("if [[ ${_vfail} -ne 0 ]]; then")
+    lines.append('    echo "Aborting: expect-cells / force-cells are mutually exclusive per sample. See errors above." >&2')
+    lines.append("    exit 1")
+    lines.append("fi")
+    lines.append("")
+
+    # ---- 5) side effects (working dirs, archive, reference presence) ----
+    # Values come from the RUN-WIDE PARAMETERS block at the top of the
+    # script (edit there if a path differs on your server).
+    lines.append("# Working directory: cellranger count output + post-processing (from RUN-WIDE PARAMETERS block)")
+    lines.append('Server_folder="${scratch_root}/${server_folder_name}"')
+    lines.append('mkdir -vp "${Server_folder}"')
+    lines.append("")
+    lines.append('mkdir -p "${NGSruns_archive}/${server_folder_name}"')
+    lines.append("NGSruns_folder=${NGSruns_archive}/${server_folder_name}")
+    lines.append("")
+    lines.append("# Check that the reference genome directory exists")
+    lines.append('if [[ ! -d "${reference_genome_used}" ]]; then')
+    lines.append('    echo "Reference genome ${reference_genome_used} does not exist. Aborting." >&2')
+    lines.append("    exit 1")
+    lines.append("fi")
+    lines.append("")
+
+    # ---- 5a) tso_percent() helper body — inlined from
+    #          pipelines/common/TSO_percent.sh so the generated .sh is
+    #          self-contained on the analysis server (no repo dependency at
+    #          run time).  Edit the .sh and regenerate to change behaviour ----
+    lines.append("")
+    lines.append("# ==============================================================================")
+    lines.append("# tso_percent helper (from pipelines/common/TSO_percent.sh, embedded verbatim)")
+    lines.append("# Computes Read-2 percentage metrics: intact TSO, intact SMART, polyA/polyT tails.")
+    lines.append("# ==============================================================================")
+    lines.extend(_TSO_HELPER_BODY.splitlines())
+
+    # ---- 6) one cellranger count per sample, each with its old-CRcount
     #          post-processing (SC tree cleanup, completion check, per-sample
     #          deploy, md5 checksums) ----
     _CONT = " \\"    # bash line-continuation used between flags
+    lines.append("# ============================================================")
+    lines.append("# PER-SAMPLE FUNCTIONS  (one count_sample_<i>() per sample)")
+    lines.append("#   Each function is the old inline per-sample block:")
+    lines.append("#     * cellranger count - flags from the *_<idx> variables above;")
+    lines.append("#       a blank value drops that flag for that sample only")
+    lines.append("#     * completion check: find <sample> -type d -name tmp")
+    lines.append("#     * post-processing: rm -r <sample>/SC_RNA_COUNTER_CS")
+    lines.append("#     * rsync -avh <sample>/ + logs + md5 checksums -> the archive")
+    lines.append("#     * TSO% library-quality metric (Read-2)")
+    lines.append("#   The DISPATCH section below runs the functions either serially")
+    lines.append("#   (max_parallel=1) or in a rolling pool of max_parallel jobs.")
+    lines.append("# ============================================================")
+    lines.append("")
     for idx, sn in enumerate(unique_samples, start=1):
         fastqs = samples_to_fastqs[sn]
         numbered_dir = f"{idx:02d}_{sn}_GEX"
@@ -505,12 +634,11 @@ def build_script_full(reference_genome, pairs, user=""):
             '    --fastqs="' + fq_paths + '"',
             '    --cell-annotation-model=auto',
             '    --tenx-cloud-token-path="/home/gecf/.config/txg/credentials"',
-            '    --output="' + SFR + '/' + numbered_dir + '"',
+            '    --output-dir="' + SFR + '/' + numbered_dir + '"',
         ]
         # Per-sample conditional knobs. Blank value -> flag omitted for this
         # sample only. custom_options is deliberately UNQUOTED on the last
-        # line so it word-splits into multiple --flags (old CRcount
-        # count_special_settings behavior).
+        # line so it word-splits into multiple --flags.
         for suffix, _default, _comment in _PER_SAMPLE_PARAMS:
             v = f"{suffix}_{idx}"
             if suffix == "custom_options":
@@ -519,17 +647,9 @@ def build_script_full(reference_genome, pairs, user=""):
                 flag = "--" + suffix.replace("_", "-")
                 flag_lines.append(f"    ${{{v}:+{flag}=${v}}}")
 
-        lines.append("# ============================================================")
-        lines.append(f"# EXECUTE  (one cellranger count per sample; each pulls from")
-        lines.append("# its own *_<idx> parameters above; the flag is only emitted")
-        lines.append("# when that variable is non-blank)")
-        lines.append("# Per-sample post-processing replicates old CRcount:")
-        lines.append("#   rm -r <sample>/SC_RNA_COUNTER_CS")
-        lines.append("#   find <sample> -type d -name tmp  (completion check)")
-        lines.append("#   rsync -avh <sample>/ + logs + md5 checksums -> archive")
-        lines.append("# ============================================================")
         lines.append("")
         lines.append(f"# --- Run sample {idx}: {sn} ---")
+        lines.append("function count_sample_" + str(idx) + "() {")
         lines.append(
             'echo "cellranger count --id=' + sn + ' --sample=' + sn
             + ' ... (see full command below)" '
@@ -539,7 +659,7 @@ def build_script_full(reference_genome, pairs, user=""):
         for i, fl in enumerate(flag_lines):
             lines.append(fl + (_CONT if i < len(flag_lines) - 1 else ""))
 
-        # Old CRcount per-sample post-processing.
+        # Per-sample post-processing.
         lines.append("")
         lines.append(f"# --- Post-processing sample {idx}: {sn} ---")
         lines.append(
@@ -565,9 +685,8 @@ def build_script_full(reference_genome, pairs, user=""):
         lines.append(
             'rsync -avh "' + SFR + '/' + numbered_dir + '_error_log.txt" "${NGSruns_folder}" 2>/dev/null'
         )
-        # md5 checksum (old CRcount: cd into sample dir, find -type f, xargs md5sum,
-        # output file is SIBLING to the sample dir with relative ./ paths inside)
-        lines.append("# md5 checksum (old CRcount)")
+        # md5 checksum (output is SIBLING to the sample dir with relative ./ paths inside)
+        lines.append("# md5 checksum")
         lines.append(
             '( cd "' + SFR + '/' + numbered_dir
             + '" && find . -type f | sort'
@@ -576,22 +695,144 @@ def build_script_full(reference_genome, pairs, user=""):
         lines.append(
             'rsync -avh "' + SFR + '/' + numbered_dir + '_md5_checksums.txt" "${NGSruns_folder}"'
         )
+
+        # ---- TSO% library-quality metric ------------------------------------
+        # Compute intact-TSO / intact-SMART / polyA / polyT fractions on a
+        # DOWNSAMPLING-sized sample of Read-2 sequences.  The R2 fastq is
+        # auto-discovered from the resolved fastq path:
+        #   * if it is already a file ending in *_R2_* — use it directly
+        #   * otherwise take the first *_R2_* file in the dir (one avid
+        #     folder holds exactly one R1 + one R2, so first == only)
+        # The report body is echoed AND written to a <sample>_tso_report.txt
+        # file (rsync'd to the NGSruns archive alongside the other per-sample
+        # artifacts).
+        if fastqs:
+            _fq0_var = "path_%d_%s" % (idx, fastqs[0][0])
+            tags = numbered_dir
+            lines.append("")
+            lines.append("# TSO% library-quality metric (Read-2 only) — intact TSO/SMART + poly tails")
+            lines.append(f'_fq="${{{_fq0_var}}}"')
+            lines.append('_TAGS="%s"' % tags)
+            lines.append('if [ ! -f "${_fq}" ]; then')
+            lines.append('    for _c in "${_fq}"/*_R2_*.fastq.gz "${_fq}"/*_R2.fastq.gz; do')
+            lines.append('        [ -f "${_c}" ] && { _fq="${_c}"; break; }')
+            lines.append("    done")
+            lines.append("fi")
+            lines.append('if [ -f "${_fq}" ]; then')
+            lines.append(f'    _tso_report="{SFR}/${{_TAGS}}_tso_report.txt"')
+            lines.append('    tso_percent "${_fq}" "${_TAGS}" | tee "${_tso_report}"')
+            lines.append(f'    rsync -avh "{SFR}/${{_TAGS}}_tso_report.txt" "${{NGSruns_folder}}" 2>/dev/null || true')
+            lines.append("else")
+            lines.append(f'    echo "tso: no Read-2 fastq found near ${{{_fq0_var}}}; TSO% step skipped." >&2')
+            lines.append("fi")
+        lines.append("}")
         lines.append("")
 
-    # ---- 6) extract_summary_metrics (old CRcount parity) ----
+    # ---- 6b) DISPATCH + per-sample status report ----
+    _N = len(unique_samples)
+    _DASH = "# --------------------------------------------------------"
+    lines.append(_DASH)
+    lines.append("# DISPATCH  (run count_sample_1 .. count_sample_" + str(_N) + ")")
+    lines.append("#   max_parallel=1 : serial, one sample after another (previous behaviour)")
+    lines.append("#   max_parallel=N : rolling pool of N concurrent cellranger counts; the")
+    lines.append("#                    next sample starts as soon as one slot frees up")
+    lines.append("#   Per-sample resource caps still apply (--localcores_<i> / --localmem_<i>),")
+    lines.append("#   so max_parallel=3 @ defaults (32 cores / 126 GB) tops out at 96 cores /")
+    lines.append("#   378 GB - within the 128-core / ~500 GB analysis box.")
+    lines.append(_DASH)
+    lines.append("NSAMPLES=" + str(_N))
+    lines.append('case "${max_parallel}" in')
+    lines.append("    ''|*[!0-9]*)")
+    lines.append('        echo "ERROR: max_parallel must be a positive integer" >&2')
+    lines.append("        exit 1")
+    lines.append("    ;;")
+    lines.append("esac")
+    lines.append('if [ "${max_parallel}" -lt 1 ] || [ "${max_parallel}" -gt "${NSAMPLES}" ]; then')
+    lines.append('    echo "ERROR: max_parallel must be between 1 and ${NSAMPLES}" >&2')
+    lines.append("    exit 1")
+    lines.append("fi")
+    lines.append("")
+    lines.append('if [ "${max_parallel}" -eq 1 ]; then')
+    lines.append("    # --- SERIAL ---")
+    lines.append("    for ((_s = 1; _s <= ${NSAMPLES}; _s++)); do")
+    lines.append("        count_sample_${_s}")
+    lines.append("    done")
+    lines.append("else")
+    lines.append("    # --- ROLLING POOL OF ${max_parallel} CONCURRENT JOBS ---")
+    lines.append("    # Slot arrays: _pids[_i] holds the background PID, _idxs[_i] the sample.")
+    lines.append("    declare -a _pids=() _idxs=()")
+    lines.append("    for ((_i = 0; _i < ${max_parallel}; _i++)); do")
+    lines.append('        _pids[$_i]=""')
+    lines.append("        _idxs[$_i]=0")
+    lines.append("    done")
+    lines.append("    _next=1")
+    lines.append("    while :; do")
+    lines.append("        # 1) reap finished slots")
+    lines.append("        for ((_i = 0; _i < ${max_parallel}; _i++)); do")
+    lines.append('            if [ -n "${_pids[$_i]}" ] && ! kill -0 "${_pids[$_i]}" 2>/dev/null; then')
+    lines.append('                wait "${_pids[$_i]}"')
+    lines.append("                _rv=$?")
+    lines.append('                echo "[REAP] sample #${_idxs[$_i]} finished (rc=${_rv})"')
+    lines.append('                _pids[$_i]=""')
+    lines.append("            fi")
+    lines.append("        done")
+    lines.append("        # 2) fill free slots with the next sample (if any left)")
+    lines.append("        _launched=0")
+    lines.append("        for ((_i = 0; _i < ${max_parallel}; _i++)); do")
+    lines.append('            if [ -z "${_pids[$_i]}" ] && [ "${_next}" -le "${NSAMPLES}" ]; then')
+    lines.append("                count_sample_${_next} &")
+    lines.append("                _pids[$_i]=$!")
+    lines.append("                _idxs[$_i]=${_next}")
+    lines.append("                _next=$(( _next + 1 ))")
+    lines.append("                _launched=1")
+    lines.append("            fi")
+    lines.append("        done")
+    lines.append("        # 3) exit when all samples launched AND all jobs reaped")
+    lines.append("        _busy=0")
+    lines.append("        for ((_i = 0; _i < ${max_parallel}; _i++)); do")
+    lines.append('            [ -n "${_pids[$_i]}" ] && _busy=1')
+    lines.append("        done")
+    lines.append('        if [ "${_next}" -gt "${NSAMPLES}" ] && [ "${_busy}" -eq 0 ]; then')
+    lines.append("            break")
+    lines.append("        fi")
+    lines.append("        # all slots busy and more samples remain: give them a moment")
+    lines.append('        if [ "${_launched}" -eq 0 ] && [ "${_next}" -le "${NSAMPLES}" ]; then')
+    lines.append("            sleep 1")
+    lines.append("        fi")
+    lines.append("    done")
+    lines.append("fi")
+    lines.append("")
+    # Per-sample status report - each sample's own completion markers:
+    #   *_error_log.txt non-empty    -> cellranger left a "tmp" dir behind on failure
+    #   no outs/metrics_summary.csv  -> cellranger count never completed
+    lines.append("# Per-sample status report (from each sample's own completion markers)")
+    lines.append("_overall_rc=0")
+    _dirs_bash = " ".join('"{:02d}_{}_GEX"'.format(i, s) for i, s in enumerate(unique_samples, 1))
+    lines.append("for _d in " + _dirs_bash + "; do")
+    lines.append('    if [ -s "${Server_folder}/${_d}_error_log.txt" ]; then')
+    lines.append('        echo "[FAIL] ${_d}  (see ${Server_folder}/${_d}_error_log.txt)" >&2')
+    lines.append("        _overall_rc=1")
+    lines.append('    elif [ ! -f "${Server_folder}/${_d}/outs/metrics_summary.csv" ]; then')
+    lines.append('        echo "[FAIL] ${_d}  (no outs/metrics_summary.csv; cellranger count did not complete)" >&2')
+    lines.append("        _overall_rc=1")
+    lines.append("    else")
+    lines.append('        echo "[ OK ] ${_d}"')
+    lines.append("    fi")
+    lines.append("done")
+    lines.append("")
+
+    # ---- 7) extract_summary_metrics ----
     #   copy per-sample web_summary.html / web_summary_cell_types.html /
     #   metrics_summary.csv into ${Server_folder}/raw_metrics_folder renamed
     #   as <sample>_... ; strip comma thousands-separators inside quoted
     #   fields (awk -F'"'); strip "N%" -> "N" (sed); build summary_metrics.csv
     #   with Samplename column; reorder to metric order 1,2,3,8,4,21,20,19,13,17.
-    #   (Old CRcount::extract_summary_metrics, lines 651-717.)
     SFR = "${Server_folder}"
     # literal sample-name list (no dynamic expansion in the emitted bash)
     _sample_list = " ".join(
         str(i).zfill(2) + "_" + s + "_GEX" for i, s in enumerate(unique_samples, 1)
     )
     lines.append("# ------------------------------------ EXTRACT SUMMARY METRICS ------------------------------------ #")
-    lines.append("# (replicates old CRcount::extract_summary_metrics)")
     lines.append("")
     lines.append('metrics_folder="' + SFR + '/raw_metrics_folder"')
     lines.append('mkdir -p "${metrics_folder}"')
@@ -610,15 +851,17 @@ def build_script_full(reference_genome, pairs, user=""):
     lines.append('        continue')
     lines.append('    fi')
     lines.append('    tmp="${dst}_tmp.csv"')
-    lines.append("    # strip comma thousands-separators inside quoted fields (old CRcount)")
+    lines.append("    # strip comma thousands-separators inside quoted fields")
     lines.append(r'''    awk -F '"' 'BEGIN {OFS = "\""} { for (i=2; i<=NF; i+=2) gsub(",", "", $i) } 1' "${dst}" > "${tmp}"''')
-    lines.append("    # strip % symbols (old CRcount)")
+    lines.append("    # strip % symbols")
     lines.append('    sed -E "s/([0-9]+)%/\\1/g" "${tmp}" > "${dst}"')
     lines.append('    rm -f "${tmp}"')
     lines.append("done")
     lines.append("")
-    lines.append("# Build summary_metrics.csv with Samplename column (old CRcount)")
+    lines.append("# Build summary_metrics.csv with Samplename column")
     lines.append("first_csv_processed=false")
+    lines.append('SM_TMP="' + SFR + '/summary_metrics_tmp.csv"')
+    lines.append('SM_OUT="' + SFR + '/summary_metrics.csv"')
     lines.append("for _sd in " + _sample_list + "; do")
     lines.append('    file="${metrics_folder}/${_sd}_metrics_summary.csv"')
     lines.append('    if [ ! -f "${file}" ]; then')
@@ -626,29 +869,30 @@ def build_script_full(reference_genome, pairs, user=""):
     lines.append('        continue')
     lines.append('    fi')
     lines.append('    if [ "$first_csv_processed" = false ]; then')
-    lines.append('        echo -n "Samplename," > summary_metrics_tmp.csv')
-    lines.append('        sed -n "1p" "${file}" >> summary_metrics_tmp.csv')
+    lines.append('        echo -n "Samplename," > "${SM_TMP}"')
+    lines.append('        sed -n "1p" "${file}" >> "${SM_TMP}"')
     lines.append('        first_csv_processed=true')
     lines.append('    fi')
-    lines.append('    echo -n "${_sd}," >> summary_metrics_tmp.csv')
-    lines.append('    sed -n "2p" "${file}" >> summary_metrics_tmp.csv')
+    lines.append('    echo -n "${_sd}," >> "${SM_TMP}"')
+    lines.append('    sed -n "2p" "${file}" >> "${SM_TMP}"')
     lines.append("done")
-    lines.append("# Reorder to classic CRcount metric order (old CRcount):")
+    lines.append("# Reorder metric columns:")
     lines.append("#   1, 2, 3, 8, 4, 21, 20, 19, 13, 17")
-    lines.append("awk -F',' '{ print $1, $2, $3, $8, $4, $21, $20, $19, $13, $17 }' OFS=',' \"summary_metrics_tmp.csv\" > \"summary_metrics.csv\"")
-    lines.append("rm -f summary_metrics_tmp.csv")
+    lines.append("awk -F',' '{ print $1, $2, $3, $8, $4, $21, $20, $19, $13, $17 }' OFS=',' \"${SM_TMP}\" > \"${SM_OUT}\"")
+    lines.append('rm -f "${SM_TMP}"')
     lines.append('rsync -avh "${metrics_folder}" "${NGSruns_folder}"')
-    lines.append('rsync -avh "summary_metrics.csv" "${NGSruns_folder}"')
+    lines.append('rsync -avh "${SM_OUT}" "${NGSruns_folder}"')
     lines.append("")
 
-    # ---- 7) keepdata cleanup (old CRcount) ----
-    # After all deploy, remove the local workdir unless keepdata=yes.
+    # ---- 8) keepdata cleanup ----
     lines.append("# ------------------------------------ LOCAL WORKDIR CLEANUP ------------------------------------ #")
-    lines.append('# Old CRcount: `if test "$keepdata" != "yes"; then rm -r ${pathcount} 2> /dev/null; fi`')
+    lines.append('#   After deploy to the archive, the local working folder is deleted')
+    lines.append('#   UNLESS keepdata="yes".')
     lines.append('if [[ "${keepdata}" != "yes" ]]; then')
     lines.append('    rm -r "${Server_folder}" 2>/dev/null || true')
     lines.append("fi")
     lines.append("")
+    lines.append('exit "${_overall_rc}"')
 
     return "\n".join(lines) + "\n"
 
@@ -690,6 +934,7 @@ def main():
         if not xlsx_file.lower().endswith(".xlsx"):
             sys.exit(f"Error: '{xlsx_file}' does not look like an .xlsx file.")
 
+        print(f"Reading '{os.path.basename(xlsx_file)}' …", flush=True)
         pairs, detected_avt = parse_xlsx(xlsx_file)
         if not pairs:
             print(f"Warning: no sample/fastq ID pairs found in '{xlsx_file}' — skipping.")
@@ -718,25 +963,139 @@ def main():
         for i in needs_avt:
             all_pairs[i] = (all_pairs[i][0], all_pairs[i][1], avt_run)
 
-    avt_counts = Counter(avt for _, _, avt in all_pairs if avt is not None)
-    main_avt = avt_counts.most_common(1)[0][0] if avt_counts else "MIXED_runs"
+    main_avt = (Counter(avt for _, _, avt in all_pairs if avt is not None)
+                .most_common(1)[0][0] if any(a for _, _, a in all_pairs) else "MIXED_runs")
+
+    # Pre-build sample -> fastqs (same shape `build_script_full` uses
+    # internally) so the selection prompt can display fastq counts for each
+    # sample; used below to re-filter the pair list to only the kept samples.
+    _prefilter_s2f = defaultdict(list)
+    for sn, fq, avt in all_pairs:
+        _prefilter_s2f[sn].append((fq, avt))
+
+    # ── Sample selection (keep/drop + add sheet-less samples) ──────────────
+    # Mirrors the reference-genome prompt pattern: interactive by default,
+    # skipped under `-n` / non-tty, in which case every detected sample is
+    # kept and none are added (identical to the old behaviour).  Dropped
+    # samples are removed from the generated script entirely — no per-sample
+    # block, no cellranger invocation.  Added samples are each specified by
+    # the user as a FULL path to an avid folder (whose basename matches
+    # ``avid\d{4,6}``); these paths are used verbatim in the generated
+    # script and their AVT run is left ``None`` (unused, the path is
+    # self-referential).
+    kept_names, added_raw = ask_sample_selection(
+        _prefilter_s2f,
+        default_root="/mnt/PTEGraw/AA/NGSruns/AVT/AV240401",
+    )
+    if dropped_names := [sn for sn in _prefilter_s2f if sn not in kept_names]:
+        print(f"  Dropped from script: {', '.join(dropped_names)}")
+    new_pairs = [(sn, fq, avt) for sn in kept_names
+                 for fq, avt in _prefilter_s2f[sn]]
+    # Samples ADDED off-prompt carry a list of FULL avid-folder paths
+    # (self-referential — no AVT-tree walk needed).  The pair's
+    # fastq_id is the folder's basename (e.g. "avid13144"); the
+    # generator consumes the full path directly when it is known.
+    added_paths = {}   # {fastq_id: full_path}
+    for sn, info in added_raw.items():
+        for p in info:
+            added_paths[os.path.basename(p)] = p
+        new_pairs.extend((sn, os.path.basename(p), None) for p in info)
+    if not new_pairs:
+        sys.exit("Error: no samples to add to the script.")
+    all_pairs = new_pairs
+
+    # ── Run-folder disambiguation (sample-level pick) ───────────────────────
+    # A sample name can exist in SEVERAL run sub-folders under the AVT tree
+    # (AVT0551: same 384 avid folders under both 1_wrong_index_… and
+    # 2_corrected_indexes_…).  A bare avid id cannot pin down a location, so
+    # before we resolve any FASTQ we pin the SAMPLE's folder here.  We only
+    # ask when there really is more than one candidate for that AVT; a
+    # single candidate resolves silently (the 99% case).  `choose_sample_dir`
+    # also handles non-interactive mode (first candidate + warning).
+    # Keyed by (sample, avt) because a sample could in principle appear
+    # under two AVTs; for the usual one-AVT run every entry shares the
+    # same avt.
+    #
+    # Samples the user ADDED on the command prompt (not from the Excel
+    # sheet) carry a user-supplied FULL path to each avid folder — that
+    # is the location and no disambiguation prompt is needed.
+    selected_dirs = {}
+    for sn in dict.fromkeys(sn for sn, _, _ in all_pairs):
+        if sn in added_raw:
+            continue  # user typed the full avid path(s); no anchor to pick
+        # Each (sample, fq, avt) row's avt may be None; resolve to main_avt.
+        row_avts = {avt for sn2, _, avt in all_pairs if sn2 == sn and avt}
+        avt_use = next(iter(row_avts)) if row_avts else main_avt
+        cands = list_sample_dirs(avt_use, sn)
+        if len(cands) > 1:
+            chosen = choose_sample_dir(sn, cands)
+            if chosen:
+                selected_dirs[(sn, avt_use)] = chosen
+
+    # Build the sample_name -> sample_dir map the builder consumes.
+    # Added samples are NOT included here — their paths are passed
+    # separately via `added_paths` and used verbatim.
+    chosen_for_build = None
+    if selected_dirs:
+        flat = {}
+        for (sn, _), dirp in selected_dirs.items():
+            flat.setdefault(sn, dirp)
+        chosen_for_build = flat
+        n_asked = len(flat)
+        if n_asked:
+            print(f"  Run-folder disambiguation picked for {n_asked} sample(s).")
+
+    # ── Final sample summary (shown before the genome prompt) ──────────────
+    # Recap of everything that will appear in the generated script: the
+    # kept samples (with their FASTQs) plus any sheet-less samples the user
+    # added by full path.  Always prints, in interactive and non-interactive
+    # mode alike.
+    _final_s2f = defaultdict(list)
+    for sn, fq, _ in all_pairs:
+        _final_s2f[sn].append(fq)
+    _n_fq = len(all_pairs)
+    _kept = [sn for sn in _final_s2f if sn not in added_raw]
+    _added = [sn for sn in dict.fromkeys(added_raw.keys())]
+    print()
+    print("  ── Final samples (genome selection next) ──")
+    for _sn in _kept:
+        print(f"    keep   {_sn}  [{', '.join(_final_s2f[_sn])}]")
+    for _sn in _added:
+        print(f"    added  {_sn}  [{', '.join(_final_s2f[_sn])}]  (added by path)")
+    print(f"    Total: {len(_kept) + len(_added)} sample(s), "
+          f"{_n_fq} FASTQ ID(s)")
+    print()
 
     reference_genome = ask_reference_genome(
-        HUMAN_GENOME_PATH, MOUSE_GENOME_PATH, default_path=HUMAN_GENOME_PATH
+        HUMAN_GENOME_PATH, MOUSE_GENOME_PATH, default_path=HUMAN_GENOME_PATH,
+        human_label="Human", mouse_label="Mouse",
+        extra_choices=[("Human + mouse (combined)", HUMAN_MOUSE_GENOME_PATH)],
     )
+    print("Reading the requester (User) field and generating the script …", flush=True)
     user = read_user_field(xlsx_files[0])
 
-    script_content = build_script_full(reference_genome, all_pairs, user)
+    script_content = build_script_full(reference_genome, all_pairs, user,
+                                       source_files=xlsx_files,
+                                       chosen_sample_dirs=chosen_for_build,
+                                       added_paths=added_paths)
     out_script = f"cellranger-count_{main_avt}.sh"
     with open(out_script, "w") as f:
         f.write(script_content)
     os.chmod(out_script, 0o755)
 
     print(f"Generated: {out_script}")
-    if "FIXME_LOCATE_" in script_content:
+    # Only flag when a path was genuinely left unresolved.  Real unresolved
+    # markers are always emitted in *path position* — a trailing
+    # "/FIXME_LOCATE_<id>" segment (e.g. "…/<run>/FIXME_LOCATE_<id>").  The
+    # header help text uses the same token as a noun ("FIXME_LOCATE_ markers
+    # mean …"), so scanning for the bare token fires even when every path
+    # resolved (which is why this note used to show up on clean runs).
+    n_unresolved = script_content.count("/FIXME_LOCATE_")
+    if n_unresolved:
         print(
-            "Note: some fastq paths could not be resolved — set the flagged "
-            "path_* variables (FIXME_LOCATE_ markers) before running."
+            f"Note: {n_unresolved} FASTQ path(s) could not be resolved — "
+            "set the flagged path_* variable(s) (FIXME_LOCATE_ markers) "
+            "before running."
         )
 
 
