@@ -1,11 +1,11 @@
 # BRB-seq single-pool RNA-seq pipeline
 
-`brbseq_pipeline.sh` (v1.2.0) — end-to-end pre-processing for
+`brbseq_pipeline.sh` (v1.3.0) — end-to-end pre-processing for
 **one pool/run** of MERCURIUS 3' BRB-seq data:
 barcode prep → STARsolo alignment + gene/UMI counts → mandatory duplication
 statistics → sample-named matrices → FastReadCounter read-distribution report
-→ optional per-sample demux → run-folder README + MD5 integrity manifest
-(written last, once every other file is final).
+→ optional per-sample demux → orientation PCA of the UMI matrix → run-folder
+README + MD5 integrity manifest (written last, once every other file is final).
 
 The STAR request always requests **both** UMI dedup methods
 (`--soloUMIdedup NoDedup 1MM_Directional` in one pass) so the mandatory
@@ -16,7 +16,7 @@ single alignment.
 
 | File | Purpose |
 |---|---|
-| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.2.0) |
+| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.3.0) |
 | `build_star_index.sh` | One-time STAR genomeDir build (Mercurius guide 1.1; no Ensembl fetch) |
 | `brbseq-env.yaml` | Conda environment (`brbseq`) — STAR, samtools, fastqc, picard, fqtk, RSeQC tools, python/openpyxl |
 | `utils/prepare_barcodes.sh` | Builds `barcode_whitelist.txt` + demux maps from the manifest (TSV `Sample_ID` → `bar`) |
@@ -24,6 +24,7 @@ single alignment.
 | `utils/rename_matrix.py` | Renames STARsolo's `Gene/raw` barcode-matrix to `Sample_ID` columns (into `star/samples/` or `star/samples_all_wells/`) |
 | `utils/prepare_umi_matrix.py` | Flattens `star/samples/umiDedup-*.mtx` into the two matrix CSVs (`umi_matrix`, `reads_matrix`) |
 | `utils/get_duplication_statistics.py` | Per-well + pool duplication stats from NoDedup vs 1MM_Directional matrices |
+| `utils/make_pca.py` | **v1.0.0 — orientation PCA of the UMI matrix** (PC1/PC2 + total-UMI depth + per-well elbow, `well_qc.csv`); optional pipeline step (`--skip-pca`), needs `scanpy` |
 | `utils/demultiplex_bam.sh` | Vendored picard-based BAM demux helper (one `FilterSamReads` per sample, `CR` tag) |
 
 ## Environment
@@ -183,9 +184,15 @@ OUT_DIR/BRBseq_<run-name>_<YYYYMMDD_HHMMSS>/     project parent
     ├── <pool>_report_summary.csv   per-well read-distribution grid
     │                               (depth/mapped/no-feature/no-alignment, in
     │                               millions) — one row per plate well + Unknown
-    └── <pool>_all_stats.csv        same read-distribution, raw totals per sample
-                                    (built from FastReadCounter intermediates,
-                                     which are deleted after the report is written)
+    ├── <pool>_all_stats.csv        same read-distribution, raw totals per sample
+    │                               (built from FastReadCounter intermediates,
+    │                                which are deleted after the report is written)
+    └── PCA_<pool>/                 orientation PCA of the UMI matrix (v1.3.0,
+                                    optional; `--skip-pca`)
+        ├── pca_<pool>.png          PC1/PC2 scatter, one dot per well, labelled
+        ├── pca_<pool>_depth.png    PC1/PC2, point size ∝ total UMI (depth)
+        ├── pca_<pool>_elbow.png    per-well elbow (top-variance genes)
+        └── well_qc.csv             audit log: per-well total_umi + genes_detected
 ```
 
 Notes:
@@ -200,12 +207,24 @@ Notes:
 
 ## Changelog
 
-Bumped in `SCRIPT_VERSION` in `brbseq_pipeline.sh` (currently **v1.2.0** —
-the current release; the latest entry is the v1.2.0 layout + integrity
-manifest).
-v1.0.1 was reserved but never shipped — the version went straight from the
-1.0.0 baseline to 1.0.2.
+### v1.3.0 — PCA of the UMI matrix
 
+- **New optional step: `utils/make_pca.py` (script v1.0.0)** computes a quick,
+  orientation-only PCA of the primary result table (the UMI matrix) and writes
+  to `files_for_report_and_CLC/PCA_<pool>/`:
+  - `pca_<pool>.png` — PC1/PC2 scatter, one dot per well, each labelled with its
+    full well name (no legend — the labels carry the identity),
+  - `pca_<pool>_depth.png` — PC1/PC2 with point size ∝ total UMI,
+  - `pca_<pool>_elbow.png` — per-well elbow (top-variance genes), and
+  - `well_qc.csv` — audit log: per-well `total_umi` (integer) + `genes_detected`.
+- **On by default; `--skip-pca` disables it.** Optional: a missing `scanpy` or a
+  PCA failure only warns — it never blocks, aborts, or fails the run.
+- **No new required dependency.** `scanpy` (with `anndata`/`matplotlib`) is
+  declared in `brbseq-env.yaml`.
+- **Runtime:** a few seconds on a real 96-well pool (≈4 s on AVT0639,
+  78k genes × 30 wells) — not a pipeline bottleneck.
+- Note: pipeline `SCRIPT_VERSION` moves to **v1.3.0**; `make_pca.py` keeps its
+  own `VERSION = 1.0.0` (its first prod-shipped release) as independent versions.
 
 ### v1.0.0 — baseline single-pool pipeline
 
@@ -378,7 +397,7 @@ with `--resume-dir` pointing at the sample folder inside that parent:
 
 ## Status
 
-`SCRIPT_VERSION="1.2.0"` (in `brbseq_pipeline.sh`) — the current, working
+`SCRIPT_VERSION="1.3.0"` (in `brbseq_pipeline.sh`) — the current, working
 version of the pipeline.  The first real-pool deployment (against an
 AVT0608/AVT0615-style pool) is built on top of this baseline.  See **Changelog**
 above for what each release shipped; reference changes by feature or date (not

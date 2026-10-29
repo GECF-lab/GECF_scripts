@@ -265,6 +265,7 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <tr><td><code>--skip-rseqc</code></td><td class="opt">optional</td><td>Skip the RSeQC read-distribution step. The step runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-dmux-bam</code></td><td class="opt">optional</td><td>Skip the per-sample BAM demux (picard) — the slowest step. It runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-dmux-fq</code></td><td class="opt">optional</td><td>Skip the per-sample FASTQ demux (fqtk). It runs by default; add this flag to turn it off</td></tr>
+  <tr><td><code>--skip-pca</code></td><td class="opt">optional</td><td>Turn off the PCA-of-the-UMI-matrix step (v1.3.0). It runs by default; add this flag to turn it off. Needs <code>scanpy</code> in the <code>brbseq</code> env</td></tr>
   <tr><td><code>--dry-run</code></td><td class="opt">optional</td><td>Show what would happen without creating any files</td></tr>
   <tr><td><code>--resume-dir</code></td><td class="opt">optional</td><td>Re-run a previous run that finished or failed <em>in its own output folder</em>: pass the <strong>sample folder</strong> inside the run, e.g. <code>BRBseq_&lt;name&gt;_&lt;timestamp&gt;/Lib_01</code> (pre-v1.2.0 single-tier <code>BRBseq_&lt;name&gt;_&lt;timestamp&gt;</code> folders also work). Steps whose output already exists are skipped; only the incomplete step(s) re-run. It reuses the sample→barcode list stored in that folder, so do <strong>not</strong> also pass <code>--libprep-xlsx</code>/<code>--barcode-tsv</code>/<code>--plate</code></td></tr>
   <tr><td><code>--bed-file</code></td><td class="opt">optional</td><td>RSeQC gene-model (BED12) file. Without this, the pipeline builds a BED12 from the GTF file inside the STAR genome index. (If neither is available, only the RSeQC read-distribution step is skipped — the rest of the pipeline still runs)</td></tr>
@@ -290,6 +291,7 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <li><strong>STARsolo alignment + counting</strong> — one alignment pass that strips the 14-nt CB + 14-nt UMI from read 1, aligns the 90-nt cDNA read, and writes per-barcode gene-count matrices (raw and UMI-deduplicated).</li>
   <li><strong>QC &amp; demux</strong> — RSeQC read distribution, per-sample BAM demux (picard) and per-sample FASTQ demux (fqtk).</li>
   <li><strong>Read-distribution report (FastReadCounter)</strong> — runs the same STAR BAM (already on disk, no second alignment) through <code>FastReadCounter</code> with the 96-barcode whitelist, then builds the two legacy-compatible QC reports: <code>files_for_report_and_CLC/&lt;pool&gt;_report_summary.csv</code> (the whole-plate grid — depth / mapped / no-feature / no-alignment per well, in millions, plus an <code>Unknown</code> catch-all) and <code>&lt;pool&gt;_all_stats.csv</code> (raw per-sample totals including all FRC buckets). The jar is a pre-installed production file (see the <code>FRC_JAR</code> line near the FRC step in the pipeline); the gene annotation is taken from the STAR index.</li>
+  <li><strong>PCA of the UMI matrix</strong> (new in v1.3.0, on by default, off with <code>--skip-pca</code>) — runs <code>utils/make_pca.py</code> (script v1.0.0) on the primary result table (the UMI matrix) and writes to <code>files_for_report_and_CLC/PCA_&lt;pool&gt;/</code>. Three orientation PNGs: PC1/PC2 scatter (one dot per well, labelled with the well name, no legend), PC1/PC2 with point size ∝ total UMI, and a per-well elbow plot. Plus <code>well_qc.csv</code> (per-well <code>total_umi</code> + <code>genes_detected</code>). Optional: a missing <code>scanpy</code> or PCA failure only warns — it never blocks the run. Runtime ≈ 4 s (AVT0639, 78k×30).</li>
   <li><strong>Final outputs</strong> — you take two things into downstream analysis: (a) the sample-named matrix <em>files</em>, and (b) the per-well duplication statistics. The matrix itself exists in two forms of the <em>same</em> data: the raw STAR output where each barcode column is renamed to its Sample_ID (<code>star/samples/</code>), and the ready-to-use CSV tables built from it (<code>matrices/&lt;pool&gt;_umi_matrix.csv</code> for unique-molecule/UMI counts, <code>&lt;pool&gt;_reads_matrix.csv</code> for raw read counts). Use the UMI CSV for PCA/DE; see section 5. The FastReadCounter reports (above) are for sequencing-quality review, not for PCA/DE.</li>
   <li><strong>Folder guide + integrity check</strong> — the run folder receives a self-generated <code>README.html</code> (an orientation index of everything produced, open in a browser) and, as the very last step, an MD5 manifest <code>&lt;pool&gt;/&lt;pool&gt;.md5</code> covering every file in the sample folder. Recipient verification: <code>cd &lt;pool&gt;/ &amp;&amp; md5sum -c &lt;pool&gt;.md5</code>.</li>
 </ol>
@@ -323,6 +325,7 @@ read from that run's <code>pipeline.log</code>:
   <tr><td>RSeQC read-distribution (QC)</td><td><strong>~ 15 min</strong></td><td>scales with the BAM size</td></tr>
   <tr><td>Duplication stats + matrix renames + UMI/reads CSVs</td><td><strong>&lt; 1 min</strong></td><td>all fast matrix reshaping</td></tr>
   <tr><td>FastReadCounter report (FRC + two report CSVs)</td><td><strong>~ 10 min</strong></td><td>one pass over the BAM with the 96-barcode whitelist; the two report CSVs themselves are instant</td></tr>
+  <tr><td>PCA of the UMI matrix (v1.3.0)</td><td><strong>&lt; 1 min</strong></td><td>≈ 4 s on AVT0639 (78k genes × 30 wells); optional — <code>--skip-pca</code> to turn off; needs <code>scanpy</code></td></tr>
   <tr><td><strong>BAM demux (picard, 30 samples)</strong></td><td><strong>~ 3.5 h</strong></td><td><em>dominant</em> — one picard pass per sample over the whole BAM</td></tr>
   <tr><td>FASTQ demux (fqtk, 446 M reads)</td><td><strong>~ 1–2 min</strong></td><td>single pass, fast (with the run's full thread count)</td></tr>
   <tr><td>MD5 manifest (md5sum over the sample folder)</td><td><strong>~ 5 min</strong></td><td>estimate — new in v1.2.0, not part of AVT0639's log; the dominant cost is the STAR-aligned BAM</td></tr>
@@ -366,7 +369,12 @@ if you only need the expression matrices you can skip the demux steps entirely
 │                                        (verify: cd Lib_01/ &amp;&amp; md5sum -c Lib_01.md5)
 └── files_for_report_and_CLC/            internal QC — sequencing side, not for users
     ├── Lib_01_report_summary.csv   ★ whole-plate read-distribution grid (depth/mapped/nf/na per well, in millions)
-    └── Lib_01_all_stats.csv        same read-distribution, raw per-sample totals</code></pre>
+    ├── Lib_01_all_stats.csv        same read-distribution, raw per-sample totals
+    └── PCA_Lib_01/                 orientation PCA of the UMI matrix (v1.3.0, optional)
+        ├── pca_Lib_01.png          PC1/PC2 scatter, one labelled dot per well (no legend)
+        ├── pca_Lib_01_depth.png    PC1/PC2, point size ∝ total UMI
+        ├── pca_Lib_01_elbow.png    per-well elbow plot
+        └── well_qc.csv             per-well total_umi + genes_detected</code></pre>
 
 <h3>Which matrix do I use?</h3>
 <table>
@@ -446,7 +454,9 @@ still stays skipped.
 default-on but each is individually skippable via its <code>--skip-*</code> flag.
 The alignment + matrix chain <em>and the FastReadCounter read-distribution
 report</em> are mandatory and always run — the report is the QC deliverable,
-so there is no <code>--skip-frc</code>.</p>
+so there is no <code>--skip-frc</code>. The PCA step (v1.3.0) is optional
+(<code>--skip-pca</code>) — it only warns if <code>scanpy</code> is missing or
+the step fails, so it never blocks your run.</p>
 <h3>What if STAR fails with a weird read-count error on 2.7.11b?</h3>
 <p>
 Star versions can differ subtly in accepted flags (<code>STAR 2.7.10b</code> and
