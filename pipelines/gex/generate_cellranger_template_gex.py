@@ -23,7 +23,8 @@ Key differences from the arc/atac generators:
   * Reference paths: gene-expression references under
     `cellranger_references/current_human|current_mouse` (not the
     `current_human_arc_ATAC|current_mouse_arc_ATAC` dirs arc/atac use).
-  * Per-sample output leaves: `NN_<sample>_GEX` (atac: `_atac`, arc:
+  * Per-sample output leaves: `NN_<sample>` (no `_GEX` suffix — the
+    sample name already carries `_GEX`; atac still adds `_atac`, arc
     `GEX_only`/`ATAC_only` under `cellranger-arc`).
   * Post-processing: no web-summary HTML to collect (bare `cellranger count`
     does not emit one) and no SC_* tree to delete. Summary.csv (run-level QC)
@@ -112,6 +113,12 @@ NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
 # path; on the dev box it is not expected to exist. Never derive from $PWD —
 # the script must land in the same place regardless of the caller's cwd.
 SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
+
+# Version stamped into every <sample>_script_log.txt as
+# `GEX script version: <HERE>`. This is the GEX generator's own version
+# (generator version == generated-script version). Bump it on any change
+# to the generator.
+SCRIPT_VERSION = "1.0"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (pipelines/common/TSO_percent.sh)
@@ -445,6 +452,12 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
     lines.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
     lines.append(f"reference_genome_used={reference_genome}")
+    lines.append(
+        # Version line stamped into each <sample>_script_log.txt ("CRcount
+        # script version"), mirroring CRmulti/CRarc.  Generator version ==
+        # generated-script version — edit SCRIPT_VERSION above to bump it.
+        "scriptversion=" + SCRIPT_VERSION
+    )
     lines.append("")
 
     # ---- 2) run-wide parameters (defaults, editable at the top) ----
@@ -621,7 +634,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
     for idx, sn in enumerate(unique_samples, start=1):
         fastqs = samples_to_fastqs[sn]
-        numbered_dir = f"{idx:02d}_{sn}_GEX"
+        numbered_dir = f"{idx:02d}_{sn}"
         fq_list_str = ",".join(fq for fq, _ in fastqs)
         fq_paths = ", ".join(f"${{path_{idx}_{fq}}}" for fq, _ in fastqs)
         SFR = "${Server_folder}"
@@ -650,12 +663,19 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         lines.append("")
         lines.append(f"# --- Run sample {idx}: {sn} ---")
         lines.append("function count_sample_" + str(idx) + "() {")
-        lines.append(
-            'echo "cellranger count --id=' + sn + ' --sample=' + sn
-            + ' ... (see full command below)" '
-            + '> "' + SFR + '/' + numbered_dir + '_script_log.txt"'
-        )
-        # Join flag_lines with the line-continuation between them.
+        # Script log = version of this generator + the FULL cellranger command.
+        # Echoed from the SAME flag_lines list that is executed below, so the
+        # log can never drift from what actually runs.  Optional ${var:+...}
+        # expansions resolve at run time (the flag appears only when the
+        # per-sample value is set), and custom_options word-splits into
+        # multiple --flags.
+        _cmd = " ".join(t.strip() for t in flag_lines)
+        lines.append("{")
+        lines.append('    echo "GEX script version: ${scriptversion}"')
+        lines.append("    echo " + _cmd)
+        lines.append('} > "' + SFR + '/' + numbered_dir + '_script_log.txt"')
+        # Emit the (identical) command for execution, line-continuation
+        # formatted, from the same flag_lines list.
         for i, fl in enumerate(flag_lines):
             lines.append(fl + (_CONT if i < len(flag_lines) - 1 else ""))
 
@@ -747,9 +767,16 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("        exit 1")
     lines.append("    ;;")
     lines.append("esac")
-    lines.append('if [ "${max_parallel}" -lt 1 ] || [ "${max_parallel}" -gt "${NSAMPLES}" ]; then')
-    lines.append('    echo "ERROR: max_parallel must be between 1 and ${NSAMPLES}" >&2')
+    lines.append('if [ "${max_parallel}" -lt 1 ]; then')
+    lines.append('    echo "ERROR: max_parallel must be >= 1" >&2')
     lines.append("    exit 1")
+    lines.append("fi")
+    lines.append('# Cap max_parallel at NSAMPLES: there is no point requesting more')
+    lines.append('# concurrent cellranger counts than the number of samples, so a')
+    lines.append('# small run (e.g. 1 sample) never hard-fails on a larger default.')
+    lines.append('if [ "${max_parallel}" -gt "${NSAMPLES}" ]; then')
+    lines.append('    echo "Note: ${NSAMPLES} sample(s) only — capping max_parallel ${max_parallel} -> ${NSAMPLES}." >&2')
+    lines.append("    max_parallel=${NSAMPLES}")
     lines.append("fi")
     lines.append("")
     lines.append('if [ "${max_parallel}" -eq 1 ]; then')
@@ -807,7 +834,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     #   no outs/metrics_summary.csv  -> cellranger count never completed
     lines.append("# Per-sample status report (from each sample's own completion markers)")
     lines.append("_overall_rc=0")
-    _dirs_bash = " ".join('"{:02d}_{}_GEX"'.format(i, s) for i, s in enumerate(unique_samples, 1))
+    _dirs_bash = " ".join('"{:02d}_{}"'.format(i, s) for i, s in enumerate(unique_samples, 1))
     lines.append("for _d in " + _dirs_bash + "; do")
     lines.append('    if [ -s "${Server_folder}/${_d}_error_log.txt" ]; then')
     lines.append('        echo "[FAIL] ${_d}  (see ${Server_folder}/${_d}_error_log.txt)" >&2')
@@ -830,7 +857,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     SFR = "${Server_folder}"
     # literal sample-name list (no dynamic expansion in the emitted bash)
     _sample_list = " ".join(
-        str(i).zfill(2) + "_" + s + "_GEX" for i, s in enumerate(unique_samples, 1)
+        str(i).zfill(2) + "_" + s for i, s in enumerate(unique_samples, 1)
     )
     lines.append("# ------------------------------------ EXTRACT SUMMARY METRICS ------------------------------------ #")
     lines.append("")
