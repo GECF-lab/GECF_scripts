@@ -13,6 +13,7 @@
 #   Duplication statistics          [MANDATORY ]  get_duplication_statistics.py
 #   BAM demultiplex (picard)        [ON by default]  off: --skip-dmux-bam
 #   FASTQ demultiplex (fqtk)        [ON by default]  off: --skip-dmux-fq
+#   PCA of the UMI matrix           [ON by default]  off: --skip-pca
 #   Merge multi-lane FASTQ          [note       ]  pre-merge or comma-list
 #
 # Logging (automatic, no flag)
@@ -61,7 +62,7 @@
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
@@ -70,6 +71,7 @@ DUP_STATS="${UTILS_DIR}/get_duplication_statistics.py"
 PARSE_LIBPREP="${UTILS_DIR}/parse_libprep_xlsx.py"
 RENAME_MATRIX="${UTILS_DIR}/rename_matrix.py"
 UMI_MATRIX_PREP="${UTILS_DIR}/prepare_umi_matrix.py"
+MAKE_PCA="${UTILS_DIR}/make_pca.py"
 
 #--- defaults (all overridable via flags) -----------------------------------
 RUN_NAME="${RUN_NAME:-}"         # run label for the output parent: BRBseq_<run-name>_<timestamp>
@@ -105,8 +107,9 @@ RUN_OPT_FASTQ="${RUN_OPT_FASTQ:-1}"
 RUN_OPT_RSEQC="${RUN_OPT_RSEQC:-1}"
 RUN_OPT_DEMUX_BAM="${RUN_OPT_DEMUX_BAM:-1}"
 RUN_OPT_DEMUX_FQ="${RUN_OPT_DEMUX_FQ:-1}"
+RUN_OPT_PCA="${RUN_OPT_PCA:-1}"
 # did the user pass the --skip-* opt-out for each?
-S_FASTQ=0; S_RSEQC=0; S_DMBAM=0; S_DMFQ=0
+S_FASTQ=0; S_RSEQC=0; S_DMBAM=0; S_DMFQ=0; S_PCA=0
 # Alithea BRB-seq production SAM tag set (fixed, not user-configurable).
 SAM_ATTRS="NH HI nM AS CR UR CB UB GX GN sS sQ sM"
 RESUME_DIR="${RESUME_DIR:-}"     # --resume-dir: target an existing run dir in place
@@ -176,6 +179,7 @@ OPTIONAL FLAGS
   --skip-rseqc          skip read_distribution  (on by default)
   --skip-dmux-bam       skip picard BAM demux  (on by default)
   --skip-dmux-fq        skip fqtk FASTQ demux  (on by default)
+  --skip-pca            skip the per-run PCA plots of the UMI matrix (on by default)
   --dry-run             emit planned commands and exit (no side effects)
 
   -h, --help            this help
@@ -224,6 +228,7 @@ while [[ $# -gt 0 ]]; do
     --skip-fastq)   S_FASTQ=1;                                        shift;;
     --skip-rseqc)   S_RSEQC=1;                                        shift;;
     --skip-dmux-bam)S_DMBAM=1;                                        shift;;
+    --skip-pca)     S_PCA=1;                                          shift;;
     --resume-dir)   RESUME_DIR="${2:?missing --resume-dir value}";    shift 2;;
     --dry-run)      DRY_RUN=1;                                        shift;;
     -h|--help)      usage; exit 0;;
@@ -238,6 +243,7 @@ done
 [[ "$S_RSEQC"  -eq 1 ]] && RUN_OPT_RSEQC=0
 [[ "$S_DMBAM"  -eq 1 ]] && RUN_OPT_DEMUX_BAM=0
 [[ "$S_DMFQ"   -eq 1 ]] && RUN_OPT_DEMUX_FQ=0
+[[ "$S_PCA"    -eq 1 ]] && RUN_OPT_PCA=0
 
 #--- validate required inputs ------------------------------------------------
 # Exactly one manifest source must be provided:
@@ -1381,8 +1387,38 @@ run_or_skip "Reads matrix (NoDedup, all PCR copies)" "$READS_MATRIX_CSV" "" "man
     --samples-dir "$RENAME_DIR" \
     --out-csv   "$READS_MATRIX_CSV" \
     --dedup     "NoDedup"
-[[ -s "$READS_MATRIX_CSV" ]] || die "The final gene count table based on total read counts rather than unique UMIs (one row per gene, one column per sample) was not produced at $READS_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so those steps are not redone)."
+[[ -s "$READS_MATRIX_CSV" ]] || die "The final gene count table based on total read counts rather than unique UMIs (one row per gene, one column per sample) was not produced at $READS_MATRIX_CSV. See the message(s) printed just above for the specific reason, fix it, and re-run (use --resume-dir pointing at this same run folder so those steps are not redone)."
 log "Reads matrix CSV: $READS_MATRIX_CSV"
+
+#=== Per-run PCA of the UMI matrix  [ON by default; off: --skip-pca] ========
+# Optional QC/PCA snapshot of the primary result table (the UMI matrix),
+# written next to the report CSVs so it ships in the same handover folder:
+#   files_for_report_and_CLC/PCA_<pool>/
+#   pca_<pool>.png  pca_<pool>_depth.png  pca_<pool>_elbow.png
+#     well_qc.csv   (well, total_umi, genes_detected - one row per well)
+# make_pca.py keeps every well from the matrix and annotates the full well
+# name on both PC1/PC2 plots.  Completion marker = pca_<pool>.png (the first
+# plot); a failed step re-runs on the next resume (run_or_skip removes the
+# marker on failure).  OPTIONAL: a missing scanpy or a PCA failure never
+# aborts the pipeline.
+PCA_DIR="${REPORTS_DIR}/PCA_${POOL_CLEAN}"
+PCA_MARKER="${PCA_DIR}/pca_${POOL}.png"
+if [[ "$RUN_OPT_PCA" -eq 1 ]]; then
+  log ""
+  log "PCA of the UMI matrix (optional)"
+  if [[ ! -f "$MAKE_PCA" ]]; then
+    warn "The PCA helper is missing from this installation ($MAKE_PCA) — skipping the PCA step; everything else is unaffected."
+  elif ! "$PYTHON" -c "import scanpy, anndata, matplotlib" >/dev/null 2>&1; then
+    warn "PCA step skipped: scanpy/anndata/matplotlib are not importable from ${PYTHON} (they are declared in brbseq-env.yaml — rebuild the env with 'conda env create -f brbseq-env.yaml'); everything else is unaffected."
+  else
+    run_or_skip "PCA (UMI matrix)" "$PCA_MARKER" "" "optional" \
+      "$PYTHON" "$MAKE_PCA" "$UMI_MATRIX_CSV" --outdir "$PCA_DIR"
+    [[ -s "$PCA_MARKER" ]] && log "PCA output: $PCA_DIR  (well label / depth / elbow plots + well_qc.csv)"
+  fi
+else
+  log ""
+  log "PCA of the UMI matrix — skipped (--skip-pca)"
+fi
 
 #=== Sample demultiplex (BAM, picard)  [OPTIONAL] ==========================
 if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then

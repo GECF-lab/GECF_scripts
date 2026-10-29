@@ -39,6 +39,12 @@ dependencies:
   - scipy>=1.15.3
   - numpy>=2.1
 
+  # Runtime for the per-run PCA step (utils/make_pca.py): QC -> HVG -> PCA ->
+  # well label/depth/elbow plots (png) + well_qc.csv.
+  - scanpy>=1.10
+  - matplotlib>=3.9
+  - adjusttext>=1.3
+
   # Java for the mandatory FastReadCounter step (the jar ships outside Conda,
   # but Java itself is a Java program). Also needed by picard.
   - openjdk>=21
