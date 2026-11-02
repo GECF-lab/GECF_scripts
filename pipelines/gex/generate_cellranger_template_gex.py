@@ -108,6 +108,18 @@ HUMAN_MOUSE_GENOME_PATH = (
 )
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
 
+# "TO delete" folder where processed datasheets are parked for later
+# cleanup (shared GECF convention — see CRcount/CRarc/CRmulti). Two
+# destinations, tried in order: Daniel's CR_pipelines tree first, the
+# older CRcount_GEXonly layout as fallback.  The generated script uses
+# the first folder that exists and creates neither (no forced mkdir).
+DELETE_PRIMARY = (
+    "/home/gecf/NGS_pipelines/CR_pipeline/CR_pipelines_Daniel/TO_DELETE"
+)
+DELETE_FALLBACK = (
+    "/home/gecf/NGS_pipelines/CR_pipeline/CRcount_GEXonly/TO_DELETE"
+)
+
 # Root on the *analysis* server where cellranger count output + post-processing
 # are written (matches arc's convention). On that host this is a real, mounted
 # path; on the dev box it is not expected to exist. Never derive from $PWD —
@@ -919,6 +931,25 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append('    rm -r "${Server_folder}" 2>/dev/null || true')
     lines.append("fi")
     lines.append("")
+
+    # ---- 9) park processed datasheets in the team "TO delete" folder ----
+    # (CRcount/CRarc/CRmulti convention — same mv, shared destination
+    # instead of a per-script ${mypwd}).  No mkdir -p: the target is
+    # created only as a side effect of the mv, and we fall back to the
+    # CRcount_GEXonly destination if Daniel's CR_pipelines tree is absent.
+    lines.append("# ------------------------------------ DATASHEET CLEANUP ------------------------------------ #")
+    lines.append("#   Parked processed datasheets for later deletion.")
+    lines.append(f'#   Primary: {DELETE_PRIMARY}')
+    lines.append(f'#   Fallback: {DELETE_FALLBACK}')
+    lines.append(f'if [ -d "{DELETE_PRIMARY}" ]; then _delfolder="{DELETE_PRIMARY}"')
+    lines.append(f'elif [ -d "{DELETE_FALLBACK}" ]; then _delfolder="{DELETE_FALLBACK}"')
+    lines.append("fi")
+    lines.append('if [ -n "${_delfolder:-}" ]; then')
+    lines.append('    mv datasheet*.txt "${_delfolder}" 2>/dev/null || true')
+    lines.append('    mv CR_count_datasheet*.txt "${_delfolder}" 2>/dev/null || true')
+    lines.append("fi")
+    lines.append("")
+
     lines.append('exit "${_overall_rc}"')
 
     return "\n".join(lines) + "\n"
