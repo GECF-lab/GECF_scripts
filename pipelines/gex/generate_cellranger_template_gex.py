@@ -23,6 +23,10 @@ Key differences from the arc/atac generators:
   * Reference paths: gene-expression references under
     `cellranger_references/current_human|current_mouse` (not the
     `current_human_arc_ATAC|current_mouse_arc_ATAC` dirs arc/atac use).
+    The genome folder INSIDE each `current_...` dir is auto-detected at
+    generation time (each holds exactly one genome folder — e.g.
+    `refdata-gex-GRCh38-2024-A` today, but that name may be renamed or
+    replaced server-side), so no refdata-* name is hard-coded anywhere.
   * Per-sample output leaves: `NN_<sample>` (no `_GEX` suffix — the
     sample name already carries `_GEX`; atac still adds `_atac`, arc
     `GEX_only`/`ATAC_only` under `cellranger-arc`).
@@ -88,24 +92,49 @@ from common.intake import (  # noqa: E402
     list_sample_dirs,       # ... list every candidate sample dir for an AVT
 )
 
-HUMAN_GENOME_PATH = (
-    "/home/gecf/references/cellranger_references/current_human/"
-    "refdata-gex-GRCh38-2024-A"
-)
-MOUSE_GENOME_PATH = (
-    "/home/gecf/references/cellranger_references/current_mouse/"
-    "refdata-gex-GRCm39-2024-A"
-)
+# Reference-genome root.  The genome folder inside each ``current_*``
+# directory is never hard-coded here: each of them holds exactly one
+# genome folder and that folder's name can change on the server
+# (rename/replace), so the real path is resolved once at startup from
+# the live filesystem (see the _resolve_reference_genome block below).
+CELLRANGER_REFERENCES_ROOT = "/home/gecf/references/cellranger_references"
+_HUMAN_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_human")
+_MOUSE_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_mouse")
+_HUMAN_MOUSE_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_human_and_mouse")
+
+
+def _resolve_reference_genome(current_dir, label):
+    """Return the genome path inside ``current_dir`` — its single subdirectory.
+
+    Only *current_* is guaranteed to persist across the analysis servers;
+    the genome folder it contains (refdata-gex-...) can be renamed or
+    replaced without the generator being updated.  Non-recursive, so an
+    inner ``old/`` tier never leaks in (only the current genome counts).
+    """
+    try:
+        children = sorted(p for p in os.listdir(current_dir)
+                          if os.path.isdir(os.path.join(current_dir, p)))
+    except OSError:
+        children = []
+    if children:
+        return os.path.join(current_dir, children[0])
+    print(f"WARNING: no genome folder found under {current_dir} "
+          f"({label}); the reference prompt will fall back to it as-is")
+    return current_dir
+
+
+HUMAN_GENOME_PATH = _resolve_reference_genome(_HUMAN_CURRENT_DIR, "Human")
+MOUSE_GENOME_PATH = _resolve_reference_genome(_MOUSE_CURRENT_DIR, "Mouse")
 # Combined human+mouse reference (single reference usable for a mix of
 # human and mouse samples) — offered as extra choice 3 in the genome
-# prompt.  The directory is a shared convention on the analysis server;
-# if it is absent on the caller's box, choice 3 is still listed (the
-# interactive menu does not probe the filesystem) — the generated script
-# will then fail its reference-genome existence check, which is the same
-# behaviour as choosing a custom path that does not exist yet.
-HUMAN_MOUSE_GENOME_PATH = (
-    "/home/gecf/references/cellranger_references/current_human_and_mouse"
-)
+# prompt.  Same auto-detection as the others: current_human_and_mouse
+# holds exactly one genome folder and its name is not hard-coded.
+# The directory is a shared convention on the analysis servers; if it is
+# absent on the caller's box, choice 3 is still listed and the generated
+# script will fail its reference-genome existence check (same behaviour as
+# choosing a custom path that does not exist yet).
+HUMAN_MOUSE_GENOME_PATH = _resolve_reference_genome(
+    _HUMAN_MOUSE_CURRENT_DIR, "Human+Mouse")
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
 
 # "TO delete" folder where processed datasheets are parked for later
