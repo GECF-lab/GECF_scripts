@@ -155,10 +155,11 @@ DELETE_FALLBACK = (
 # the script must land in the same place regardless of the caller's cwd.
 SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 
-# Version stamped into every <sample>_script_log.txt as
-# `GEX script version: <HERE>`. This is the GEX generator's own version
-# (generator version == generated-script version). Bump it on any change
-# to the generator.
+# Provenance: version stamped into the generated .sh header
+# (scriptversion=...) and into the script's own source as SCRIPT_VERSION.
+# Generator version == generated-script version; the kept .sh in the
+# archive tells you which one produced it.  Bump on any change to the
+# generator.
 SCRIPT_VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
@@ -506,9 +507,10 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
     lines.append(f"reference_genome_used={reference_genome}")
     lines.append(
-        # Version line stamped into each <sample>_script_log.txt ("CRcount
-        # script version"), mirroring CRmulti/CRarc.  Generator version ==
-        # generated-script version — edit SCRIPT_VERSION above to bump it.
+        # Provenance stamp in the kept .sh (copied into the run folder +
+        # archive): which GENERATOR produced this script.  The generator
+        # version == the generated-script version — edit SCRIPT_VERSION
+        # above to bump it.
         "scriptversion=" + SCRIPT_VERSION
     )
     lines.append("")
@@ -684,8 +686,10 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("#       a blank value drops that flag for that sample only")
     lines.append("#     * completion check: find <sample> -type d -name tmp")
     lines.append("#     * post-processing: rm -r <sample>/SC_RNA_COUNTER_CS")
-    lines.append("#     * rsync -avh <sample>/ + logs + md5 checksums -> the archive")
+    lines.append("#     * rsync -avh <sample>/ + logs -> the archive")
     lines.append("#     * TSO% library-quality metric (Read-2)")
+    lines.append("#   (the single whole-folder md5sums.txt is written ONCE, after")
+    lines.append("#   DISPATCH — see MD5 CHECKSUMS (WHOLE FOLDER), not per sample)")
     lines.append("#   The DISPATCH section below runs the functions either serially")
     lines.append("#   (max_parallel=1) or in a rolling pool of max_parallel jobs.")
     lines.append("# ============================================================")
@@ -721,19 +725,13 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         lines.append("")
         lines.append(f"# --- Run sample {idx}: {sn} ---")
         lines.append("function count_sample_" + str(idx) + "() {")
-        # Script log = version of this generator + the FULL cellranger command.
-        # Echoed from the SAME flag_lines list that is executed below, so the
-        # log can never drift from what actually runs.  Optional ${var:+...}
-        # expansions resolve at run time (the flag appears only when the
-        # per-sample value is set), and custom_options word-splits into
-        # multiple --flags.
-        _cmd = " ".join(t.strip() for t in flag_lines)
-        lines.append("{")
-        lines.append('    echo "GEX script version: ${scriptversion}"')
-        lines.append("    echo " + _cmd)
-        lines.append('} > "' + SFR + '/' + numbered_dir + '_script_log.txt"')
-        # Emit the (identical) command for execution, line-continuation
-        # formatted, from the same flag_lines list.
+        # Emit the command for execution, line-continuation formatted,
+        # from the SAME flag_lines list (so what runs is exactly what
+        # appears in the .sh).  The .sh itself (copied into the run
+        # folder + archive by KEEP A COPY OF THIS SCRIPT) is the
+        # provenance record; cellranger's own command.log in
+        # <sample>/outs/logs/ is the execution record — no separate
+        # per-sample script_log needed.
         for i, fl in enumerate(flag_lines):
             lines.append(fl + (_CONT if i < len(flag_lines) - 1 else ""))
 
@@ -758,20 +756,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         lines.append("fi")
         lines.append('rsync -avh "' + SFR + '/' + numbered_dir + '" "${NGSruns_folder}"')
         lines.append(
-            'rsync -avh "' + SFR + '/' + numbered_dir + '_script_log.txt" "${NGSruns_folder}"'
-        )
-        lines.append(
             'rsync -avh "' + SFR + '/' + numbered_dir + '_error_log.txt" "${NGSruns_folder}" 2>/dev/null'
-        )
-        # md5 checksum (output is SIBLING to the sample dir with relative ./ paths inside)
-        lines.append("# md5 checksum")
-        lines.append(
-            '( cd "' + SFR + '/' + numbered_dir
-            + '" && find . -type f | sort'
-            + ' | xargs md5sum > "../' + numbered_dir + '_md5_checksums.txt" )'
-        )
-        lines.append(
-            'rsync -avh "' + SFR + '/' + numbered_dir + '_md5_checksums.txt" "${NGSruns_folder}"'
         )
 
         # ---- TSO% library-quality metric ------------------------------------
@@ -1017,6 +1002,22 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append('    cp "${_self}" "${Server_folder}/$(basename "${_self}")" 2>/dev/null || true')
     lines.append('    cp "${_self}" "${NGSruns_folder}/$(basename "${_self}")" 2>/dev/null || true')
     lines.append("fi")
+    lines.append("")
+    lines.append("")
+    # ---- 7d) single md5 checksums file for the ENTIRE run folder -------
+    # One md5sums.txt covering every file under ${Server_folder} (sample dirs,
+    # logs, TSO report, summary metrics, the .sh copy — the whole tree), with
+    # paths relative to the folder.  Computed after every artifact is in
+    # place and rsync'd to the archive.  Placed after KEEP A COPY OF THIS
+    # SCRIPT so the .sh is included too; before LOCAL WORKDIR CLEANUP so
+    # the local files still exist for the checksum to be computed from.
+    lines.append("# ------------------------------------ MD5 CHECKSUMS (WHOLE FOLDER) ------------------------------------ #")
+    lines.append("#   One md5sums.txt covering the ENTIRE run folder (every file,")
+    lines.append("#   relative ./ paths).  Replace the old per-sample *_md5_checksums.txt files.")
+    lines.append('_md5_out="' + SFR + '/md5sums.txt"')
+    lines.append('( cd "' + SFR + '" && find . -type f ! -name "md5sums.txt" | sort | xargs md5sum > "md5sums.txt" )')
+    lines.append('echo "MD5 checksums (whole folder): ${_md5_out}"')
+    lines.append('rsync -avh "${_md5_out}" "${NGSruns_folder}" 2>/dev/null || true')
     lines.append("")
     lines.append("")
     # ---- 8) keepdata cleanup ----
