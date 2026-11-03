@@ -159,7 +159,7 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # `GEX script version: <HERE>`. This is the GEX generator's own version
 # (generator version == generated-script version). Bump it on any change
 # to the generator.
-SCRIPT_VERSION = "1.0"
+SCRIPT_VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (pipelines/common/TSO_percent.sh)
@@ -443,8 +443,15 @@ _PER_SAMPLE_PARAMS = (
 
 
 def build_script_full(reference_genome, pairs, user="", source_files=None,
-                      chosen_sample_dirs=None, added_paths=None):
+                      chosen_sample_dirs=None, added_paths=None,
+                      sample_order=False):
     """Build the complete `cellranger count` bash script (GEX).
+
+    *sample_order* (default False): order of samples as they appear in the
+    datasheet(s) — first-seen order preserved, NOT alphabetical sorting.
+    Only pass True when the input is a SINGLE Excel file (with several
+    files the cross-file order is ambiguous, so the alphabetical sort is
+    kept as the unambiguous fallback).
 
     Layout (top -> bottom):
       1. Header / constants (timestamp, reference genome).
@@ -472,7 +479,12 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     samples_to_fastqs = defaultdict(list)
     for sn, fq, avt in pairs:
         samples_to_fastqs[sn].append((fq, avt))
-    unique_samples = sorted(samples_to_fastqs.keys())
+    # Order: datasheet order (first-seen, insertion-preserving) or the
+    # alphabetical sort fallback (multi-file input — see docstring).
+    if sample_order:
+        unique_samples = list(samples_to_fastqs.keys())
+    else:
+        unique_samples = sorted(samples_to_fastqs.keys())
     n = len(unique_samples)
 
     # ---- 1) header / constants ----
@@ -634,9 +646,14 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("# Working directory: cellranger count output + post-processing (from RUN-WIDE PARAMETERS block)")
     lines.append('Server_folder="${scratch_root}/${server_folder_name}"')
     lines.append('mkdir -vp "${Server_folder}"')
+    lines.append("# Parts dir: each sample (possibly running in parallel) writes its")
+    lines.append("# TSO% report body here; the single centralized tso_report.txt is")
+    lines.append("# assembled from them after DISPATCH (see TSO% REPORT section).")
+    lines.append('mkdir -p "${Server_folder}/tso_report_parts"')
     lines.append("")
     lines.append('mkdir -p "${NGSruns_archive}/${server_folder_name}"')
-    lines.append("NGSruns_folder=${NGSruns_archive}/${server_folder_name}")
+    lines.append('NGSruns_folder=${NGSruns_archive}/${server_folder_name}')
+    SFR = "${Server_folder}"
     lines.append("")
     lines.append("# Check that the reference genome directory exists")
     lines.append('if [[ ! -d "${reference_genome_used}" ]]; then')
@@ -764,9 +781,12 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         #   * if it is already a file ending in *_R2_* — use it directly
         #   * otherwise take the first *_R2_* file in the dir (one avid
         #     folder holds exactly one R1 + one R2, so first == only)
-        # The report body is echoed AND written to a <sample>_tso_report.txt
-        # file (rsync'd to the NGSruns archive alongside the other per-sample
-        # artifacts).
+        # The report body is echoed to the console AND written to a
+        # PER-SAMPLE PART file under
+        # ${Server_folder}/tso_report_parts/<NN_sample>.txt.  One centralized
+        # tso_report.txt is assembled from all parts AFTER DISPATCH (samples
+        # may run in parallel, so each part has exactly one writer);
+        # see the "TSO% REPORT (SINGLE FILE)" section.
         if fastqs:
             _fq0_var = "path_%d_%s" % (idx, fastqs[0][0])
             tags = numbered_dir
@@ -780,9 +800,8 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
             lines.append("    done")
             lines.append("fi")
             lines.append('if [ -f "${_fq}" ]; then')
-            lines.append(f'    _tso_report="{SFR}/${{_TAGS}}_tso_report.txt"')
-            lines.append('    tso_percent "${_fq}" "${_TAGS}" | tee "${_tso_report}"')
-            lines.append(f'    rsync -avh "{SFR}/${{_TAGS}}_tso_report.txt" "${{NGSruns_folder}}" 2>/dev/null || true')
+            lines.append('    _tso_part="' + SFR + '/tso_report_parts/' + tags + '.txt"')
+            lines.append('    tso_percent "${_fq}" "${_TAGS}" | tee "${_tso_part}"')
             lines.append("else")
             lines.append(f'    echo "tso: no Read-2 fastq found near ${{{_fq0_var}}}; TSO% step skipped." >&2')
             lines.append("fi")
@@ -889,6 +908,37 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("done")
     lines.append("")
 
+    # ---- 6c) TSO% — assemble the ONE centralized report -------------------
+    # Samples (serially or in a parallel pool) each wrote their part under
+    # tso_report_parts/; now concatenate them, in sample order, into a single
+    # tso_report.txt and rsync that one file to the archive.  The working
+    # copy is removed (the archive copy is the deliverable; with
+    # keepdata=no the whole working dir is deleted below anyway).
+    lines.append("# ------------------------------------ TSO% REPORT (SINGLE FILE) ------------------------------------ #")
+    lines.append("#   Centralized TSO% report: one tso_report.txt gathering every sample's")
+    lines.append("#   per-sample section (from tso_report_parts/), in sample order.")
+    lines.append('_tso_out="' + SFR + '/tso_report.txt"')
+    lines.append("{")
+    lines.append('    echo "TSO% library-quality report — one section per sample"')
+    lines.append('    echo "Generated: $(date)"')
+    lines.append('    echo "Server folder: ' + SFR + '"')
+    lines.append('    echo "Samples: ' + str(n) + '"')
+    lines.append('    echo ""')
+    for idx_t, sn_t in enumerate(unique_samples, start=1):
+        part = f"{idx_t:02d}_{sn_t}"
+        lines.append(f'    if [ -f "{SFR}/tso_report_parts/{part}.txt" ]; then')
+        lines.append(f'        cat "{SFR}/tso_report_parts/{part}.txt"')
+        lines.append("    else")
+        lines.append(f'        echo "[{part}] (no TSO% report — no Read-2 fastq found or tso_percent skipped)" >&2')
+        lines.append(f'        echo "[{part}] (no report: Read-2 fastq not found or step skipped)"')
+        lines.append("    fi")
+        lines.append('    echo ""')
+    lines.append('} > "${_tso_out}"')
+    lines.append('rm -rf "' + SFR + '/tso_report_parts"')
+    lines.append('echo "TSO% report (single file): ${_tso_out}"')
+    lines.append('rsync -avh "${_tso_out}" "${NGSruns_folder}" 2>/dev/null || true')
+    lines.append("")
+
     # ---- 7) extract_summary_metrics ----
     #   copy per-sample web_summary.html / web_summary_cell_types.html /
     #   metrics_summary.csv into ${Server_folder}/raw_metrics_folder renamed
@@ -952,6 +1002,23 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append('rsync -avh "${SM_OUT}" "${NGSruns_folder}"')
     lines.append("")
 
+    # ---- 7b) copy the generating .sh into the project folders ----
+    # The user runs this script from their working directory (e.g.
+    # `./cellranger-count_AVT0571.sh`), so $0 points at it.  Save a copy in
+    # the local project folder AND the central archive, which both live
+    # under paths that outlive the caller's cwd.
+    lines.append("# ------------------------------------ KEEP A COPY OF THIS SCRIPT ------------------------------------ #")
+    lines.append("#   Copy the .sh used to generate this project into the project folders")
+    lines.append("#   (local working dir + central archive) so the exact pipeline is")
+    lines.append("#   preserved with the results.")
+    lines.append('if [ -n "${BASH_SOURCE:-}" ]; then _self="${BASH_SOURCE[0]}"')
+    lines.append('elif [ -n "${0:-}" ]; then _self="${0}"; fi')
+    lines.append('if [ -f "${_self:-/nonexistent}" ]; then')
+    lines.append('    cp "${_self}" "${Server_folder}/$(basename "${_self}")" 2>/dev/null || true')
+    lines.append('    cp "${_self}" "${NGSruns_folder}/$(basename "${_self}")" 2>/dev/null || true')
+    lines.append("fi")
+    lines.append("")
+    lines.append("")
     # ---- 8) keepdata cleanup ----
     lines.append("# ------------------------------------ LOCAL WORKDIR CLEANUP ------------------------------------ #")
     lines.append('#   After deploy to the archive, the local working folder is deleted')
@@ -967,15 +1034,25 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     # created only as a side effect of the mv, and we fall back to the
     # CRcount_GEXonly destination if Daniel's CR_pipelines tree is absent.
     lines.append("# ------------------------------------ DATASHEET CLEANUP ------------------------------------ #")
-    lines.append("#   Parked processed datasheets for later deletion.")
-    lines.append(f'#   Primary: {DELETE_PRIMARY}')
-    lines.append(f'#   Fallback: {DELETE_FALLBACK}')
+    lines.append("#   Park the Excel datasheets USED TO GENERATE THIS SCRIPT here for later")
+    lines.append("#   deletion — only these exact files; any other .xlsx in the working dir")
+    lines.append("#   is left untouched.  Absolute paths (captured at generation time), so")
+    lines.append("#   this works no matter where the script is launched from.")
+    lines.append(f"#   Primary: {DELETE_PRIMARY}")
+    lines.append(f"#   Fallback: {DELETE_FALLBACK}")
     lines.append(f'if [ -d "{DELETE_PRIMARY}" ]; then _delfolder="{DELETE_PRIMARY}"')
     lines.append(f'elif [ -d "{DELETE_FALLBACK}" ]; then _delfolder="{DELETE_FALLBACK}"')
     lines.append("fi")
     lines.append('if [ -n "${_delfolder:-}" ]; then')
-    lines.append('    mv datasheet*.txt "${_delfolder}" 2>/dev/null || true')
-    lines.append('    mv CR_count_datasheet*.txt "${_delfolder}" 2>/dev/null || true')
+    _srcs = []
+    for _s in (source_files or []):
+        _s_abs = os.path.abspath(_s)
+        if _s_abs not in _srcs:
+            _srcs.append(_s_abs)
+    for _s in _srcs:
+        # `${_delfolder}` must survive the f-string as literal bash:
+        # doubled braces `${{_delfolder}}` -> `${_delfolder}`.
+        lines.append(f'    mv "{_s}" "${{_delfolder}}" 2>/dev/null || true')
     lines.append("fi")
     lines.append("")
 
@@ -1164,7 +1241,13 @@ def main():
     script_content = build_script_full(reference_genome, all_pairs, user,
                                        source_files=xlsx_files,
                                        chosen_sample_dirs=chosen_for_build,
-                                       added_paths=added_paths)
+                                       added_paths=added_paths,
+                                       # Datasheet order for the 01_/02_/…
+                                       # numbering: only when a SINGLE Excel
+                                       # file drives the generation (with
+                                       # several files the cross-file order
+                                       # is ambiguous -> alphabetical).
+                                       sample_order=(len(xlsx_files) == 1))
     out_script = f"cellranger-count_{main_avt}.sh"
     with open(out_script, "w") as f:
         f.write(script_content)
