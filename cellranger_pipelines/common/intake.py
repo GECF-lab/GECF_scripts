@@ -11,7 +11,7 @@ and Visium) shares the same low-level workbook plumbing:
   reference genome, select / add samples) and the readline
   path-completion setup
 
-The per-assay generators (``pipelines/{atac,arc}/generate_cellranger_template_*.py``)
+The per-assay generators (``cellranger_pipelines/{atac,arc}/generate_cellranger_template_*.py``)
 import *these* helpers from here and layer their own sheet-selection, row-gate,
 AVT-extraction, and data-model logic on top.
 
@@ -19,13 +19,13 @@ This module is the single source of truth for the atoms.  If any of the helpers
 have a bug or need a format change, the fix lives in one place and propagates
 to all generators on their next import — no cross-file syncing required.
 
-Import convention (from a generator file at ``pipelines/<assay>/...py``):
+Import convention (from a generator file at ``cellranger_pipelines/<assay>/...py``):
 
     import os, sys
     _HERE      = os.path.dirname(os.path.abspath(__file__))
-    _PIPELINES = os.path.normpath(os.path.join(_HERE, ".."))
-    if _PIPELINES not in sys.path:
-        sys.path.insert(0, _PIPELINES)
+    _CELLRANGER_PIPELINES = os.path.normpath(os.path.join(_HERE, ".."))
+    if _CELLRANGER_PIPELINES not in sys.path:
+        sys.path.insert(0, _CELLRANGER_PIPELINES)
 
     from common.intake import (
         NGS_BASE_DIR_TEMPLATE,     # template literal w/ {avt_run} placeholder

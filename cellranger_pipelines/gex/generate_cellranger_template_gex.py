@@ -6,42 +6,11 @@ Usage:
     python3 generate_cellranger_template_gex.py file.xlsx [more.xlsx ...]
     python3 generate_cellranger_template_gex.py -n file.xlsx
 
-GEX-only pipeline (Elisa: `CRcount_GEXonly`). Reads one or more Excel
-datasheets (the `CR_count_datasheet_XXX_template.xlsx` layout) and emits a
-single self-contained bash script — `cellranger-count_AVT0XXX.sh` — with
-one `cellranger count` block per unique sample.
-
-Design follows the arc/atac generator pattern (common/intake atoms, shared
-parse_xlsx, one bash script out); only the emitted command and its output
-layout differ.
-
-Key differences from the arc/atac generators:
-
-  * Binary: plain `cellranger` (CellRanger 10.1.0), not `cellranger-arc` /
-    `cellranger-atac`.
-  * Reference flag: `--transcriptome` (arc/atac use `--reference`).
-  * Reference paths: gene-expression references under
-    `cellranger_references/current_human|current_mouse` (not the
-    `current_human_arc_ATAC|current_mouse_arc_ATAC` dirs arc/atac use).
-    The genome folder INSIDE each `current_...` dir is auto-detected at
-    generation time (each holds exactly one genome folder — e.g.
-    `refdata-gex-GRCh38-2024-A` today, but that name may be renamed or
-    replaced server-side), so no refdata-* name is hard-coded anywhere.
-  * Per-sample output leaves: `NN_<sample>` (no `_GEX` suffix — the
-    sample name already carries `_GEX`; atac still adds `_atac`, arc
-    `GEX_only`/`ATAC_only` under `cellranger-arc`).
-  * Post-processing: no web-summary HTML to collect (bare `cellranger count`
-    does not emit one) and no SC_* tree to delete. Summary.csv (run-level QC)
-    is still merged across samples.
-  * Archive destination:
-    `/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count/` (arc: `arc/`,
-    atac: `atac/`). The `count/` subfolder already exists on the server.
-  * Parallelism: each sample is a self-contained `count_sample <i>()`
-    function.  The dispatcher runs them either serially
-    (`max_parallel=1`) or in batches of `max_parallel` at a time
-    (`&` + `wait -n`), each sample still capped by its own
-    `--localcores`/`--localmem`.  The default (3) is sized for a
-    128-core / ~500 GB box: 3 x 32 cores, 3 x 126 GB.
+GEX-only pipeline. Reads one or more Excel datasheets (the
+`CR_count_datasheet_XXX_template.xlsx` layout) and emits a single
+self-contained bash script (`cellranger-count_AVT0XXX.sh`) with one
+`count_sample_<i>()` function per unique sample, plus the run-wide
+dispatch / post-processing / archive block.
 """
 
 import argparse
@@ -65,15 +34,15 @@ except ImportError:
         "Install it with: pip3 install openpyxl"
     )
 
-# Ensure the pipelines/ package root is on sys.path so ``common.intake``
-# resolves. The generator lives at ``pipelines/<assay>/`` so its parent
+# Ensure the cellranger_pipelines/ package root is on sys.path so ``common.intake``
+# resolves. The generator lives at ``cellranger_pipelines/<assay>/`` so its parent
 # dir is the package root.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PIPELINES_ROOT = os.path.normpath(os.path.join(_HERE, os.pardir))
-if _PIPELINES_ROOT not in sys.path:
-    sys.path.insert(0, _PIPELINES_ROOT)
+_CELLRANGER_PIPELINES_ROOT = os.path.normpath(os.path.join(_HERE, os.pardir))
+if _CELLRANGER_PIPELINES_ROOT not in sys.path:
+    sys.path.insert(0, _CELLRANGER_PIPELINES_ROOT)
 
-from common.intake import (  # noqa: E402
+from common.intake import (
     NGS_BASE_DIR_TEMPLATE,
     AVT_PATTERN,
     FASTQ_ID_PATTERN,
@@ -146,10 +115,10 @@ HUMAN_MOUSE_GENOME_PATH = _resolve_reference_genome(
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
 
 # "TO delete" folder where processed datasheets are parked for later
-# cleanup (shared GECF convention — see CRcount/CRarc/CRmulti). Two
-# destinations, tried in order: Daniel's CR_pipelines tree first, the
-# older CRcount_GEXonly layout as fallback.  The generated script uses
-# the first folder that exists and creates neither (no forced mkdir).
+# cleanup. Two destinations, tried in order: Daniel's CR_pipelines tree
+# first, the older CRcount_GEXonly layout as fallback.  The generated
+# script uses the first folder that exists and creates neither (no
+# forced mkdir).
 DELETE_PRIMARY = (
     "/home/gecf/NGS_pipelines/CR_pipeline/CR_pipelines_Daniel/TO_DELETE"
 )
@@ -158,7 +127,7 @@ DELETE_FALLBACK = (
 )
 
 # Root on the *analysis* server where cellranger count output + post-processing
-# are written (matches arc's convention). On that host this is a real, mounted
+# are written. On that host this is a real, mounted
 # path; on the dev box it is not expected to exist. Never derive from $PWD —
 # the script must land in the same place regardless of the caller's cwd.
 SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
@@ -171,15 +140,15 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 SCRIPT_VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
-# TSO% library-quality helper (pipelines/common/TSO_percent.sh)
+# TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
 # The body of `tso_percent()` is inlined once per generated script so the
 # analysis server needs no runtime dependency on this repo.
 # ---------------------------------------------------------------------------
-_TSO_HELPER_PATH = os.path.join(_PIPELINES_ROOT, "common", "TSO_percent.sh")
+_TSO_HELPER_PATH = os.path.join(_CELLRANGER_PIPELINES_ROOT, "common", "TSO_percent.sh")
 
 
 def _load_tso_helper_body() -> str:
-    """Return the region of ``pipelines/common/TSO_percent.sh`` up to the
+    """Return the region of ``cellranger_pipelines/common/TSO_percent.sh`` up to the
     ``# %%EMBED-END%%`` marker (the ``tso_percent()`` function and its
     comments, WITHOUT the standalone-runner footer).
 
@@ -188,7 +157,7 @@ def _load_tso_helper_body() -> str:
     """
     if not os.path.isfile(_TSO_HELPER_PATH):
         return (
-            "echo 'WARNING: pipelines/common/TSO_percent.sh not found "
+            "echo 'WARNING: cellranger_pipelines/common/TSO_percent.sh not found "
             f"(expected: {_TSO_HELPER_PATH}); tso_percent() will be a no-op.' >&2\n"
             "tso_percent() { :; }"
         )
@@ -463,22 +432,43 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     kept as the unambiguous fallback).
 
     Layout (top -> bottom):
-      1. Header / constants (timestamp, reference genome).
+      1. Header / constants (timestamp, reference genome, scriptversion,
+         the source files list, the requester).
       2. RUN-WIDE PARAMETERS — one editable block at the top of the script:
-         keepdata, scratch_root, server_folder_name, NGSruns_archive, and
-         the per-sample FASTQ path_* variables (resolved at generation time).
+         keepdata, max_parallel, scratch_root, server_folder_name,
+         NGSruns_archive, and the per-sample FASTQ path_* variables
+         (resolved at generation time).
       3. Per-sample parameter variables (one block per sample),
          editable in place; blank a value to drop the flag for that sample.
       4. Validation: ``--expect-cells`` and ``--force-cells`` are mutually
          exclusive per sample; if both are non-blank the script exits 1
          *before* any side effects.
-      5. Side effects: working dir + archive dir creation, reference
+      5. Side effects: working dir + archive dir creation, and a reference
          genome existence check (values come from the block in 2.).
-      6. One `cellranger count` call per sample, each using its own
-         *_<idx> variables.
-      7. Post-processing: merge per-sample ``summary.csv`` into one
-         ``all_summary.csv`` under ``<avt>_Summaries/``.
-      8. rsync the working dir up to the shared NGS-runs archive.
+      5a. The ``tso_percent()`` helper body inlined from
+         ``cellranger_pipelines/common/TSO_percent.sh`` (self-contained .sh — no repo
+         dependency on the analysis server).
+      6. One `count_sample_<i>()` per sample: a `cellranger count`
+         invocation using its `*_<idx>` variables, followed by that
+         sample's own post-processing (SC_RNA_COUNTER_CS cleanup, tmp-dir
+         completion check, TSO% metric to ``tso_report_parts/``, rsync of
+         the sample dir + error log to the archive).
+      6b/6c. DISPATCH (serial or a rolling pool of ``max_parallel``
+         concurrent samples), the per-sample status report, and the single
+         assembled ``tso_report.txt`` (concatenation of all parts, in
+         sample order).
+      7. ``extract_summary_metrics``: copy each sample's ``web_summary.html``,
+         ``cell_types/web_summary_cell_types.html`` and
+         ``metrics_summary.csv`` into ``raw_metrics_folder/`` (renamed
+         ``<sample>_...``), and build a merged ``summary_metrics.csv`` with
+         a Samplename column in the GECF metric order (1,2,3,8,4,21,20,19,13,17).
+      7b. Copy this .sh into the working folder and the archive as the
+         provenance record.
+      7d. A single ``md5sums.txt`` over the entire run folder (replaces
+         per-sample ``*_md5_checksums.txt``).
+      8. Local workdir cleanup — unless ``keepdata=yes``.
+      9. Park this run's source datasheets in the team "TO delete" folder
+         (first existing of the two DELETE_* destinations; no mkdir -p).
     """
     lines = []
 
@@ -550,8 +540,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("#   server_folder_name : working + archive leaf folder name.")
     lines.append("#                  default is <AVT>[_user]_<timestamp>; change only if needed.")
     lines.append(f'server_folder_name="{main_avt}{user_tag}_$TIMESTAMP"')
-    lines.append("#   NGSruns_archive  : central archive destination (shared with arc/atac;")
-    lines.append("#                  fixed target).")
+    lines.append("#   NGSruns_archive  : central archive destination (fixed target).")
     lines.append(f'NGSruns_archive="{NGSruns_ARCHIVE_DIR}"')
     lines.append("#   FASTQ paths : one per (sample, FASTQ) pair, resolved by the generator")
     lines.append("#                  at generation time under the AVT run tree.")
@@ -673,12 +662,12 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
 
     # ---- 5a) tso_percent() helper body — inlined from
-    #          pipelines/common/TSO_percent.sh so the generated .sh is
+    #          cellranger_pipelines/common/TSO_percent.sh so the generated .sh is
     #          self-contained on the analysis server (no repo dependency at
     #          run time).  Edit the .sh and regenerate to change behaviour ----
     lines.append("")
     lines.append("# ==============================================================================")
-    lines.append("# tso_percent helper (from pipelines/common/TSO_percent.sh, embedded verbatim)")
+    lines.append("# tso_percent helper (from cellranger_pipelines/common/TSO_percent.sh, embedded verbatim)")
     lines.append("# Computes Read-2 percentage metrics: intact TSO, intact SMART, polyA/polyT tails.")
     lines.append("# ==============================================================================")
     lines.extend(_TSO_HELPER_BODY.splitlines())
@@ -1038,10 +1027,10 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
 
     # ---- 9) park processed datasheets in the team "TO delete" folder ----
-    # (CRcount/CRarc/CRmulti convention — same mv, shared destination
-    # instead of a per-script ${mypwd}).  No mkdir -p: the target is
-    # created only as a side effect of the mv, and we fall back to the
-    # CRcount_GEXonly destination if Daniel's CR_pipelines tree is absent.
+    # Shared destination instead of a per-script ${mypwd}.  No mkdir -p:
+    # the target is created only as a side effect of the mv, and we fall
+    # back to the CRcount_GEXonly destination if Daniel's CR_pipelines
+    # tree is absent.
     lines.append("# ------------------------------------ DATASHEET CLEANUP ------------------------------------ #")
     lines.append("#   Park the Excel datasheets USED TO GENERATE THIS SCRIPT here for later")
     lines.append("#   deletion — only these exact files; any other .xlsx in the working dir")
@@ -1074,8 +1063,9 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Parses one or more GEX-only Excel datasheets and generates a "
-            "cellranger-count_AVT0XXX.sh script with one `cellranger count` "
-            "block per sample."
+            "cellranger-count_AVT0XXX.sh script with one "
+            "`count_sample_<i>()` function per sample, plus the run-wide "
+            "dispatch / post-processing / archive block."
         ),
         epilog="Example:\n  python3 %(prog)s samples.xlsx\n  python3 %(prog)s run1.xlsx run2.xlsx",
         formatter_class=argparse.RawDescriptionHelpFormatter,
