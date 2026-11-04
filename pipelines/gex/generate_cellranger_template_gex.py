@@ -103,6 +103,13 @@ _MOUSE_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_mouse")
 _HUMAN_MOUSE_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_human_and_mouse")
 
 
+def _is_version_check() -> bool:
+    """True when the user is only asking for ``-v``/``--version`` so the
+    import-time reference-genome scan can stay quiet (argparse hasn't run
+    yet but ``sys.argv`` already carries the flag)."""
+    return ("-v" in sys.argv or "--version" in sys.argv)
+
+
 def _resolve_reference_genome(current_dir, label):
     """Return the genome path inside ``current_dir`` — its single subdirectory.
 
@@ -118,8 +125,9 @@ def _resolve_reference_genome(current_dir, label):
         children = []
     if children:
         return os.path.join(current_dir, children[0])
-    print(f"WARNING: no genome folder found under {current_dir} "
-          f"({label}); the reference prompt will fall back to it as-is")
+    if not _is_version_check():
+        print(f"WARNING: no genome folder found under {current_dir} "
+              f"({label}); the reference prompt will fall back to it as-is")
     return current_dir
 
 
@@ -1071,6 +1079,12 @@ def main():
         ),
         epilog="Example:\n  python3 %(prog)s samples.xlsx\n  python3 %(prog)s run1.xlsx run2.xlsx",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"generate_cellranger_template_gex.py {SCRIPT_VERSION}",
+        help="Print the generator version and exit.",
     )
     parser.add_argument(
         "xlsx_files",
