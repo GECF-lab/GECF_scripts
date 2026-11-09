@@ -26,7 +26,7 @@ CSV (the same 3-column layout cellranger-arc consumes) and one
     cellranger-arc count \\
         --id=20260310_mAP_CD28_4_ED --description=avid12500,avid12499 \\
         --reference=$REF --libraries=libraries_20260310_mAP_CD28_4_ED.csv \\
-        --create-bam=true --localcores=44 --localmem=150 \\
+        --create-bam=true --localcores=32 --localmem=126 \\
         --cell-annotation-model=auto \\
         --tenx-cloud-token-path=/home/gecf/.config/txg/credentials
 
@@ -40,8 +40,10 @@ import argparse
 import os
 import re
 import sys
+import time
+import unicodedata
 import warnings
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 warnings.filterwarnings("ignore",
                         message="Data Validation extension is not supported")
@@ -54,24 +56,24 @@ except ImportError:
     sys.exit("Error: the python module 'openpyxl' is required.\n"
              "Install it with: pip3 install openpyxl")
 
-# Ensure the pipelines/ package root is on sys.path so ``common.intake``
-# resolves.  This file lives at ``pipelines/arc/`` so its parent is the
+# Ensure the cellranger_pipelines/ package root is on sys.path so ``common.intake``
+# resolves.  This file lives at ``cellranger_pipelines/arc/`` so its parent is the
 # package root.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PIPELINES_ROOT = os.path.normpath(os.path.join(_HERE, os.pardir))
-if _PIPELINES_ROOT not in sys.path:
-    sys.path.insert(0, _PIPELINES_ROOT)
+_CELLRANGER_PIPELINES_ROOT = os.path.normpath(os.path.join(_HERE, os.pardir))
+if _CELLRANGER_PIPELINES_ROOT not in sys.path:
+    sys.path.insert(0, _CELLRANGER_PIPELINES_ROOT)
 
-# Shared intake atoms — see pipelines/common/intake.py.  All the low-level
+# Shared intake atoms — see cellranger_pipelines/common/intake.py.  All the low-level
 # workbook helpers (norm, merged-cell lookup, cell read, the 'User:' label
 # scan) are imported from there and used by both this generator and the
 # ATAC generator on an identical code path.
-from common.intake import (  # noqa: E402
+from common.intake import (
     NGS_BASE_DIR_TEMPLATE,
     AVT_PATTERN,
     FASTQ_ID_PATTERN,   # row gate: ^avid\d{4,6}$ — single source of truth
-    LOCAL_CORES,        # cellranger --localcores (shared default "44")
-    LOCAL_MEM,          # cellranger --localmem   (shared default "150")
+    LOCAL_CORES,        # cellranger --localcores (shared default "32")
+    LOCAL_MEM,          # cellranger --localmem   (shared default "126")
     norm,
     build_merged_cell_lookup,
     get_cell_value,
@@ -80,16 +82,126 @@ from common.intake import (  # noqa: E402
     setup_readline_completer,
     ask_avt_run,
     ask_reference_genome,
+    # Parity items 3 & 4 (arc_gex_parity.md): the same shared helpers the
+    # GEX generator uses for its sample-selection prompt and the
+    # run-folder disambiguation (single source of truth in common.intake).
+    ask_sample_selection,        # keep/drop + add sheet-less samples (item 3)
+    list_sample_dirs,            # candidate dirs for one (AVT, sample) (item 4)
+    choose_sample_dir,           # pick ONE when >1 candidate  (item 4)
+    find_fastq_path_with_pref,   # resolve an avid id honouring the pick
 )
+
+# Provenance: version stamped into the generated .sh header
+# (``scriptversion=...``) and reportable on the generator itself via
+# ``-v``/``--version``.  Generator version == generated-script version;
+# the .sh kept in the archive tells you which one produced it.
+# Bump on any change to the generator.
+SCRIPT_VERSION = "1.0.0"
 
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc"
 
-HUMAN_GENOME_PATH = ("/home/gecf/references/cellranger_references/"
-                     "current_human_arc_ATAC/"
-                     "refdata-cellranger-arc-GRCh38-2024-A")
-MOUSE_GENOME_PATH = ("/home/gecf/references/cellranger_references/"
-                     "current_mouse_arc_ATAC/"
-                     "refdata-cellranger-arc-GRCm39-2024-A")
+# Reference-genome root.  The genome folder inside each ``current_*``
+# directory is never hard-coded here: each of them holds exactly one
+# genome folder and that folder's name can change on the server
+# (rename/replace), so the real path is resolved once at startup from
+# the live filesystem (see the _resolve_reference_genome block below).
+CELLRANGER_REFERENCES_ROOT = "/home/gecf/references/cellranger_references"
+_HUMAN_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_human_arc_ATAC")
+_MOUSE_CURRENT_DIR = os.path.join(CELLRANGER_REFERENCES_ROOT, "current_mouse_arc_ATAC")
+
+
+# ---------------------------------------------------------------------------
+# Requester -> safe path-segment (parity item 12).  Ported from the finished
+# GEX generator.  The requester string comes from the ``User:`` cell of the
+# datasheet and is not validated; it is sanitised to a CIFS-/URL-safe segment
+# before it is baked into the working-folder name, so an accented or
+# punctuation-laden requester cannot break the path.
+# ---------------------------------------------------------------------------
+def folder_safe(name: str) -> str:
+    """Reduce *name* (a requester string from the datasheet) to a safe
+    path-segment for the working-folder name.
+
+    Unicode is NFKD-decomposed and non-ASCII leftovers dropped, so accented
+    text like ``Cèsar`` becomes ``Cesar``; any other character that cannot
+    live in a CIFS path / URL is replaced with ``_`` and a trailing dot/space
+    is stripped (Windows).  Empty input yields ``""`` so the caller can omit
+    the whole ``_<user>`` segment instead of emitting a stray underscore.
+    """
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", name)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", s)
+    s = re.sub(r"_{2,}", "_", s).strip("._ ")
+    return s
+
+
+# ---------------------------------------------------------------------------
+# TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh).
+# The body of `tso_percent()` is inlined once per generated script so the
+# analysis server needs no runtime dependency on this repo.  Ported from the
+# finished GEX generator (parity item 9).
+# ---------------------------------------------------------------------------
+_TSO_HELPER_PATH = os.path.join(_CELLRANGER_PIPELINES_ROOT, "common", "TSO_percent.sh")
+
+
+def _load_tso_helper_body() -> str:
+    """Return the region of ``cellranger_pipelines/common/TSO_percent.sh`` up to
+    the ``# %%EMBED-END%%`` marker (the ``tso_percent()`` function and its
+    comments, WITHOUT the standalone-runner footer).
+
+    Returns a warning string if the file is absent so the generated script
+    still runs — the TSO% call will be skipped with a clear message.
+    """
+    if not os.path.isfile(_TSO_HELPER_PATH):
+        return (
+            "echo 'WARNING: cellranger_pipelines/common/TSO_percent.sh not found "
+            f"(expected: {_TSO_HELPER_PATH}); tso_percent() will be a no-op.' >&2\n"
+            "tso_percent() { :; }"
+        )
+    with open(_TSO_HELPER_PATH, encoding="utf-8") as fh:
+        text = fh.read()
+    marker = "# %%EMBED-END%%"
+    pos = text.rfind(marker)  # last occurrence, in case a comment mentions it
+    if pos == -1:
+        return text.rstrip()
+    return text[:pos].rstrip()
+
+
+_TSO_HELPER_BODY = _load_tso_helper_body()
+
+
+def _is_version_check() -> bool:
+    """True when the user is only asking for ``-v``/``--version`` so the
+    import-time reference-genome scan can stay quiet (argparse hasn't run
+    yet but ``sys.argv`` already carries the flag)."""
+    return ("-v" in sys.argv or "--version" in sys.argv)
+
+
+def _resolve_reference_genome(current_dir, label):
+    """Return the genome path inside ``current_dir`` — its single subdirectory.
+
+    Only *current_* is guaranteed to persist across the analysis servers;
+    the genome folder it contains (refdata-cellranger-arc-...) can be
+    renamed or replaced without the generator being updated.
+    Non-recursive, so an inner ``old/`` tier never leaks in (only the
+    current genome counts).
+    """
+    try:
+        children = sorted(p for p in os.listdir(current_dir)
+                          if os.path.isdir(os.path.join(current_dir, p)))
+    except OSError:
+        children = []
+    if children:
+        return os.path.join(current_dir, children[0])
+    if not _is_version_check():
+        print(f"WARNING: no genome folder found under {current_dir} "
+              f"({label}); the reference prompt will fall back to it as-is")
+    return current_dir
+
+
+HUMAN_GENOME_PATH = _resolve_reference_genome(_HUMAN_CURRENT_DIR, "Human")
+MOUSE_GENOME_PATH = _resolve_reference_genome(_MOUSE_CURRENT_DIR, "Mouse")
 
 # (AVT_PATTERN is imported from common.intake — see the import block above.)
 
@@ -100,6 +212,46 @@ EXCLUDED_BATCH_PATTERNS = (
     re.compile(r"for_check", re.IGNORECASE),
 )
 TENX_TOKEN_PATH = "/home/gecf/.config/txg/credentials"
+
+
+# Analysis-server working root (scratch) where cellranger-arc output is
+# written; emitted into the generated .sh's run-wide parameters block.
+SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
+
+# GEX parity item 8c: park the Excel datasheet(s) used to generate the
+# project .sh in a team "TO DELETE" folder for later cleanup.  Primary
+# first, fallback if it isn't on this server; whichever directory exists
+# at run time wins.
+DELETE_PRIMARY = (
+    "/home/gecf/NGS_pipelines/CR_pipeline/CR_pipelines_Daniel/TO_DELETE"
+)
+DELETE_FALLBACK = (
+    "/home/gecf/NGS_pipelines/CR_pipeline/CRarc_Multiome/TO_DELETE"
+)
+
+# GEX parity item 5: per-sample editable parameters emitted as one block
+# per sample at the top of the generated .sh (mirrors gex._PER_SAMPLE_PARAMS,
+# restricted to cellranger-arc's knobs: no include_introns/chemistry/
+# expect_cells/force_cells/r1_length/r2_length).
+#   * localcores            : number of cores, or blank (cellranger default)
+#   * localmem              : memory in GB, or blank (cellranger default)
+#   * create_bam            : true | false — emit aligned fastq BAM
+#   * cell_annotation_model : auto | <model name>, or blank (=auto)
+#   * custom_options        : extra flags as-is, e.g. --nosecondary --localvmem=300
+# A blank value ("") drops that flag for that sample.
+_ARC_PER_SAMPLE_PARAMS = (
+    ("localcores",            LOCAL_CORES,
+     "max cores; blank => cellranger default"),
+    ("localmem",              LOCAL_MEM,
+     "max GB of memory; blank => cellranger default"),
+    ("create_bam",            "true",
+     "true = emit aligned BAM (default); false = faster + smaller output"),
+    ("cell_annotation_model", "auto",
+     "auto | <cellranger-arc annotation model name>; blank = auto (default)"),
+    ("custom_options",        "",
+     "extra flags passed through as-is; e.g. --nosecondary --localvmem=300"),
+)
+
 
 
 # ─── input helpers ────────────────────────────────────────────────────
@@ -129,8 +281,37 @@ def _locate_header(ws, merged_lookup):
     return fastq_col, sample_col, header_row
 
 
+def _row_avt(ws, merged_lookup, row_idx, fastq_col, sample_col, fastq_txt):
+    """Per-row AVT run-name detection (parity item 11).
+
+    Mirrors the finished GEX generator: the AVT run name may sit in the
+    fastq-ID cell itself or in any *adjacent* cell of the same table row.
+    The fastq-ID column and the sample-name column are skipped (they carry
+    the avid id / the sample label, not the run).  Returns the upper-cased
+    run name (``AVT0XXX``) or ``None`` when this row does not name a run.
+    """
+    m = AVT_PATTERN.search(fastq_txt or "")
+    if m:
+        return m.group(0).upper()
+    for c in range(1, ws.max_column + 1):
+        if c == fastq_col or c == sample_col:
+            continue
+        val = get_cell_value(ws, merged_lookup, row_idx, c)
+        if val is None:
+            continue
+        cm = AVT_PATTERN.search(str(val))
+        if cm:
+            return cm.group(0).upper()
+    return None
+
+
 def _sheet_sample_rows(ws, merged_lookup):
-    """Extract (sample, fastq) rows from one sheet, or [] if it is not a data sheet."""
+    """
+    Extract (sample, fastq, avt) triples from one sheet, or [] if it is not a
+    data sheet.  Each row's ``avt`` is the per-run AVT name (``AVT0XXX``)
+    detected from the fastq-ID cell or an adjacent cell of that row, or
+    ``None`` when the row does not name a run (parity item 11).
+    """
     fastq_col, sample_col, header_row = _locate_header(ws, merged_lookup)
     if fastq_col is None or sample_col is None:
         return []
@@ -156,7 +337,9 @@ def _sheet_sample_rows(ws, merged_lookup):
             break
 
         if sample_txt and fastq_txt and FASTQ_ID_PATTERN.match(fastq_txt):
-            rows.append((sample_txt, fastq_txt))
+            rows.append((sample_txt, fastq_txt,
+                         _row_avt(ws, merged_lookup, row_idx,
+                                  fastq_col, sample_col, fastq_txt)))
             blank_streak = 0
         else:
             blank_streak += 1
@@ -215,9 +398,9 @@ def parse_xlsx(path):
     Parse one AVT submission workbook.
 
     Returns (rows, detected_avt) where ``rows`` is a list of
-    ``(sample_name, fastq_id)`` tuples (real library ids only) and
-    ``detected_avt`` is the AVT run name found in a cell or the file
-    name (or None).
+    ``(sample_name, fastq_id, avt_run)`` triples (real library ids only) and
+    ``detected_avt`` is the AVT run name found in a data row, any sheet cell,
+    or the file name (or None).
 
     Handles both the single-sheet layout of older submissions
     (e.g. AVT0519) and the 15-sheet GECF submission workbooks where the
@@ -227,30 +410,40 @@ def parse_xlsx(path):
 
     sheet_name, rows = best_data_sheet(wb)
     if rows:
-        # De-duplicate, preserving first-seen order.
+        # De-duplicate, preserving first-seen order.  Rows are
+        # (sample, fastq, avt) triples; the per-row avt rides along and is not
+        # part of the duplicate key (parity item 11).
         seen = set()
         deduped = []
-        for sample, fastq in rows:
+        for sample, fastq, avt in rows:
             key = (sample.lower(), fastq.lower())
             if key in seen:
                 continue
             seen.add(key)
-            deduped.append((sample, fastq))
+            deduped.append((sample, fastq, avt))
         rows = deduped
 
-    # Detect the AVT run name from any data row or, failing that, the file name.
-    detected_avt = None
-    for sample, fastq in rows:
-        m = AVT_PATTERN.search(sample) or AVT_PATTERN.search(fastq)
+    # Sheet-wide fallback: rows that do not name a run inherit the AVT run
+    # found in any data cell of the table (a run name written once in the
+    # sheet), so per-sample resolution still has a value to hang on.
+    sheet_avt = None
+    for sample, fastq, avt in rows:
+        m = (AVT_PATTERN.search(avt) if avt else None) \
+            or AVT_PATTERN.search(sample) or AVT_PATTERN.search(fastq)
         if m:
-            detected_avt = m.group(0).upper()
+            sheet_avt = m.group(0).upper()
             break
-    if detected_avt is None:
+    if sheet_avt:
+        rows = [(s, f, (a or sheet_avt)) for (s, f, a) in rows]
+
+    # Final fallback: the file name.
+    if sheet_avt is None:
         m = AVT_PATTERN.search(os.path.basename(path))
         if m:
-            detected_avt = m.group(0).upper()
+            sheet_avt = m.group(0).upper()
+            rows = [(s, f, (a or sheet_avt)) for (s, f, a) in rows]
 
-    return rows, detected_avt
+    return rows, sheet_avt
 
 
 def latest_avt(avt_names):
@@ -288,7 +481,10 @@ def group_libraries(rows):
     ``(full_name, fastq_id, modality)`` in original order.
     """
     groups = OrderedDict()
-    for sample, fid in rows:
+    for row in rows:
+        # Rows are (sample, fid, [avt]); the per-row avt rides separately via
+        # the fid->avt map built in main(), so it is not stored here.
+        sample, fid = row[0], row[1]
         full = sample.strip()
         if not full:
             continue
@@ -358,229 +554,582 @@ def print_groups_table(groups):
 _GEX, _ATAC = "Gene Expression", "Chromatin Accessibility"
 
 
-def build_script(reference_genome, groups, avt_run, user, run_dir):
+def build_script(reference_genome, groups, avt_run, user, run_dir,
+                 source_files=None, resolve=None):
+    """Emit the ``cellranger-arc_AVT0XXX.sh`` text.
+
+    ``resolve`` maps ``(sample_base, fastq_id)`` to a leaf directory (or
+    None); resolved at generation time and baked into the .sh as literal
+    path assignments.  When ``resolve`` is None the classic full-tree walk
+    (``resolve_fastq_leaf``) is used directly.
+
+    Layout (top -> bottom) — items 5–8 of the arc/GEX parity list:
+      1.  Header / constants (timestamp, reference, source files, requester,
+          scriptversion stamp, REFPATH, avt_run, user).
+      2.  RUN-WIDE PARAMETERS (editable at the top): keepdata, max_parallel,
+          scratch_root, server_folder_name, NGSruns_archive, then all FASTQ
+          path variables (resolved at generation time), then derived vars
+          (Server_folder, metrics_folder, archive_dir), mkdir, ref check.
+      3.  PER-SAMPLE PARAMETERS (item 5 — one block per sample): localcores,
+          localmem, create_bam, cell_annotation_model, custom_options;
+          blank a value to drop that flag for that sample.
+      4.  One ``arc_sample_<i>()`` function per sample: builds the libraries
+          CSV, runs ``cellranger-arc count`` (flags from the ``*_<i>``
+          variables in block 3), checks for leftover tmp folders, harvests
+          web summaries (joint + GEX_only + ATAC_only), deletes the
+          SC_ATAC_GEX_COUNTER_CS scratch tree, rsync's the sample dir and
+          auxiliary files to the archive.
+      5.  DISPATCH (item 6): serial (max_parallel=1) or rolling pool of
+          max_parallel concurrent arc samples.
+      6.  Per-sample status sweep (item 7): [OK]/[FAIL] per sample,
+          ``_overall_rc`` accumulator.
+      7.  rsync ``raw_metrics_folder`` to the archive (global — arc-specific).
+      8.  Whole-folder ``md5sums.txt`` (item 8a; replaces per-sample
+          ``*_md5_checksums.txt``).
+      9.  ``.sh`` copy to work folder + archive (item 8b).
+      10. keepdata cleanup.
+      11. TO_DELETE parking of the source .xlsx files (item 8c).
+      12. ``exit ${_overall_rc}``.
+    """
+    _resolve = (resolve if resolve is not None
+                else (lambda base, fid: resolve_fastq_leaf(run_dir, fid)))
     L = []
+
+    # ---- 1) header / constants -----------------------------------------------------------------
     L.append("#!/bin/bash")
-    L.append("set -euo pipefail")
-    L.append("")
-    L.append("# cellranger-arc — one `cellranger-arc count` per biologic sample.")
-    L.append("# Each sample carries a Gene Expression and a Chromatin")
-    L.append("# Accessibility library, resolved from the run's")
-    L.append("# `fastq_bases2fastq/<batch>/Samples/<experiment>/<avid>/` leaves.")
+    L.append("# cellranger-arc — one `cellranger-arc count` per biologic sample (GEX + ATAC Multiome).")
+    L.append(f"# Generated by generate_cellranger_template_arc.py ({len(groups)} sample(s)).")
+    L.append(f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _srcs = list(dict.fromkeys(source_files or []))
+    if _srcs:
+        L.append("# Source file(s):")
+        for _s in _srcs:
+            L.append(f"#   {os.path.basename(_s)}")
+    else:
+        L.append("# Source file(s): (not provided)")
     L.append(f"# Requester: {user or 'n/a'}")
+    # Provenance stamp in the kept .sh: which GENERATOR produced this script.
+    L.append("scriptversion=" + SCRIPT_VERSION)
     L.append("")
-
-    # Fixed paths.
+    L.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
+    L.append('REFPATH="' + reference_genome + '"')
     L.append(f"avt_run='{avt_run}'")
-    L.append(f'REFPATH="{reference_genome}"')
-    L.append(f'NGSruns_folder="{NGSruns_ARCHIVE_DIR}"')
-    # Local working folder where cellranger-arc writes its run dirs +
-    # libraries CSVs (separate from the raw fastq source folder above).
-    # Namespaced per run, same as CRarc_patched_full:
-    # /mnt/data/CellRangerCountOutput/<AVT>_<user>_<timestamp>/
-    L.append('scratch_root="/mnt/data/CellRangerCountOutput"')
-    L.append("timestamp=$(date +%Y%m%d-%H%M%S)")
-    L.append(f"user='{user or ''}'")
-    L.append('run_subdir="${avt_run}${user:+_${user}}_${timestamp}"')
-    L.append('Server_folder="${scratch_root}/${run_subdir}"')
-    L.append('metrics_folder="${Server_folder}/raw_metrics_folder"')
-    L.append('archive_dir="${NGSruns_folder}/${run_subdir}"')
-    L.append('# set keepdata="yes" to skip local cleanup (CS tree + workdir) at the end')
-    L.append('keepdata="no"')
-    L.append("run_ids=(" + " ".join(f"'{b}'" for b in groups) + ")")
-    L.append("")
-    L.append('mkdir -p "${metrics_folder}" \\')
-    L.append('    "${metrics_folder}/GEX_only" "${metrics_folder}/ATAC_only" \\')
-    L.append('    "${archive_dir}"')
-    L.append('cd "${Server_folder}"')
+    # Item 12: the requester string (datasheet ``User:`` cell) is not
+    # validated; clean it to a CIFS-/URL-safe path segment HERE at generation
+    # time so an accented / punctuation-laden name cannot later break the
+    # working-folder name.  If the result is empty, the ``${user:+_${user}}``
+    # conditional below simply omits the ``_user`` segment.
+    L.append("user='" + folder_safe(user or "") + "'")
     L.append("")
 
-    # One arc invocation per biologic sample.
+    # ---- 2) RUN-WIDE PARAMETERS (editable block) -----------------------------------------------
+    L.append("# ============================================================")
+    L.append("# RUN-WIDE PARAMETERS  (defaults — edit here)")
+    L.append("# ----------------------------------------------------------------")
+    L.append('#   keepdata : "yes" = keep the local working folder after the run;')
+    L.append('#               "no"  = delete it (data already rsynced to the archive).')
+    L.append('keepdata="no"')
+    L.append('#   max_parallel : how many cellranger-arc counts to run at the same time.')
+    L.append('#   1 = serial (one sample after another); N>1 = rolling pool of N jobs,')
+    L.append('#         the next sample starts as soon as a slot frees up.  Default is 3,')
+    L.append('#         i.e. 3 concurrent runs.  Each sample still caps its own CPU')
+    L.append('#         (--localcores_<#>) and RAM (--localmem_<#>), so max_parallel x these')
+    L.append('#         must fit within the server\'s total resources — set max_parallel=1')
+    L.append('#         to disable concurrency.')
+    L.append('max_parallel=3')
+    L.append('#   scratch_root : root on the analysis server where cellranger-arc output is written')
+    L.append('#                  (fixed convention — change only if the mount differs on your server).')
+    L.append('scratch_root="' + SCRATCH_ROOT + '"')
+    L.append('#   server_folder_name : working + archive leaf folder name.')
+    L.append('#                  default is <AVT>[_user]_<TIMESTAMP>; change only if needed.')
+    L.append('server_folder_name="${avt_run}${user:+_${user}}_$TIMESTAMP"')
+    L.append('#   NGSruns_archive: central archive destination (fixed target).')
+    L.append('NGSruns_archive="' + NGSruns_ARCHIVE_DIR + '"')
+    L.append("")
+
+    # Fastq paths — one variable per library, resolved at generation time
+    L.append("# ============================================================")
+    L.append("# FASTQ PATHS  (one per sample library — resolved at generation time)")
+    L.append("# ----------------------------------------------------------------")
+    L.append('#   If a variable is set to the empty string (""), the generator could not')
+    L.append('#   resolve the leaf directory — set the real path by hand before running.')
+    any_missing = False
     for idx, (base, libs) in enumerate(groups.items(), start=1):
-        ordered = sorted(
-            libs, key=lambda t: 0 if t[2] == _GEX else 1
-        )
+        ordered = sorted(libs, key=lambda t: 0 if t[2] == _GEX else 1)
+        L.append("")
+        L.append(f"# --- Sample {idx}: {base}  ({len(ordered)} library(ies)) ---")
+        for full, fid, modality in ordered:
+            if not fid:
+                var = f"fastq_{idx}_{modality.replace(' ', '_')}"
+                L.append(f'{var}=""   # (no fastq ID parsed — set the leaf path by hand)')
+                any_missing = True
+                continue
+            var = f"fastq_{idx}_{fid}"
+            leaf = _resolve(base, fid)
+            if leaf:
+                L.append(f'{var}="{leaf}"')
+            else:
+                L.append(f'{var}=""   # FIXME: leaf for \'{full}\' (fid {fid}) — set by hand before running')
+                any_missing = True
+    if any_missing:
+        L.append("")
+        L.append("# NOTE: at least one fastq variable is empty — set it before running.")
+        print("  Warning: some fastq leaves could not be resolved at generation time.",
+              file=sys.stderr)
+        print("  The flagged fastq_<idx>_<fid> variables must be set before running.",
+              file=sys.stderr)
+    L.append("")
+
+    # Derived working-dir variables (used throughout the sample functions)
+    L.append('Server_folder="${scratch_root}/${server_folder_name}"')
+    L.append('metrics_folder="${Server_folder}/raw_metrics_folder"')
+    L.append('archive_dir="${NGSruns_archive}/${server_folder_name}"')
+    L.append('mkdir -p "${metrics_folder}/GEX_only" "${metrics_folder}/ATAC_only"')
+    L.append('mkdir -p "${archive_dir}"')
+    L.append('mkdir -p "${Server_folder}/tso_report_parts"')
+    L.append("")
+
+    # Reference genome existence check (MUST run before any side effects beyond mkdir)
+    L.append("# Check that the reference genome directory exists")
+    L.append('if [[ ! -d "${REFPATH}" ]]; then')
+    L.append('    echo "Reference genome ${REFPATH} does not exist. Aborting." >&2')
+    L.append("    exit 1")
+    L.append("fi")
+    L.append("")
+
+    # ---- 3) PER-SAMPLE PARAMETERS (item 5) ------------------------------------------------------
+    L.append("# ============================================================")
+    L.append("# PER-SAMPLE PARAMETERS  (one block per sample — edit values in place)")
+    L.append("# ----------------------------------------------------------------")
+    L.append('#   * blank a value ( value="" )  -> that flag is DROPPED for that sample')
+    L.append("#   * localcores             : number of cores, or blank (cellranger default)")
+    L.append("#   * localmem               : memory in GB, or blank (cellranger default)")
+    L.append("#   * create_bam             : true | false")
+    L.append("#   * cell_annotation_model  : auto | <model name>, or blank (=auto)")
+    L.append("#   * custom_options         : extra flags as-is, e.g. --nosecondary --localvmem=300")
+    L.append("# ============================================================")
+    for idx, (base, libs) in enumerate(groups.items(), start=1):
+        L.append(f"# Sample {idx}: {base}")
+        for suffix, default, comment in _ARC_PER_SAMPLE_PARAMS:
+            base_str = f'{suffix}_{idx}="{default}"'
+            pad = max(1, 56 - len(base_str))
+            L.append(f"    {base_str}{' ' * pad}# {comment}")
+    L.append("")
+
+    # ---- tso_percent() library-quality helper (inlined from common/TSO_percent.sh) ----
+    # (parity item 9) The body of `tso_percent()` is inlined once per generated
+    # script, so the run needs no runtime dependency on the cellranger_pipelines
+    # repo.  Called per sample (from the arc_sample_<i>() functions) on the
+    # sample's GEX-leg Read-2 fastq.
+    #
+    # Emitted AFTER both parameter blocks (run-wide + per-sample) so every
+    # editable parameter is listed first and the tso_percent helper follows  —
+    # the same top-to-bottom order the GEX generated script uses.
+    L.append("# ==============================================================================")
+    L.append("# tso_percent helper (from cellranger_pipelines/common/TSO_percent.sh, embedded verbatim)")
+    L.append("# Computes Read-2 percentage metrics: intact TSO, intact SMART, polyA/polyT tails.")
+    L.append("# ==============================================================================")
+    L.append(_TSO_HELPER_BODY)
+    L.append("")
+
+    # ---- 4) arc_sample_<i>() functions (item 5 — wrapped in functions) ---------------------------
+    L.append("# ============================================================")
+    L.append("# PER-SAMPLE FUNCTIONS  (one arc_sample_<i> per biologic sample)")
+    L.append("#   Each function:")
+    L.append("#     * builds the libraries CSV for this sample")
+    L.append("#     * runs cellranger-arc count (flags from the *_<i> variables above)")
+    L.append("#     * checks for leftover tmp folders -> <sample>_error_log.txt")
+    L.append("#     * harvests web summaries (joint + GEX_only + ATAC_only)")
+    L.append("#     * deletes the SC_ATAC_GEX_COUNTER_CS scratch tree")
+    L.append("#     * rsync's the sample dir + libraries CSV + logs to the archive")
+    L.append("# ============================================================")
+
+    for idx, (base, libs) in enumerate(groups.items(), start=1):
+        ordered = sorted(libs, key=lambda t: 0 if t[2] == _GEX else 1)
         fids = [fid for _, fid, _ in ordered if fid]
         desc = ",".join(fids) if fids else base
         n_gex = sum(1 for _, _, m in libs if m == _GEX)
         n_atac = sum(1 for _, _, m in libs if m == _ATAC)
         csv_name = f"libraries_{base}.csv"
 
-        L.append(f"# ══ Sample {idx}: {base}  ({n_gex} GEX + {n_atac} ATAC) ══")
-        L.append("")
-        L.append(f'csv_path="${{Server_folder}}/{csv_name}"')
-        L.append('echo "fastqs,sample,library_type" > "${csv_path}"')
+        L.append(f"# --- arc_sample_{idx}() — Sample {idx}: {base}  ({n_gex} GEX + {n_atac} ATAC) ---")
+        L.append(f"arc_sample_{idx}() {{")
+        # cellranger-arc uses --id=<sample> and a relative --libraries=, so it
+        # MUST run from inside the Server_folder (its CWD becomes the run root).
+        L.append('    cd "${Server_folder}"')
 
+        # Build the libraries CSV (one row per library)
+        L.append(f'    csv_path="${{Server_folder}}/{csv_name}"')
+        L.append('    echo "fastqs,sample,library_type" > "${csv_path}"')
         for full, fid, modality in ordered:
-            leaf = resolve_fastq_leaf(run_dir, fid) if fid else None
-            if leaf:
-                L.append(
-                    f'echo "{leaf},{full},{modality}" >> "${{csv_path}}"'
-                )
-            else:
-                L.append(
-                    f"# NOTE: fastq leaf for '{full}' "
-                    f"(fid {fid or '-'}) was not resolved here; "
-                    f"fill in the directory below."
-                )
-                L.append(
-                    f'echo "/PATH/TO/Samples/.../{fid or full},{full},{modality}" '
-                    f'>> "${{csv_path}}"'
-                )
-
-        L.append(f'cmd_log="${{Server_folder}}/{base}_script_log.txt"')
-        # CRarc_patched_full (l.558) logs the exact command on ONE line. The
-        # emitted `echo "…"` body must therefore carry the logical newlines of
-        # the cellranger invocation as `\\` (escaped backslash) INSIDE the
-        # double-quoted shell string — bash then prints a literal `\` at each
-        # break, giving a single-line, readable log entry.
-        log_line = (
-            [
-                "cellranger-arc count",
-                f"--id={base}",
-                f"--description={desc}",
-                '--reference="$REFPATH"',
-                f"--libraries={csv_name}",
-                "--create-bam=true",
-                f"--localcores={LOCAL_CORES}",
-                f"--localmem={LOCAL_MEM}",
-                "--cell-annotation-model=auto",
-                f"--tenx-cloud-token-path={TENX_TOKEN_PATH}",
-            ]
-        )
-        log_body = " \\\\\n    ".join(log_line)
-        L.append(f'echo "{log_body}" > "${{cmd_log}}"')
-        L.append("cellranger-arc count \\")
-        L.append(f"    --id={base} \\")
-        L.append(f"    --description={desc} \\")
-        L.append('    --reference="$REFPATH" \\')
-        L.append(f"    --libraries={csv_name} \\")
-        L.append("    --create-bam=true \\")
-        L.append(f"    --localcores={LOCAL_CORES} \\")
-        L.append(f"    --localmem={LOCAL_MEM} \\")
-        L.append("    --cell-annotation-model=auto \\")
-        L.append(f"    --tenx-cloud-token-path={TENX_TOKEN_PATH}")
-        # CRarc_patched_full (l.567-573): after the arc call, probe for
-        # leftover `tmp` folders as an incomplete-count signal and persist
-        # the result to `<sample>_error_log.txt` (empty if all good).
-        L.append(
-            f'error_log="${{Server_folder}}/{base}_error_log.txt"'
-        )
-        L.append(
-            'find "${Server_folder}/' + base
-            + '" -mindepth 2 -maxdepth 2 -type d -name "tmp" -print '
-            '2>/dev/null > "${error_log}"'
-        )
-        L.append('if [ -s "${error_log}" ]; then')
-        err_msg = (
-            "    echo \"Error: cellranger-arc count for "
-            + base
-            + " didn't fully complete (leftover tmp folders detected). "
-            + "See "
-            + base
-            + "_error_log.txt\" >&2"
-        )
-        L.append(err_msg)
-        L.append('else')
-        L.append('    rm -f "${error_log}"')
-        L.append('fi')
+            var = (f"fastq_{idx}_{fid}" if fid
+                   else f"fastq_{idx}_{modality.replace(' ', '_')}")
+            L.append(f'    echo "${{{var}}},{full},{modality}" >> "${{csv_path}}"')
         L.append("")
 
-    # Post-processing: collect per-sample web summaries + summary CSV into
-    # raw_metrics_folder (matches CRarc_patched_full extract_summary_metrics),
-    # then archive everything to the NGSruns tree, then clean up locally.
-    L.append("# ══ Post-processing ══")
-    L.append("# Mirrors CRarc_patched_full::extract_summary_metrics (l.596-657).")
-    L.append('for sd in "${run_ids[@]}"; do')
+        # cellranger-arc count — flag_lines list = what runs AND appears in the .sh
+        flag_lines = [
+            'cellranger-arc count',
+            f'    --id={base}',
+            f'    --description={desc}',
+            '    --reference="${REFPATH}"',
+            f'    --libraries={csv_name}',
+        ]
+        for suffix, _default, _comment in _ARC_PER_SAMPLE_PARAMS:
+            v = f"{suffix}_{idx}"
+            if suffix == "custom_options":
+                flag_lines.append(f"    ${{{v}}}")
+            else:
+                flag = "--" + suffix.replace("_", "-")
+                flag_lines.append(f"    ${{{v}:+{flag}=${v}}}")
+        flag_lines.append(f'    --tenx-cloud-token-path={TENX_TOKEN_PATH}')
+
+        # Write the exact command to <base>_script_log.txt (one readable line)
+        L.append(f'    _cmd_log="${{Server_folder}}/{base}_script_log.txt"')
+        _log_body = " ".join(fl.strip() for fl in flag_lines)
+        L.append(f"    echo {_log_body!r} > \"${{_cmd_log}}\"")
+        L.append("")
+        # Execute the command (same flag_lines list, line-continuation formatted)
+        for i, fl in enumerate(flag_lines):
+            cont = " \\" if i < len(flag_lines) - 1 else ""
+            L.append(f"    {fl}{cont}")
+        L.append("")
+
+        # Completion check: leftover tmp folders indicate cellranger-arc count did not finish
+        L.append(f'    _err_log="${{Server_folder}}/{base}_error_log.txt"')
+        L.append(f'    find "${{Server_folder}}/{base}" -mindepth 2 -maxdepth 2 '
+                 f'-type d -name "tmp" -print 2>/dev/null > "${{_err_log}}"')
+        L.append('    if [ -s "${_err_log}" ]; then')
+        L.append(f'        echo "Error: cellranger-arc count for {base} did not complete '
+                 f'(leftover tmp folders detected).\\nSee ${{Server_folder}}/{base}_error_log.txt" >&2')
+        L.append('    else')
+        L.append('        rm -f "${_err_log}"')
+        L.append('    fi')
+        L.append("")
+
+        # Harvest web summaries (joint + GEX_only + ATAC_only)
+        L.append("    # Harvest web summaries (joint + GEX_only + ATAC_only)")
+        L.append(f'    if [ -f "${{Server_folder}}/{base}/outs/web_summary.html" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{base}/outs/web_summary.html" '
+                 f'"${{metrics_folder}}/{base}_web_summary.html"')
+        L.append("    fi")
+        L.append(f'    if [ -f "${{Server_folder}}/{base}/outs/summary.csv" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{base}/outs/summary.csv" '
+                 f'"${{metrics_folder}}/{base}_summary.csv"')
+        L.append(f'    elif [ -f "${{Server_folder}}/{base}/outs/metrics_summary.csv" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{base}/outs/metrics_summary.csv" '
+                 f'"${{metrics_folder}}/{base}_summary.csv"')
+        L.append('    else')
+        L.append(f'        echo "  [warn] no summary.csv/metrics_summary.csv for {base}" >&2')
+        L.append('    fi')
+        L.append(f'    if [ -f "${{Server_folder}}/{base}/outs/cell_types/web_summary_cell_types.html" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{base}/outs/cell_types/web_summary_cell_types.html" '
+                 f'"${{metrics_folder}}/{base}_web_summary_cell_types.html"')
+        L.append("    fi")
+        # GEX-only web summary (from the CS tree — harvest before CS-tree deletion)
+        L.append(f'    _gex_web=$(find "${{Server_folder}}/{base}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/GEX_SUMMARIZE_REPORTS" \\')
+        L.append('        -path "*/files/web_summary.html" -type f 2>/dev/null | head -1 || true)')
+        L.append('    if [ -n "${_gex_web}" ]; then')
+        L.append(f'        cp "${{_gex_web}}" "${{metrics_folder}}/GEX_only/{base}_web_summary.html"')
+        L.append('    else')
+        L.append(f'        echo "  [warn] no GEX-only web summary for {base}" >&2')
+        L.append('    fi')
+        # ATAC-only web summary (from the CS tree)
+        L.append(f'    _atac_web=$(find "${{Server_folder}}/{base}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/_SC_ATAC_REPORTER/CREATE_WEBSUMMARY" \\')
+        L.append('        -path "*/files/web_summary.html" -type f 2>/dev/null | head -1 || true)')
+        L.append('    if [ -n "${_atac_web}" ]; then')
+        L.append(f'        cp "${{_atac_web}}" "${{metrics_folder}}/ATAC_only/{base}_web_summary.html"')
+        L.append('    else')
+        L.append(f'        echo "  [warn] no ATAC-only web summary for {base}" >&2')
+        L.append('    fi')
+        L.append("")
+
+        # Delete the SC_ATAC_GEX_COUNTER_CS scratch tree (summaries already harvested)
+        L.append("    rm -r \"${Server_folder}/" + base + "/SC_ATAC_GEX_COUNTER_CS\" 2>/dev/null || true")
+        L.append("")
+
+        # rsync sample dir + auxiliary files to the archive
+        L.append("    # Archive this sample + auxiliary files")
+        L.append('    if command -v rsync >/dev/null 2>&1; then')
+        L.append(f'        if [ -d "${{Server_folder}}/{base}" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{base}" "${{archive_dir}}/"')
+        L.append('        fi')
+        L.append(f'        if [ -f "${{Server_folder}}/{csv_name}" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{csv_name}" "${{archive_dir}}/"')
+        L.append('        fi')
+        L.append(f'        if [ -f "${{Server_folder}}/{base}_script_log.txt" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{base}_script_log.txt" "${{archive_dir}}/"')
+        L.append('        fi')
+        L.append(f'        if [ -f "${{Server_folder}}/{base}_error_log.txt" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{base}_error_log.txt" "${{archive_dir}}/" 2>/dev/null || true')
+        L.append('        fi')
+        L.append('    fi')
+
+        # ---- TSO% library-quality metric (parity item 9) — GEX leg only ----
+        # intact-TSO / intact-SMART / polyA+polyT fractions, measured on a
+        # downsampled Read-2 subset of the GEX-leg fastq.  The ATAC leg is
+        # chromatin and carries no meaningful TSO% reading, so it is never
+        # measured.  The report body is tee'd to a per-sample part under
+        # tso_report_parts/; the single centralized tso_report.txt is
+        # assembled AFTER DISPATCH (samples may run concurrently, so each
+        # part has exactly one writer).  See the "TSO% REPORT (SINGLE FILE)"
+        # section below.
+        gex_fid = next((fid for _, fid, m in libs if m == _GEX), None)
+        if gex_fid is not None:
+            _tso_var = f"fastq_{idx}_{gex_fid}"
+            _tso_tags = f"{idx:02d}_{base}"
+            L.append("")
+            L.append("    # TSO% library-quality metric (Read-2 only) — intact TSO/SMART + poly tails")
+            L.append(f'    _tso_fq="${{{_tso_var}}}"')
+            L.append(f'    _tso_tags="{_tso_tags}"')
+            L.append('    if [ ! -f "${_tso_fq}" ] && [ -d "${_tso_fq}" ]; then')
+            L.append('        for _c in "${_tso_fq}"/*_R2_*.fastq.gz "${_tso_fq}"/*_R2.fastq.gz; do')
+            L.append('            [ -f "${_c}" ] && { _tso_fq="${_c}"; break; }')
+            L.append("        done")
+            L.append("    fi")
+            L.append('    if [ -f "${_tso_fq}" ]; then')
+            L.append(f'        _tso_part="${{Server_folder}}/tso_report_parts/{_tso_tags}.txt"')
+            L.append('        tso_percent "${_tso_fq}" "${_tso_tags}" | tee "${_tso_part}"')
+            L.append("    else")
+            L.append(f'        echo "tso: no Read-2 fastq near {_tso_var}; TSO% step skipped." >&2')
+            L.append("    fi")
+        else:
+            L.append("")
+            L.append(f'    echo "[{idx:02d}_{base}] no GEX leg in this sample; TSO% step skipped (ATAC-only)" >&2')
+
+        L.append("}")
+        L.append("")
+
+    # ---- 5) DISPATCH (item 6) -------------------------------------------------------------------
+    N = len(groups)
+    L.append("# ============================================================")
+    L.append("# DISPATCH  (run arc_sample_1 .. arc_sample_" + str(N) + ")")
+    L.append("#   max_parallel=1 : serial, one sample after another")
+    L.append("#   max_parallel=N : rolling pool of N concurrent cellranger-arc counts —")
+    L.append("#                    the next sample starts as soon as a slot frees up")
+    L.append("#   (default 3 in the generated script — see RUN-WIDE PARAMETERS above)")
+    L.append("# ============================================================")
+    L.append("NSAMPLES=" + str(N))
+    L.append('case "${max_parallel}" in')
+    L.append("    ''|*[!0-9]*)")
+    L.append('        echo "ERROR: max_parallel must be a positive integer" >&2')
+    L.append("        exit 1")
+    L.append("    ;;")
+    L.append("esac")
+    L.append('if [ "${max_parallel}" -lt 1 ]; then')
+    L.append('    echo "ERROR: max_parallel must be >= 1" >&2')
+    L.append("    exit 1")
+    L.append("fi")
+    L.append("# Cap max_parallel at NSAMPLES (no point requesting more slots than samples)")
+    L.append('if [ "${max_parallel}" -gt "${NSAMPLES}" ]; then')
+    L.append('    echo "Note: only ${NSAMPLES} sample(s) — capping max_parallel ${max_parallel} -> ${NSAMPLES}." >&2')
+    L.append("    max_parallel=${NSAMPLES}")
+    L.append("fi")
     L.append("")
-    # 1) Joint web summary — always present.
-    L.append('    if [ -f "${Server_folder}/${sd}/outs/web_summary.html" ]; then')
-    L.append('        cp "${Server_folder}/${sd}/outs/web_summary.html" \\')
-    L.append('            "${metrics_folder}/${sd}_web_summary.html"')
-    L.append("    fi")
-    # 2) Joint metrics CSV — name differs by pipeline layout (multiome/CR>=v8
-    #    use summary.csv, older GEX-only uses metrics_summary.csv).
-    L.append('    if [ -f "${Server_folder}/${sd}/outs/summary.csv" ]; then')
-    L.append('        cp "${Server_folder}/${sd}/outs/summary.csv" \\')
-    L.append('            "${metrics_folder}/${sd}_summary.csv"')
-    L.append("    elif [ -f \"${Server_folder}/${sd}/outs/metrics_summary.csv\" ]; then")
-    L.append('        cp "${Server_folder}/${sd}/outs/metrics_summary.csv" \\')
-    L.append('            "${metrics_folder}/${sd}_metrics_summary.csv"')
-    L.append('    else')
-    L.append('        echo "  [warn] no summary.csv or metrics_summary.csv for ${sd}" >&2')
-    L.append("    fi")
-    # 3) Optional: cell-type web summary.
-    L.append('    if [ -f "${Server_folder}/${sd}/outs/cell_types/web_summary_cell_types.html" ]; then')
-    L.append('        cp "${Server_folder}/${sd}/outs/cell_types/web_summary_cell_types.html" \\')
-    L.append('            "${metrics_folder}/${sd}_web_summary_cell_types.html"')
-    L.append("    fi")
-    # 4) Optional: GEX-only internal web summary — located by stage name
-    #    under the arc CS tree, independent of fork/join/chnk depth.
-    L.append(
-        '    gex_web=$(find "${Server_folder}/${sd}/SC_ATAC_GEX_COUNTER_CS/'
-        'SC_ATAC_GEX_COUNTER/GEX_SUMMARIZE_REPORTS" \\'
-    )
-    L.append('        -path "*/files/web_summary.html" -type f 2>/dev/null | head -1 || true)')
-    L.append('    if [ -n "$gex_web" ]; then')
-    L.append('        cp "$gex_web" "${metrics_folder}/GEX_only/${sd}_web_summary.html"')
+    L.append('if [ "${max_parallel}" -eq 1 ]; then')
+    L.append("    # --- SERIAL ---")
+    L.append("    for (( _s = 1; _s <= ${NSAMPLES}; _s++ )); do")
+    L.append("        arc_sample_${_s}")
+    L.append("    done")
+    L.append("else")
+    L.append("    # --- ROLLING POOL OF ${max_parallel} CONCURRENT JOBS ---")
+    L.append("    # Slot arrays: _pids[_i] = PID, _idxs[_i] = sample number")
+    L.append("    declare -a _pids=() _idxs=()")
+    L.append("    for (( _i = 0; _i < ${max_parallel}; _i++ )); do")
+    L.append('        _pids[$_i]=""')
+    L.append("        _idxs[$_i]=0")
+    L.append("    done")
+    L.append("    _next=1")
+    L.append("    while :; do")
+    L.append("        # 1) reap finished slots")
+    L.append("        for (( _i = 0; _i < ${max_parallel}; _i++ )); do")
+    L.append('            if [ -n "${_pids[$_i]}" ] && ! kill -0 "${_pids[$_i]}" 2>/dev/null; then')
+    L.append('                wait "${_pids[$_i]}"')
+    L.append("                _rv=$?")
+    L.append('                echo "[REAP] sample #${_idxs[$_i]} finished (rc=${_rv})"')
+    L.append('                _pids[$_i]=""')
+    L.append("            fi")
+    L.append("        done")
+    L.append("        # 2) fill free slots with the next sample (if any remain)")
+    L.append("        _launched=0")
+    L.append("        for (( _i = 0; _i < ${max_parallel}; _i++ )); do")
+    L.append('            if [ -z "${_pids[$_i]}" ] && [ "${_next}" -le "${NSAMPLES}" ]; then')
+    L.append("                arc_sample_${_next} &")
+    L.append("                _pids[$_i]=$!")
+    L.append("                _idxs[$_i]=${_next}")
+    L.append("                _next=$(( _next + 1 ))")
+    L.append("                _launched=1")
+    L.append("            fi")
+    L.append("        done")
+    L.append("        # 3) exit when all samples launched AND all jobs reaped")
+    L.append("        _busy=0")
+    L.append("        for (( _i = 0; _i < ${max_parallel}; _i++ )); do")
+    L.append('            [ -n "${_pids[$_i]}" ] && _busy=1')
+    L.append("        done")
+    L.append('        if [ "${_next}" -gt "${NSAMPLES}" ] && [ "${_busy}" -eq 0 ]; then')
+    L.append("            break")
+    L.append("        fi")
+    L.append("        if [ \"${_launched}\" -eq 0 ] && [ \"${_next}\" -le \"${NSAMPLES}\" ]; then")
+    L.append("            sleep 1")
+    L.append("        fi")
+    L.append("    done")
+    L.append("fi")
+    L.append("")
+
+    # ---- 6) per-sample status sweep (item 7) -----------------------------------------------------
+    L.append("# ============================================================")
+    L.append("# PER-SAMPLE STATUS REPORT")
+    L.append("#   Each sample's own completion markers determine the outcome:")
+    L.append("#     *_error_log.txt non-empty  -> cellranger-arc count left tmp dirs on failure")
+    L.append("#     no outs/summary.csv        -> cellranger-arc count never completed")
+    L.append("# ============================================================")
+    L.append("_overall_rc=0")
+    _dirs_bash = " ".join('"' + base + '"' for base in groups)
+    L.append("for _d in " + _dirs_bash + "; do")
+    L.append('    if [ -s "${Server_folder}/${_d}_error_log.txt" ]; then')
+    L.append('        echo "[FAIL] ${_d}  (see ${Server_folder}/${_d}_error_log.txt)" >&2')
+    L.append("        _overall_rc=1")
+    L.append('    elif [ ! -f "${Server_folder}/${_d}/outs/summary.csv" ] && [ ! -f "${Server_folder}/${_d}/outs/metrics_summary.csv" ]; then')
+    L.append('        echo "[FAIL] ${_d}  (no summary output — cellranger-arc count did not complete)" >&2')
+    L.append("        _overall_rc=1")
     L.append("    else")
-    L.append('        echo "  [warn] no GEX-only web_summary for ${sd} (GEX_SUMMARIZE_REPORTS absent)" >&2')
+    L.append('        echo "[ OK ] ${_d}"')
     L.append("    fi")
-    # 5) Optional: ATAC-only internal web summary (same layout-robust lookup).
-    L.append(
-        '    atc_web=$(find "${Server_folder}/${sd}/SC_ATAC_GEX_COUNTER_CS/'
-        'SC_ATAC_GEX_COUNTER/_SC_ATAC_REPORTER/CREATE_WEBSUMMARY" \\'
-    )
-    L.append('        -path "*/files/web_summary.html" -type f 2>/dev/null | head -1 || true)')
-    L.append('    if [ -n "$atc_web" ]; then')
-    L.append('        cp "$atc_web" "${metrics_folder}/ATAC_only/${sd}_web_summary.html"')
-    L.append("    else")
-    L.append('        echo "  [warn] no ATAC-only web_summary for ${sd} (CREATE_WEBSUMMARY absent)" >&2')
-    L.append("    fi")
-    # 6) md5 checksums over the sample run dir (CRarc_patched_full l.582-584).
-    L.append('    find "${Server_folder}/${sd}" -type f 2>/dev/null | sort \\')
-    L.append('        | xargs md5sum 2>/dev/null \\')
-    L.append('        | sed "s|${Server_folder}||" \\')
-    L.append('        > "${Server_folder}/${sd}_md5_checksums.txt"')
     L.append("done")
     L.append("")
-    L.append('echo "=== archives ==="')
-    L.append('if command -v rsync >/dev/null 2>&1; then')
-    L.append('    for sd in "${run_ids[@]}"; do')
-    L.append('        if [ -d "${Server_folder}/${sd}" ]; then')
-    L.append('            rsync -avh "${Server_folder}/${sd}" "${archive_dir}/"')
-    L.append("        fi")
-    L.append('        if [ -f "${Server_folder}/libraries_${sd}.csv" ]; then')
-    L.append('            rsync -avh "libraries_${sd}.csv" "${archive_dir}/"')
-    L.append("        fi")
-    L.append('        if [ -f "${Server_folder}/${sd}_script_log.txt" ]; then')
-    L.append('            rsync -avh "${sd}_script_log.txt" "${archive_dir}/"')
-    L.append("        fi")
-    L.append('        if [ -f "${Server_folder}/${sd}_error_log.txt" ]; then')
-    L.append('            rsync -avh "${sd}_error_log.txt" "${archive_dir}/"')
-    L.append("        fi")
-    L.append('        if [ -f "${Server_folder}/${sd}_md5_checksums.txt" ]; then')
-    L.append('            rsync -avh "${sd}_md5_checksums.txt" "${archive_dir}/"')
-    L.append("        fi")
-    L.append("    done")
-    L.append('    if [ -d "${metrics_folder}" ]; then')
-    L.append('        rsync -avh "${metrics_folder}/" "${archive_dir}/raw_metrics_folder/"')
-    L.append("    fi")
+
+    # ---- 6b) TSO% REPORT (single file) — parity item 9 -------------------------------------------
+    L.append("# ============================================================")
+    L.append("# TSO% REPORT  (SINGLE FILE)")
+    L.append("#   Assembles one tso_report.txt from the per-sample parts under")
+    L.append("#   tso_report_parts/ (each GEX-leg sample's intact-TSO / intact-SMART /")
+    L.append("#   polyA+polyT block), in sample order.  ATAC-only samples write")
+    L.append("#   no part (no Read-2 fastq to measure) and are simply absent.")
+    L.append("# ============================================================")
+    L.append('_tso_out="${Server_folder}/tso_report.txt"')
+    L.append("{")
+    L.append('    echo "# ============================================================"')
+    L.append('    echo "# TSO% REPORT — ' + str(len(groups)) + ' sample(s) — AVT run: ${avt_run}"')
+    L.append('    echo "# Generated: $(date -u)  —  generator ' + SCRIPT_VERSION + '"')
+    L.append('    echo "# (per sample: intact TSO % / intact SMART % / polyA tail % / polyT tail %)"')
+    L.append('    echo "# ============================================================"')
+    L.append('    echo ""')
+    for idx, (base, _libs) in enumerate(groups.items(), start=1):
+        _tag = "%02d_%s" % (idx, base)
+        L.append('    if [ -f "${Server_folder}/tso_report_parts/%s.txt" ]; then' % _tag)
+        L.append('        echo "### Sample %d: %s (TSO%%) ###"' % (idx, base))
+        L.append('        cat "${Server_folder}/tso_report_parts/%s.txt"' % _tag)
+        L.append('        echo ""')
+        L.append("    fi")
+    L.append('} > "${_tso_out}"')
+    L.append('rm -rf "${Server_folder}/tso_report_parts"')
+    L.append('echo "TSO%% report (single file): ${_tso_out}"')
+    L.append('if command -v rsync >/dev/null 2>&1; then rsync -avh "${_tso_out}" "${archive_dir}/" 2>/dev/null || true; fi')
+    L.append("")
+
+    # ---- 6c) MERGED SUMMARY METRICS (one summary_metrics.csv) — parity item 10 ---------------------
+    L.append("# ============================================================")
+    L.append("# MERGED SUMMARY METRICS  (one summary_metrics.csv, Samplename column first)")
+    L.append("#   Gathers each sample's outs/summary.csv into a single CSV so all")
+    L.append("#   samples' key metrics can be read in one table.")
+    L.append("# ============================================================")
+    L.append('SM_TMP="${Server_folder}/summary_metrics_tmp.csv"')
+    L.append('SM_OUT="${Server_folder}/summary_metrics.csv"')
+    L.append(': > "${SM_TMP}"')
+    L.append('_sm_hdr_written=0')
+    for _base in groups:
+        L.append('    _sm_src="${Server_folder}/%s/outs/summary.csv"' % _base)
+        L.append('    [ -f "${_sm_src}" ] || _sm_src="${Server_folder}/%s/outs/metrics_summary.csv"' % _base)
+        L.append('    if [ -f "${_sm_src}" ]; then')
+        L.append('        _sm_hdr=$(head -n1 "${_sm_src}" | tr -d "\\t")')
+        L.append('        _sm_dat=$(tail -n +2 "${_sm_src}" | head -n1 | tr -d "\\t")')
+        L.append('        if [ "${_sm_hdr_written}" -eq 0 ] && [ -n "${_sm_hdr}" ]; then')
+        L.append('            echo "Samplename,${_sm_hdr}" > "${SM_TMP}"')
+        L.append('            _sm_hdr_written=1')
+        L.append('        fi')
+        L.append('        if [ -n "${_sm_dat}" ]; then echo "%s,${_sm_dat}" >> "${SM_TMP}"; fi' % _base)
+        L.append("    fi")
+    L.append('if [ -s "${SM_TMP}" ]; then')
+    L.append('    cp "${SM_TMP}" "${SM_OUT}"')
+    L.append('    rm -f "${SM_TMP}"')
+    L.append('    echo "Merged summary metrics: ${SM_OUT}"')
+    L.append('    if command -v rsync >/dev/null 2>&1; then rsync -avh "${SM_OUT}" "${archive_dir}/" 2>/dev/null || true; fi')
+    L.append("else")
+    L.append('    rm -f "${SM_TMP}"')
+    L.append('    echo "  [warn] no per-sample summary.csv found; summary_metrics.csv not created" >&2')
     L.append("fi")
     L.append("")
-    # Local cleanup, same logic as CRarc_patched_full: drop the big
-    # SC_ATAC_GEX_COUNTER_CS trees first (only after web summaries are copied),
-    # then delete the local workdir unless keepdata=yes.
-    L.append('if [ "${keepdata}" != "yes" ]; then')
-    L.append('    for sd in "${run_ids[@]}"; do')
-    L.append('        if [ -d "${Server_folder}/${sd}/SC_ATAC_GEX_COUNTER_CS" ]; then')
-    L.append('            rm -r "${Server_folder}/${sd}/SC_ATAC_GEX_COUNTER_CS"')
-    L.append("        fi")
-    L.append("    done")
-    L.append('    rm -r "${Server_folder}" 2>/dev/null')
+
+    # ---- 7) rsync raw_metrics_folder -------------------------------------------------------------
+    L.append("# ============================================================")
+    L.append("# POST-PROCESSING  (rsync raw_metrics_folder to the archive)")
+    L.append("# ============================================================")
+    L.append('if [ -d "${metrics_folder}" ] && command -v rsync >/dev/null 2>&1; then')
+    L.append('    rsync -avh "${metrics_folder}/" "${archive_dir}/raw_metrics_folder/"')
     L.append("fi")
     L.append("")
+
+    # ---- 8a) whole-folder md5sums.txt (item 8) ---------------------------------------------------
+    L.append("# ============================================================")
+    L.append("# MD5 CHECKSUMS  (WHOLE FOLDER)")
+    L.append("#   One md5sums.txt covering every file under ${Server_folder},")
+    L.append("#   relative ./ paths.")
+    L.append("# ============================================================")
+    L.append('_md5_out="${Server_folder}/md5sums.txt"')
+    L.append('( cd "${Server_folder}" && find . -type f ! -name "md5sums.txt" | sort | xargs md5sum > "md5sums.txt" )')
+    L.append('echo "MD5 checksums (whole folder): ${_md5_out}"')
+    L.append('rsync -avh "${_md5_out}" "${archive_dir}/" 2>/dev/null || true')
+    L.append("")
+
+    # ---- 8b) copy the .sh used to generate this project ------------------------------------------
+    L.append("# ============================================================")
+    L.append("# KEEP A COPY OF THIS SCRIPT")
+    L.append("#   Copy the .sh used to generate this project into the project folders")
+    L.append("#   (local working dir + central archive) so the exact pipeline is")
+    L.append("#   preserved with the results.")
+    L.append("# ============================================================")
+    L.append('if [ -n "${BASH_SOURCE:-}" ]; then _self="${BASH_SOURCE[0]}"')
+    L.append('elif [ -n "${0:-}" ]; then _self="${0}"; fi')
+    L.append('if [ -f "${_self:-/nonexistent}" ]; then')
+    L.append('    cp "${_self}" "${Server_folder}/$(basename "${_self}")" 2>/dev/null || true')
+    L.append('    cp "${_self}" "${archive_dir}/$(basename "${_self}")" 2>/dev/null || true')
+    L.append("fi")
+    L.append("")
+
+    # ---- 10) keepdata cleanup ---------------------------------------------------------------------
+    L.append("# ============================================================")
+    L.append("# LOCAL WORKDIR CLEANUP")
+    L.append('#   After deploy to the archive, the local working folder is deleted')
+    L.append('#   UNLESS keepdata="yes".  (MD5 checksums and the .sh copy are done first.)')
+    L.append("# ============================================================")
+    L.append('if [[ "${keepdata}" != "yes" ]]; then')
+    L.append('    rm -r "${Server_folder}" 2>/dev/null || true')
+    L.append("fi")
+    L.append("")
+
+    # ---- 11) park processed datasheets in the team "TO delete" folder -----------------------------
+    L.append("# ============================================================")
+    L.append("# DATASHEET CLEANUP")
+    L.append("#   Park the Excel datasheets USED TO GENERATE THIS SCRIPT for later deletion —")
+    L.append("#   only these exact files; any other .xlsx in the working dir is left untouched.")
+    L.append("#   Primary:  " + DELETE_PRIMARY)
+    L.append("#   Fallback: " + DELETE_FALLBACK)
+    L.append("# ============================================================")
+    L.append('if [ -d "' + DELETE_PRIMARY + '" ]; then _delfolder="' + DELETE_PRIMARY + '"')
+    L.append('elif [ -d "' + DELETE_FALLBACK + '" ]; then _delfolder="' + DELETE_FALLBACK + '"')
+    L.append("fi")
+    L.append('if [ -n "${_delfolder:-}" ]; then')
+    _srcs_abs = list(dict.fromkeys(os.path.abspath(s) for s in (source_files or [])))
+    for _s in _srcs_abs:
+        L.append(f'    mv "{_s}" "${{_delfolder}}" 2>/dev/null || true')
+    L.append("fi")
+    L.append("")
+
+    # ---- 12) exit ---------------------------------------------------------------------------------
+    L.append('exit "${_overall_rc}"')
+
     return "\n".join(L) + "\n"
+
 
 
 # ─── main ─────────────────────────────────────────────────────────────
@@ -600,6 +1149,12 @@ def main():
             "  python3 %(prog)s -n run1.xlsx run2.xlsx run3.xlsx"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"generate_cellranger_template_arc.py {SCRIPT_VERSION}",
+        help="Print the generator version and exit.",
     )
     parser.add_argument(
         "xlsx_files", nargs="+",
@@ -623,10 +1178,12 @@ def main():
     }[args.genome]
 
     all_rows, detected_avts, any_user = [], [], ""
+    source_files = []  # accepted Excel file(s) — parked in TO_DELETE by the generated .sh
     for path in args.xlsx_files:
         if not os.path.isfile(path) or not path.lower().endswith((".xlsx", ".xlsm")):
             print(f"Warning: skipping '{path}' (not found or not .xlsx).")
             continue
+        source_files.append(path)
         rows, avt = parse_xlsx(path)
         if rows:
             all_rows.extend(rows)
@@ -651,12 +1208,114 @@ def main():
     if not any_avt:
         sys.exit("Error: AVT run name cannot be empty.")
 
+    # ── Parity item 3: sample selection (keep/drop + add sheet-less) ───
+    # Same shared helper + prompt as the GEX generator.  ``ask_sample_selection``
+    # wants ``{sample: [(fastq_id, avt_run)]}`` (the defaultdict shape the
+    # generators build); arc keys it by the BIologic base name (GEX/_ATAC legs
+    # collapse to one entry).  Returns (kept_names, added) where added maps a
+    # sample name to the FULL avid-folder path(s) the operator typed — those
+    # are self-referential and used verbatim (no AVT-tree walk).  Under -n the
+    # helper returns every sample kept and adds none (identical to old behaviour).
+    sample_fastqs = defaultdict(list)
+    for _row in all_rows:
+        # (sample, fid, [per-row avt]); the per-row avt (parity item 11) is
+        # what the selection helper sees per FASTQ — any_avt is only the
+        # fallback for rows that name no run.
+        _sample, _fid = _row[0], _row[1]
+        _ravt = _row[2] if len(_row) > 2 else None
+        sample_fastqs[base_sample_name(_sample)].append((
+            (_fid or ""), (_ravt or any_avt)))
+    kept_names, added_raw = ask_sample_selection(
+        sample_fastqs, default_root=NGSruns_ARCHIVE_DIR)
+    if dropped := [sn for sn in sample_fastqs if sn not in kept_names]:
+        print(f"  Dropped from script: {', '.join(dropped)}")
+    all_rows = [r for r in all_rows
+                if base_sample_name(r[0]) in kept_names]
+    # Added (sheet-less) samples: carry a full avid-folder path per leg.  The
+    # row's fastq id is the folder's basename (e.g. avid13144); the generator
+    # uses the full path verbatim.  A sample added via two folders (GEX + ATAC)
+    # contributes one row per folder.
+    added_paths = {}   # {fastq id (avid basename): full avid-folder path}
+    for name, folders in added_raw.items():
+        for p in folders:
+            added_paths[os.path.basename(p)] = p
+            # Per-row avt = None: a folder added by full path keeps the run
+            # implied by the folder the operator typed (parity item 11).
+            all_rows.append((name, os.path.basename(p), None))
+    if not all_rows:
+        sys.exit("Error: no samples selected — nothing to generate.")
+
+    # ── Parity item 11: per-row AVT — resolve each FASTQ under its own run tree ──
+    # Each sample's FASTQ is resolved under the AVT run named on its own sheet
+    # row (the run may sit in the fastq-ID cell or an adjacent cell), so a
+    # worksheet mixing two runs resolves correctly.  A row that names no run
+    # inherits the sheet-wide / file-name-detected run; a sample added by full
+    # path keeps the run implied by the folder that was typed.  When every
+    # FASTQ names one run, the outcome is identical to the pre-item-11
+    # generator (single-run workspace).
+    fid_avt = {}
+    base_avt = {}
+    for _row in all_rows:
+        _sample, _fid, _ravt = _row[0], _row[1], (_row[2] if len(_row) > 2 else None)
+        _fid = (_fid or "").strip()
+        if _fid:
+            fid_avt.setdefault(_fid, _ravt or any_avt)
+        if _ravt:
+            base_avt.setdefault(base_sample_name(_sample), _ravt)
+    _distinct_avts = sorted(set(fid_avt.values()) | set(base_avt.values()))
+    if len(_distinct_avts) > 1:
+        print(f"  Note: this workspace spans AVT runs {', '.join(_distinct_avts)}; "
+              f"each FASTQ resolves under the run named on its own row.")
+
+    groups = group_libraries(all_rows)
+    print()
+    print_groups_table(groups)
+
     reference_genome = ask_reference_genome(
-        HUMAN_GENOME_PATH, MOUSE_GENOME_PATH, default_path=default_genome)
+        HUMAN_GENOME_PATH, MOUSE_GENOME_PATH, default_path=default_genome,
+        human_label="Human", mouse_label="Mouse")
     user = any_user
     run_dir = NGS_BASE_DIR_TEMPLATE.format(avt_run=any_avt)
 
-    script = build_script(reference_genome, groups, any_avt, user, run_dir)
+    # ── Parity item 4: run-folder disambiguation (AVT0551 case) ─────────
+    # Before: resolve_fastq_leaf() blind-walked the run tree and took the
+    # FIRST hit — the AVT0551 case, where the same sample recurs under
+    # 1_wrong_index_… AND 2_corrected_indexes_… and silently resolved to the
+    # wrong library.  Now we pin the SAMPLE's directory (keyed by base) via
+    # list_sample_dirs/choose_sample_dir before resolving; choose_sample_dir
+    # prompts only when >1 candidate exists (the 99% single-candidate case
+    # resolves silently) and also no-ops under -n (first candidate + a warning
+    # naming the alternatives).  Samples added by full path have no candidate
+    # set — they are used verbatim.
+    chosen_dirs = {}
+    for base in kept_names:
+        cands = list_sample_dirs(base_avt.get(base, any_avt), base)
+        if len(cands) > 1:
+            chosen = choose_sample_dir(base, cands)
+            if chosen:
+                chosen_dirs[base] = chosen
+    if chosen_dirs:
+        print(f"  Run-folder disambiguation pinned {len(chosen_dirs)} sample(s).")
+
+    # Emission-time resolver: build_script calls resolve(base, fid).  Each
+    # FASTQ walks the run tree of the AVT run named on its own row (parity
+    # item 11); `any_avt` is only the fallback for rows that name no run.
+    def resolve(base, fid):
+        _fid = (fid or "").strip()
+        _f_avt = fid_avt.get(_fid, any_avt) if _fid else any_avt
+        if _fid and _fid in added_paths:          # added-by-path sample → verbatim
+            return added_paths[_fid]
+        pref = chosen_dirs.get(base)
+        if pref:                                  # preferred sample dir first
+            hit = find_fastq_path_with_pref(_f_avt, _fid,
+                                            preferred_sample_dir=pref)
+            if hit:
+                return hit
+        _run = NGS_BASE_DIR_TEMPLATE.format(avt_run=_f_avt)
+        return resolve_fastq_leaf(_run, _fid)     # full-tree walk (parity item 11)
+
+    script = build_script(reference_genome, groups, any_avt, user, run_dir,
+                          resolve=resolve, source_files=source_files)
     out_script = f"cellranger-arc_{any_avt}.sh"
     with open(out_script, "w") as f:
         f.write(script)
