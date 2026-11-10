@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARC (Multiome) pipeline — How to use it</title>
+<style>
+  :root {
+    --ink: #1f2933; --muted: #5f6b7a; --accent: #0b5fa5; --soft: #eef4fa;
+    --code-bg: #f6f8fa; --border: #d9e2ec;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color: var(--ink); margin: 0; line-height: 1.6; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 1.9em; margin: 0 0 6px; }
+  h2 { font-size: 1.3em; margin-top: 2.4em; padding-bottom: 6px; border-bottom: 2px solid var(--soft); }
+  h3 { font-size: 1.05em; margin-top: 1.6em; }
+  p { margin: 0.7em 0; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 1.02em; }
+  ol { margin: 0.6em 0; padding-left: 1.3em; }
+  ol li { margin: 0.45em 0; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; line-height: 1.55; margin: 12px 0 18px; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 22px; font-size: 0.95em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--soft); }
+  td code { white-space: nowrap; }
+  .warn { background: #fff7e9; border-left: 3px solid #d98a00;
+          padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 16px 0; font-size: 0.96em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ARC (Multiome) pipeline — How to use it</h1>
+  <p class="subtitle">Generate the script from your Excel file, adjust any settings you need, then run it.</p>
+  <p>ARC counts both a <strong>GEX</strong> (RNA) leg and an <strong>ATAC</strong> (chromatin) leg for each sample in a single <code>cellranger-arc count</code> run — the script handles that per-sample pairing for you.</p>
+
+  <h2>Step 1 — Generate the script</h2>
+  <p>Run the generator with your run's Excel file (the one named after the run, e.g. <code>AVT0571_Arianna_GECF Copy.xlsx</code>):</p>
+  <pre><code>python3 generate_cellranger_template_arc.py "AVT0571_Arianna_GECF Copy.xlsx"</code></pre>
+  <p>Keep the quotes around the file name — the paths contain spaces. To combine several runs, list each file after the command in its own quotes; all samples go into one script.</p>
+  <pre><code>python3 generate_cellranger_template_arc.py "AVT0571_….xlsx" "AVT0572_….xlsx"</code></pre>
+
+  <p>It asks up to four questions, each answered by typing a number (or a path, or yes/no) and pressing enter. Not every run needs every question — the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
+  <ol>
+    <li><strong>AVT run name</strong> — only when some samples have no detected run name; confirm the detected value or type the correct <code>AVT0XXX</code>.</li>
+    <li><strong>Samples.</strong> Detected samples are listed. Keep the ones to run; a sample missing from the list can be added by its full data-folder path. Ends with a summary of the final sample list.</li>
+    <li><strong>Data folder</strong> — shown only when a sample name exists in more than one run folder. Pick the correct one by number; a single match is used automatically.</li>
+    <li><strong>Genome</strong> — 1 human, 2 mouse (there is no combined reference for ARC). You can also type a full path to any other reference genome directory to use a custom one. The exact genome file/folder name inside each reference is resolved automatically, so no need to specify it.</li>
+  </ol>
+
+  <p>On success it writes <code>cellranger-arc_AVT0XXX.sh</code> in the current directory. That file is your pipeline.</p>
+
+  <h2>Step 2 — Edit the script</h2>
+  <p>Open the generated script in a text editor. From the terminal, in the folder where the script was written, <code>code cellranger-arc_AVT0571.sh</code> opens it in VS Code, or open it through your file manager. Any editor works. To change a setting, edit the value inside the quotes on its line. When you are done, save the file (Ctrl+S, or File → Save) and close it before running the pipeline. Most lines can stay as they are; the ones worth knowing are below.</p>
+
+  <h3>Run-wide (all samples)</h3>
+  <table>
+    <tr><th>Setting</th><th>Meaning</th></tr>
+    <tr><td><code>keepdata</code></td><td>Keep the local working folder after the run. Default <code>no</code> is correct — results are already in the central archive. Set <code>yes</code> only to keep a local copy too.</td></tr>
+    <tr><td><code>max_parallel</code></td><td>Number of samples counted simultaneously. <code>1</code> is serial. Default <code>3</code> suits a large server; lower it for a smaller box or when other heavy jobs are running.</td></tr>
+    <tr><td><code>scratch_root</code></td><td>Where <code>cellranger-arc count</code> writes its working output (fixed convention on the analysis server — only change if the mount differs on your box).</td></tr>
+    <tr><td><code>REFPATH</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
+    <tr><td><code>server_folder_name</code></td><td>Output folder name, prefilled with run + user + timestamp. Leave as is unless renaming is wanted.</td></tr>
+    <tr><td><code>NGSruns_archive</code></td><td>Central archive the results are copied to at the end (fixed shared target — leave as is).</td></tr>
+    <tr><td><code>fastq_&lt;#&gt;_&lt;library&gt;</code></td><td>Data location per sample leg (the GEX fastq and the ATAC fastq), prefilled. A <code>FIXME</code> marker instead of a real path means that leaf folder could not be resolved — set the real folder there before running.</td></tr>
+  </table>
+
+  <h3>Per-sample (the suffix is the sample number)</h3>
+  <p>Leave a value blank to use the built-in default. The <code>_&lt;#&gt;</code> matches the sample to change.</p>
+  <table>
+    <tr><th>Setting</th><th>Meaning</th></tr>
+    <tr><td><code>localcores_&lt;#&gt;</code></td><td>Maximum CPU cores for this sample. Default 32.</td></tr>
+    <tr><td><code>localmem_&lt;#&gt;</code></td><td>Maximum memory in GB for this sample. Default 126.</td></tr>
+    <tr><td><code>create_bam_&lt;#&gt;</code></td><td><code>true</code> (default) also writes an aligned BAM for this sample. Set <code>false</code> to skip it (faster, smaller output).</td></tr>
+    <tr><td><code>cell_annotation_model_&lt;#&gt;</code></td><td><code>auto</code> (default) lets cellranger-arc choose the cell-annotation model. Name a specific model, or leave blank, if you have one in mind.</td></tr>
+    <tr><td><code>custom_options_&lt;#&gt;</code></td><td>Additional flags for this sample, written in full inside the quotes (e.g. <code>--nosecondary --localvmem=300</code>).</td></tr>
+  </table>
+
+  <div class="warn"><strong>Note.</strong> <code>localcores_&lt;#&gt;</code> and <code>localmem_&lt;#&gt;</code> are per-sample, and up to <code>max_parallel</code> samples run at the same time — so the box effectively needs <code>max_parallel × (cores, memory)</code>. Example: at the defaults, 3 samples × 32 cores / 126 GB needs roughly 96 cores / 378 GB of free space. If the run is bigger than that, lower <code>max_parallel</code> or the per-sample cores/memory.</div>
+
+  <h2>Step 3 — Run it</h2>
+  <p>From the same directory as the script:</p>
+  <pre><code>./cellranger-arc_AVT0571.sh</code></pre>
+  <p>The <code>./</code> prefix is required to run a script from the current directory. To run it in the background and capture output to a log:</p>
+  <pre><code>nohup bash cellranger-arc_AVT0571.sh &gt; AVT0571.log</code></pre>
+
+  <p>It checks the settings first (e.g. that the reference folder exists), then counts each sample in a rolling pool of <code>max_parallel</code> (default 3). Each sample reports <code>[ OK ]</code> or <code>[ FAIL ]</code>; a failing sample does not block the rest. When the counting is done it merges every sample's summary table into one <code>summary_metrics.csv</code>, writes a central per-sample TSO% report on the GEX leg, collects the web summaries (the joint Multiome page plus the GEX-only and ATAC-only pages), stores a copy of this script and its checksums in the run folder, copies everything to the shared archive, and — with <code>keepdata="no"</code> — removes the local working folder. That removal is normal.</p>
+  <p>Follow progress directly in the terminal, or via <code>AVT0571.log</code> if it is running in the background.</p>
+</main>
+</body>
+</html>

@@ -82,12 +82,12 @@ from common.intake import (
     setup_readline_completer,
     ask_avt_run,
     ask_reference_genome,
-    # Parity items 3 & 4 (arc_gex_parity.md): the same shared helpers the
-    # GEX generator uses for its sample-selection prompt and the
-    # run-folder disambiguation (single source of truth in common.intake).
-    ask_sample_selection,        # keep/drop + add sheet-less samples (item 3)
-    list_sample_dirs,            # candidate dirs for one (AVT, sample) (item 4)
-    choose_sample_dir,           # pick ONE when >1 candidate  (item 4)
+    # Same shared helpers the GEX generator uses for its sample-selection
+    # prompt and run-folder disambiguation (single source of truth in
+    # common.intake).
+    ask_sample_selection,        # keep/drop + add sheet-less samples
+    list_sample_dirs,            # candidate dirs for one (AVT, sample)
+    choose_sample_dir,           # pick ONE when >1 candidate
     find_fastq_path_with_pref,   # resolve an avid id honouring the pick
 )
 
@@ -621,6 +621,16 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     # conditional below simply omits the ``_user`` segment.
     L.append("user='" + folder_safe(user or "") + "'")
     L.append("")
+    # Absolute path of THIS script, captured at the very top — BEFORE the
+    # arc_sample_<i> functions `cd` into ${Server_folder}.  A relative
+    # BASH_SOURCE[0] is resolved against the CWD *at use time*, and by the
+    # KEEP-A-COPY step below (item 8b) the CWD is ${Server_folder}, not the
+    # folder the script lives in — so a same-time BASH_SOURCE lookup silently
+    # no-ops and the .sh never lands in the working/archive folders.
+    L.append('# Absolute path of this script (captured before any cd — used by the self-preserve step)')
+    L.append('_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"')
+    L.append('if [ ! -f "${_SELF_PATH}" ]; then _SELF_PATH="${BASH_SOURCE[0]:-$0}"; fi')
+    L.append("")
 
     # ---- 2) RUN-WIDE PARAMETERS (editable block) -----------------------------------------------
     L.append("# ============================================================")
@@ -784,10 +794,18 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
                 flag_lines.append(f"    ${{{v}:+{flag}=${v}}}")
         flag_lines.append(f'    --tenx-cloud-token-path={TENX_TOKEN_PATH}')
 
-        # Write the exact command to <base>_script_log.txt (one readable line)
+        # Log the exact command, WITH RESOLVED VALUES, to <base>_script_log.txt
+        # (one readable line).  A single bash array (_cmd) is built from the
+        # SAME flag_lines list the execution line uses, so the log can never
+        # drift from what actually runs: `echo "${_cmd[@]}"` expands
+        # ${REFPATH}, ${localcores_N:+--localcores=N}, ${localmem_N:+...} and
+        # the per-sample flag values exactly as the execution sees them.
+        # (The old version printf'd a Python-repr()'d string — a
+        # single-quoted echo — which wrote the unexpanded ${...} template
+        # into the log: parameter NAMES without VALUES.)
+        L.append('    _cmd=( ' + " ".join(fl.strip() for fl in flag_lines) + ' )')
         L.append(f'    _cmd_log="${{Server_folder}}/{base}_script_log.txt"')
-        _log_body = " ".join(fl.strip() for fl in flag_lines)
-        L.append(f"    echo {_log_body!r} > \"${{_cmd_log}}\"")
+        L.append('    echo "${_cmd[@]}" > "${_cmd_log}"')
         L.append("")
         # Execute the command (same flag_lines list, line-continuation formatted)
         for i, fl in enumerate(flag_lines):
@@ -1088,11 +1106,12 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("#   (local working dir + central archive) so the exact pipeline is")
     L.append("#   preserved with the results.")
     L.append("# ============================================================")
-    L.append('if [ -n "${BASH_SOURCE:-}" ]; then _self="${BASH_SOURCE[0]}"')
-    L.append('elif [ -n "${0:-}" ]; then _self="${0}"; fi')
-    L.append('if [ -f "${_self:-/nonexistent}" ]; then')
-    L.append('    cp "${_self}" "${Server_folder}/$(basename "${_self}")" 2>/dev/null || true')
-    L.append('    cp "${_self}" "${archive_dir}/$(basename "${_self}")" 2>/dev/null || true')
+    # Use ${_SELF_PATH} (absolute, captured at script top before any `cd`) —
+    # a relative BASH_SOURCE[0] fails the -f test once the arc_sample_<i>
+    # functions have cd'd into ${Server_folder}, so the copy silently no-ops.
+    L.append('if [ -n "${_SELF_PATH:-}" ] && [ -f "${_SELF_PATH}" ]; then')
+    L.append('    cp "${_SELF_PATH}" "${Server_folder}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
+    L.append('    cp "${_SELF_PATH}" "${archive_dir}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
     L.append("fi")
     L.append("")
 
@@ -1122,6 +1141,9 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     _srcs_abs = list(dict.fromkeys(os.path.abspath(s) for s in (source_files or [])))
     for _s in _srcs_abs:
         L.append(f'    mv "{_s}" "${{_delfolder}}" 2>/dev/null || true')
+    if not _srcs_abs:
+        # bash rejects an empty `then ... fi` body — keep one (no-op) command
+        L.append('    :   # (no source datasheets to park)')
     L.append("fi")
     L.append("")
 

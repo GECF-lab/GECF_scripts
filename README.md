@@ -83,7 +83,7 @@ chmod +x *.sh
 | `adaptive_sampling_filter.sh` | Filters pod5 files using adaptive sampling decisions |
 | `mapping_bams.sh` | Aligns FASTQ/BAM reads to a reference genome with minimap2 |
 | `update_dorado.sh` | Downloads and installs the latest stable Dorado release |
-| `cellranger_pipelines/` | 10x Genomics CellRanger & SpaceRanger pipeline scripts (atac, arc, multi, visium) |
+| `cellranger_pipelines/` | 10x Genomics CellRanger & SpaceRanger pipeline scripts (gex, atac, arc, multi, visium) |
 | `FLASHseq/` | FLASH-seq (single-cell) RNA-seq pipeline + RSeQC QC |
 | `fasta_to_gtf.py` | Converts custom multi-FASTA to cellranger-arc-compatible GTF |
 | `qpcr-template-validator.py` | Validates qPCR DNA/PRIMER Hamilton Excel templates before sending to robot |
@@ -387,12 +387,13 @@ All 10x Genomics pipeline scripts live in `cellranger_pipelines/`, one subfolder
 |----------|--------|------|---------------------|
 | visium (spatial) | `cellranger_pipelines/visium/` | spaceranger count 4.1.0 | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/spaceranger/` |
 | atac (single-cell ATAC) | `cellranger_pipelines/atac/` | cellranger-atac count | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/atac/` |
+| gex (single-cell RNA) | `cellranger_pipelines/gex/` | cellranger count | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/count/` |
 | arc (Multiome RNA+ATAC) | `cellranger_pipelines/arc/` | cellranger-arc count | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc/` |
 | multi (TotalSeq / VDJ) | `cellranger_pipelines/multi/` | cellranger multi | `/AA/NGSruns/AVT/AV240401/ZZ_10XG/multi/` |
 
 - **Standard archive rule:** results are rsync'd to `/AA/NGSruns/AVT/AV240401/ZZ_10XG/<modality>/<run folder>/`.
-- **Generator-style pipelines** (visium, atac): a Python generator reads the sample Excel/datasheet, writes one ready-to-run `.sh` into the **current working directory**; review it, then run it — results land locally there and are deployed to the archive automatically.
-- **Driver-style pipelines** (arc, multi): bash scripts that live with their datasheet on the server (`/home/gecf/NGS_pipelines/CR_pipeline/`), read `CR_*_datasheet*.txt` files, run the count, and rsync to the archive themselves.
+- **Generator-style pipelines** (gex, atac, arc, visium): a Python generator reads the sample Excel/datasheet, writes one ready-to-run `.sh` into the **current working directory**; review it, then run it — results land locally there and are deployed to the archive automatically.
+- **Driver-style pipelines** (multi): bash scripts that live with their datasheet on the server (`/home/gecf/NGS_pipelines/CR_pipeline/`), read `CR_*_datasheet*.txt` files, run the count, and rsync to the archive themselves. (arc (Multiome) now also has a generator — the preferred path; its old bash driver `CRarc_patched_full` still works as a legacy fallback.)
 
 ### visium — run_visium.sh + generate_spaceRanger_visium.py
 
@@ -406,17 +407,35 @@ bash cellranger_pipelines/visium/run_visium.sh workbook.xlsx --species human \
 
 ### atac — generate_cellranger_template_atac.py
 
-Given an AVT Excel tracking file, generates a ready-to-run shell script that executes `cellranger-atac count` for every sample. Parses the "GECF fastq ID (avidxxxx)" column to locate each sample's FASTQ pair and writes out `<AVT>_cellranger_atac_pipelines.sh` into the current directory.
+Single-cell ATAC pipeline. Given an AVT Excel tracking file, generates a ready-to-run shell script that executes `cellranger-atac count` for every sample and writes it out as `cellranger-atac_AVT0XXX.sh` into the current directory.
 
 ```bash
-python3 cellranger_pipelines/atac/generate_cellranger_template_atac.py file.xlsx
+python3 cellranger_pipelines/atac/generate_cellranger_template_atac.py "AVT0571_Arianna_GECF Copy.xlsx"
 ```
 
-The Excel sheet must contain a `"GECF fastq ID (avidxxxx)"` column and a run name matching `AVT0\d{3,5}` (sheet or filename). After running, check the generated script and verify paths before executing.
+The prompt flow (AVT run, sample selection / add sheet-less samples, reference genome) and the run-wide + per-sample settings work the same as GEX and ARC — tweak them in the generated script's editable blocks, then run it. The Excel sheet needs a sample-name column plus a per-sample fastq ID (or full FASTQ path); the AVT run can come from the sheet, the file name, or the prompt.
 
-### arc — CRarc_patched_full (v1.4)
+### gex — generate_cellranger_template_gex.py
 
-Multiome (RNA+ATAC) driver. Must be run from its server copy directory `/home/gecf/NGS_pipelines/CR_pipeline/CRarc_Multiome`; reads every `CR_arc_datasheet*.txt` there, runs `cellranger-arc count` per sample (2 in parallel), extracts the joint web summary + CSVs, cleans up staging trees, and rsyncs to the arc archive.
+Single-cell RNA (GEX) pipeline. Given an AVT Excel tracking file, generates a ready-to-run shell script that executes `cellranger count` for every sample and writes it out as `cellranger-count_AVT0XXX.sh` into the current directory.
+
+```bash
+python3 cellranger_pipelines/gex/generate_cellranger_template_gex.py "AVT0571_Arianna_GECF Copy.xlsx"
+```
+
+Tweak the run-wide and per-sample settings in the generated script, then run it. Full step-by-step: see [GEX_pipeline_howto.html](cellranger_pipelines/gex/GEX_pipeline_howto.html).
+
+### arc — generate_cellranger_template_arc.py
+
+Multiome (RNA + ATAC) pipeline. Given an AVT Excel tracking file, generates a ready-to-run shell script that executes `cellranger-arc count` for every sample (one `--libraries` CSV with the GEX leg before the ATAC leg) and writes it out as `cellranger-arc_AVT0XXX.sh` into the current directory.
+
+```bash
+python3 cellranger_pipelines/arc/generate_cellranger_template_arc.py "AVT0571_Arianna_GECF Copy.xlsx"
+```
+
+Tweak the run-wide and per-sample settings in the generated script, then run it. The prompt flow and settings work the same as GEX — full step-by-step: see [ARC_pipeline_howto.html](cellranger_pipelines/arc/ARC_pipeline_howto.html).
+
+> The legacy bash driver `CRarc_patched_full (v1.4)` (still in `cellranger_pipelines/arc/`) remains available for the server-datasheet workflow: run it from `/home/gecf/NGS_pipelines/CR_pipeline/CRarc_Multiome`, and it reads every `CR_arc_datasheet*.txt` there, runs `cellranger-arc count` per sample, extracts the joint web summary + CSVs, and rsyncs to the arc archive.
 
 ### multi — CRmulti (v2.11)
 
