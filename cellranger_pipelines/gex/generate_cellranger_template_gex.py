@@ -137,7 +137,7 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # Generator version == generated-script version; the kept .sh in the
 # archive tells you which one produced it.  Bump on any change to the
 # generator.
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -422,7 +422,7 @@ _PER_SAMPLE_PARAMS = (
 
 def build_script_full(reference_genome, pairs, user="", source_files=None,
                       chosen_sample_dirs=None, added_paths=None,
-                      sample_order=False):
+                      sample_order=False, number_prefix=True):
     """Build the complete `cellranger count` bash script (GEX).
 
     *sample_order* (default False): order of samples as they appear in the
@@ -430,6 +430,11 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     Only pass True when the input is a SINGLE Excel file (with several
     files the cross-file order is ambiguous, so the alphabetical sort is
     kept as the unambiguous fallback).
+
+    *number_prefix* (default True): zero-pad the sample index (01_, 02_,
+    …) onto each per-sample output folder, keeping the folders in sample
+    order even when the names are not alphabetical.  Pass False (CLI:
+    --no-number-prefix) for bare sample names.
 
     Layout (top -> bottom):
       1. Header / constants (timestamp, reference genome, scriptversion,
@@ -485,6 +490,11 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     else:
         unique_samples = sorted(samples_to_fastqs.keys())
     n = len(unique_samples)
+    # Per-sample output folder name: 01_, 02_, … (ON by default) keeps the
+    # folders in sample order even when the names are not alphabetical.
+    # --no-number-prefix -> bare sample name (previous behaviour).
+    dir_names = [f"{i:02d}_{s}" if number_prefix else s
+                 for i, s in enumerate(unique_samples, 1)]
 
     # ---- 1) header / constants ----
     gen_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -693,7 +703,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
     for idx, sn in enumerate(unique_samples, start=1):
         fastqs = samples_to_fastqs[sn]
-        numbered_dir = f"{idx:02d}_{sn}"
+        numbered_dir = dir_names[idx - 1]
         fq_list_str = ",".join(fq for fq, _ in fastqs)
         fq_paths = ", ".join(f"${{path_{idx}_{fq}}}" for fq, _ in fastqs)
         SFR = "${Server_folder}"
@@ -771,7 +781,9 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         # see the "TSO% REPORT (SINGLE FILE)" section.
         if fastqs:
             _fq0_var = "path_%d_%s" % (idx, fastqs[0][0])
-            tags = numbered_dir
+            # Part name stays 01_sn (matches the assembler below) regardless
+            # of the per-sample folder naming.
+            tags = f"{idx:02d}_{sn}"
             lines.append("")
             lines.append("# TSO% library-quality metric (Read-2 only) — intact TSO/SMART + poly tails")
             lines.append(f'_fq="${{{_fq0_var}}}"')
@@ -876,7 +888,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     #   no outs/metrics_summary.csv  -> cellranger count never completed
     lines.append("# Per-sample status report (from each sample's own completion markers)")
     lines.append("_overall_rc=0")
-    _dirs_bash = " ".join('"{:02d}_{}"'.format(i, s) for i, s in enumerate(unique_samples, 1))
+    _dirs_bash = " ".join('"' + d + '"' for d in dir_names)
     lines.append("for _d in " + _dirs_bash + "; do")
     lines.append('    if [ -s "${Server_folder}/${_d}_error_log.txt" ]; then')
     lines.append('        echo "[FAIL] ${_d}  (see ${Server_folder}/${_d}_error_log.txt)" >&2')
@@ -929,9 +941,9 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     #   with Samplename column; reorder to metric order 1,2,3,8,4,21,20,19,13,17.
     SFR = "${Server_folder}"
     # literal sample-name list (no dynamic expansion in the emitted bash)
-    _sample_list = " ".join(
-        str(i).zfill(2) + "_" + s for i, s in enumerate(unique_samples, 1)
-    )
+    # — must match the per-sample dir names used in the cellranger count
+    # section above (01_, 02_, … or bare names with --no-number-prefix).
+    _sample_list = " ".join(dir_names)
     lines.append("# ------------------------------------ EXTRACT SUMMARY METRICS ------------------------------------ #")
     lines.append("")
     lines.append('metrics_folder="' + SFR + '/raw_metrics_folder"')
@@ -1090,6 +1102,17 @@ def main():
         action="store_true",
         default=False,
         help="Skip prompts; use detected values and human genome as default.",
+    )
+    parser.add_argument(
+        "--no-number-prefix",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not number the per-sample output folders (ON by default): "
+            "the folder becomes '<sample>' instead of '01_<sample>'. "
+            "Numbering keeps the folders in sample order even when the "
+            "names are not alphabetical."
+        ),
     )
     args = parser.parse_args()
 
@@ -1252,7 +1275,11 @@ def main():
                                        # file drives the generation (with
                                        # several files the cross-file order
                                        # is ambiguous -> alphabetical).
-                                       sample_order=(len(xlsx_files) == 1))
+                                       sample_order=(len(xlsx_files) == 1),
+                                       # Per-sample folder numbering (01_,
+                                       # 02_, …) is ON by default;
+                                       # --no-number-prefix disables it.
+                                       number_prefix=not args.no_number_prefix)
     out_script = f"cellranger-count_{main_avt}.sh"
     with open(out_script, "w") as f:
         f.write(script_content)

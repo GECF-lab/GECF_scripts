@@ -44,6 +44,10 @@
   <p>Keep the quotes around the file name — the paths contain spaces. To combine several runs, list each file after the command in its own quotes; all samples go into one script.</p>
   <pre><code>python3 generate_cellranger_template_gex.py "AVT0571_….xlsx" "AVT0572_….xlsx"</code></pre>
 
+  <h3>Numbered sample folders (on by default)</h3>
+  <p>Each sample's output folder is prefixed with its number in sample order — <code>01_Name_of_sample</code>, <code>02_…</code>, <code>03_…</code> — so the folders always appear in the order of your samples, even when the names themselves are not alphabetical (from 10 samples up the numbers continue 10, 11, …). If you prefer bare sample names without the number, add <code>--no-number-prefix</code> to the command:</p>
+  <pre><code>python3 generate_cellranger_template_gex.py --no-number-prefix "AVT0571_Arianna_GECF Copy.xlsx"</code></pre>
+
   <p>It asks up to four questions, each answered by typing a number (or a path) and pressing enter. Not every run needs every question — the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
   <ol>
     <li><strong>AVT run name</strong> — only when some samples have no detected run name; confirm the detected value or type the correct <code>AVT0XXX</code>.</li>
