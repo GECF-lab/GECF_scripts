@@ -8,14 +8,15 @@
 # What it does
 #   For a cellranger count output directory and a list of custom (transgene /
 #   appended) genes, reports — per gene —
-#       status          EXPRESSED if the transgene row has >=1 expressed cell,
-#                       else SILENT
-#       tg_cells        cells with >=1 count on the TRANSGENE feature row only
-#       tg_UMI          total UMIs on the TRANSGENE feature row only
+#       status          EXPRESSED if the transgene row has >=1 detected cell,
+#                       else SILENT (a "detected" cell = UMI count >= threshold;
+#                       default 3, change with --min-umi N)
+#       tg_cells        cells with UMI >= threshold on the TRANSGENE row only
+#       tg_UMI          total UMIs in those detected cells (transgene row)
 #       tg_per_cell     tg_UMI / tg_cells (0 if none)
-#       endo_cells      cells with >=1 count on ENDOGENOUS rows (other feature
-#                       rows that carry the same name, e.g. Ensembl-keyed)
-#       endo_UMI        total UMIs on those endogenous rows
+#       endo_cells      cells with UMI >= threshold on ENDOGENOUS rows (other
+#                       feature rows that carry the same name, e.g. Ensembl-keyed)
+#       endo_UMI        total UMIs in those detected cells (endogenous rows)
 #   plus a summary line.
 #
 # How the split works (verified on AVT0571 / CRREF040)
@@ -59,13 +60,18 @@
 #   barcodes:   filtered_feature_bc_matrix/{barcodes.tsv.gz, barcodes.tsv}
 #   matrix:     filtered_feature_bc_matrix/{matrix.mtx.gz, matrix.mtx}
 #
-# Library usage (embedded into a generated pipeline .sh)
-#   The generator inlines everything ABOVE the `# %%EMBED-END%%` marker
-#   verbatim, then calls:
-#     check_custom_genes <count_out> <feature_list> [out_report_file]
+# Detection threshold
+#   A cell counts as "detecting" a row when its UMI count for that row is
+#   >= the threshold: default 3, change with --min-umi N (integer >= 1,
+#   accepted at any CLI position). EXPRESSED = >=1 detected cell on the
+#   transgene row.
 #
-# Standalone usage:
-#   bash custom_gene_check.sh <count_out> <feature_list> [report_path]
+# Usage:
+#   bash custom_gene_check.sh --sample-dir  <sample_dir>    <genes> [report_path]
+#   bash custom_gene_check.sh --project-dir <project_dir> <genes> [report_path]
+#   bash custom_gene_check.sh --list        <sample_dir>    <gene_name>
+#
+#   <genes> = a gene name (matched exactly) OR a file with one gene name/line.
 #
 # The report is written to report_path IF given; ALWAYS echoed to stdout.
 # Only bash + awk + (z)cat are required (mawk-compatible).
@@ -89,6 +95,30 @@ _zread() {
         *.gz) zcat "$f" 2>/dev/null ;;
         *)    cat  "$f" 2>/dev/null ;;
     esac
+}
+
+# default CSV report path for an input folder: <dir>/custom_genes_<dir>.csv
+_default_report() {
+    local D="${1%/}"
+    printf '%s/custom_genes_%s.csv\n' "$D" "$(basename "$D")"
+}
+
+# convert a tab-separated report on stdin to RFC-4180 CSV on stdout.
+# A field is quoted (embedded double-quotes doubled) only when it contains
+# a comma or a double-quote; other fields are written verbatim.
+_to_csv() {
+    awk '
+        BEGIN { FS = "\t" }
+        {
+            line = ""
+            for (i = 1; i <= NF; i++) {
+                f = $i
+                if (f ~ /[",]/) { gsub(/"/, "\"\"", f); f = "\"" f "\"" }
+                line = (i == 1 ? f : line "," f)
+            }
+            print line
+        }
+    '
 }
 
 # ---- main ----
@@ -188,7 +218,7 @@ check_custom_genes() {
     ST == 3 {
         if ($0 ~ /^%/ || $0 ~ /^[ \t\r]*$/) next
         if (!dim_seen) { dim_seen = 1; next }   # dimension line: Nfeat Ncells Nnz
-        if (NF >= 3) { fi = $1 + 0; cells[fi]++; umi[fi] += $3 }
+        if (NF >= 3 && $3 + 0 >= T) { fi = $1 + 0; cells[fi]++; umi[fi] += $3 }
         next
     }
     BEGIN { ST = 1 }
@@ -220,19 +250,24 @@ check_custom_genes() {
             else        { status = "SILENT";    n_silent++ }
             printf "%s\t%s\t%s\t%d\t%d\t%.3f\t%d\t%d\t%d\n", sample, nm, status, tc, tu, tgp, ec, eu, TOT
         }
-        printf "%s\tCUSTOM SUMMARY: %d custom genes | EXPRESSED=%d | SILENT=%d | with-endogenous-row=%d | no-transgene-row=%d\n", \
-               sample, nwant, n_exp, n_silent, n_duo, n_notg
+        printf "%s\tCUSTOM SUMMARY: %d custom genes | EXPRESSED=%d | SILENT=%d | with-endogenous-row=%d | no-transgene-row=%d | min_UMI=%d\n", \
+               sample, nwant, n_exp, n_silent, n_duo, n_notg, T
     }
     '
 
+    local T="${MIN_UMI:-3}"
     local RC=0
+    if [ -t 2 ]; then
+        echo "check_custom_genes: scanning '${SAMPLE}' (min_UMI=${T}) -- reads the full filtered matrix;" >&2
+        echo "                     large runs take a minute or two, hang tight..." >&2
+    fi
     {
-        _zread "$LIST" | awk 'NF > 0 { sub(/^#/, ""); print }' | awk 'NF > 0 { print $1 }'
+        _zread "$LIST" | awk 'NF > 0 && $1 !~ /^#/ { print $1 }'
         printf '!!FEAT!!\n'
         _zread "$FEATURES"
         printf '!!MTX!!\n'
         _zread "$MATRIX"
-    } | awk -v sample="$SAMPLE" -v TOT="$TOTAL" "$AWK" > "$TMPREPORT" 2>/dev/null
+    } | awk -v sample="$SAMPLE" -v TOT="$TOTAL" -v T="$T" "$AWK" > "$TMPREPORT" 2>/dev/null
     RC=$?
     if [ $RC -ne 0 ]; then
         echo "check_custom_genes: awk failed (rc=$RC)" >&2
@@ -242,15 +277,14 @@ check_custom_genes() {
 
     cat "$TMPREPORT"
     if [ -n "$REPORT" ]; then
-        cp "$TMPREPORT" "$REPORT"
+        _to_csv < "$TMPREPORT" > "$REPORT"
     fi
     rm -f "$TMPREPORT"
     return 0
 }
-# ---- discovery/report helpers (embedded with the script; self-contained:
-#      awk, grep, sed, mktemp only — safe to call from generated .sh files) ----
+# ---- discovery/report helpers (self-contained: awk, grep, sed, mktemp only) ----
 
-# _first_feature_file <outs_dir>
+# _first_feature_file <sample_dir>
 #   echo the first existing features/genes file under outs (shared by helpers)
 _first_feature_file() {
     local OUTB="${1%/}"
@@ -260,7 +294,7 @@ _first_feature_file() {
             "${OUTB}/filtered_feature_bc_matrix/genes.tsv"
 }
 
-# list_custom_genes <outs_dir> <gene_name>
+# list_custom_genes <sample_dir> <gene_name>
 #   Show what the run's reference contains for <gene_name>: every row of
 #   features.tsv(.gz) mentioning it (case-insensitive), marking the
 #   transgene row (feature ID == gene name), and printing the line to put
@@ -301,46 +335,6 @@ list_custom_genes() {
     return 3
 }
 
-# detect_custom_gene <outs_dir> <gene_name> [report_path]
-#   One-shot check with no list file: find the transgene row for <gene_name>
-#   in the reference (id==name), write it to a temp list file, run the
-#   normal check, print the result table to stdout, and copy it to
-#   [report_path] if given.
-#   rc same as check_custom_genes (0 ok) | 3 no transgene row in reference
-detect_custom_gene() {
-    local OUT="${1%/}"
-    local SYM="$2"
-    local REPORT="${3:-}"
-    local FEAT
-    FEAT="$(_first_feature_file "$OUT")"
-    if [ -z "$FEAT" ]; then
-        echo "detect_custom_gene: no features.tsv(.gz)/genes.tsv(.gz) under ${OUT}" >&2
-        return 2
-    fi
-    local TMP
-    TMP="$(mktemp "${TMPDIR:-/tmp}/custom_gene_check.XXXXXX")" || return 2
-    # transgene rows: id == name and row matches symbol (case-insensitive)
-    _zread "$FEAT" | awk -F'\t' -v s="$SYM" '
-        BEGIN { ts = tolower(s) }
-        {
-            id = tolower($1); nm = tolower($2)
-            if (id == nm && (id == ts || index(nm, ts) > 0)) print $1
-        }' > "$TMP"
-    if [ ! -s "$TMP" ]; then
-        echo "detect_custom_gene: no transgene feature row (id==name) matched '${SYM}' in $FEAT" >&2
-        echo "  show all matching rows:  --list ${SYM} ${OUT}" >&2
-        rm -f "$TMP"
-        return 3
-    fi
-    echo "auto-selected feature row(s) from reference:"
-    sed 's/^/  /' "$TMP"
-    echo "----------------------------------------------"
-    local RC=0
-    check_custom_genes "$OUT" "$TMP" "$REPORT" || RC=$?
-    rm -f "$TMP"
-    return $RC
-}
-
 # check_project_genes <project_dir> <gene_name> [report_path]
 #   Run the check for <gene_name> on every outs/ directory found under
 #   <project_dir> (recursively) and emit one combined table: header, then one
@@ -372,10 +366,22 @@ check_project_genes() {
     local header="" rows="" RC=0
     local sname n_found=0 n_exp=0 n_silent=0 n_norows=0
     local d FBM OUT out grow st ntl
+    local _NS="${#FBM_DIRS[@]}" _i=0
 
+    if [ -t 2 ]; then
+        echo "check_project_genes: ${_NS} sample(s) found under ${PROJ} -- scanning each matrix now (can take a while)" >&2
+        echo "                     a line prints as each sample finishes; the table below is the final result..." >&2
+    fi
     for FBM in "${FBM_DIRS[@]}"; do
+        _i=$((_i + 1))
         OUT="$(dirname "$FBM")"
+        if [ -t 2 ]; then
+            echo "check_project_genes: [${_i}/${_NS}] scanning $(basename "$(dirname "$OUT")") ..." >&2
+        fi
         out="$(check_custom_genes "$OUT" "$LIST" 2>/dev/null)" || RC=$?
+        if [ -t 2 ]; then
+            echo "check_project_genes: [${_i}/${_NS}] $(basename "$(dirname "$OUT")") done" >&2
+        fi
         [ -z "$out" ] && continue
         if [ -z "$header" ]; then
             header="$(printf '%s\n' "$out" | sed -n '1p')"
@@ -405,94 +411,178 @@ check_project_genes() {
     RESULT="$(
         printf '%s\n' "${header}"
         printf '%s' "${rows}"
-        printf '%s\tPROJECT SUMMARY: %d sample(s) | EXPRESSED=%d | SILENT=%d | without-transgene-row=%d\n' \
-            "PROJECT" "${n_found}" "${n_exp}" "${n_silent}" "${n_norows}"
+        printf '%s\tPROJECT SUMMARY: %d sample(s) | EXPRESSED=%d | SILENT=%d | without-transgene-row=%d | min_UMI=%s\n' \
+            "PROJECT" "${n_found}" "${n_exp}" "${n_silent}" "${n_norows}" "${MIN_UMI:-3}" 
     )"
 
     printf '%s\n' "${RESULT}"
     if [ -n "${REPORT}" ]; then
-        printf '%s\n' "${RESULT}" > "${REPORT}"
+        printf '%s\n' "${RESULT}" | _to_csv > "${REPORT}"
     fi
     return 0
 }
 
-# make_list <out_file> <symbol> [symbol ...]
-#   Convenience: write a ready-to-use feature-list file (one symbol per line)
-#   so subsequent `--detect` or direct runs have consistent input.
-make_list_file() {
-    local OUTFILE="${1:-}"
-    shift
-    if [ -z "$OUTFILE" ] || [ $# -eq 0 ]; then
-        echo "make_list_file: usage: --make-list <out_file> <symbol> [symbol ...]" >&2
+# ---- sample / project / list runners ----
+
+# run_sample_dir <sample_dir> <gene_name_or_file> [report_path]
+#   Unified single-sample entry: <gene_name_or_file> is either a single gene
+#   name (matched EXACTLY against the reference) or a file with one gene name
+#   per line. Both route into check_custom_genes (exact match on the row name).
+run_sample_dir() {
+    local OUT="${1%/}"
+    local TOKEN="${2:-}"
+    local REPORT="${3:-}"
+    if [ -z "$TOKEN" ]; then
+        echo "run_sample_dir: <gene_name> or <gene_list_file> is required" >&2
         return 2
     fi
-    : > "$OUTFILE"
-    local s
-    for s in "$@"; do
-        printf '%s\n' "$s" >> "$OUTFILE"
-    done
-    echo "wrote feature list: $OUTFILE ($(wc -l < "$OUTFILE") lines)"
-    return 0
+    if [ -f "$TOKEN" ]; then
+        check_custom_genes "$OUT" "$TOKEN" "$REPORT"
+        return $?
+    fi
+    if printf '%s' "$TOKEN" | grep -q '/'; then
+        echo "run_sample_dir: '$TOKEN' contains '/' but is not an existing file" >&2
+        echo "  - a single gene name must not contain '/'   - a list file must exist" >&2
+        echo "  find the exact row name:  --list ${OUT} <gene_name>" >&2
+        return 2
+    fi
+    local TMP
+    TMP="$(mktemp "${TMPDIR:-/tmp}/custom_gene_check.XXXXXX")" || return 2
+    printf '%s\n' "$TOKEN" > "$TMP"
+    local RC=0
+    check_custom_genes "$OUT" "$TMP" "$REPORT" || RC=$?
+    rm -f "$TMP"
+    return "$RC"
 }
-# ---- the embedded region ends here (generator inlines everything above this) ----
-# %%EMBED-END%%
 
-# ---- standalone CLI runner (NOT embedded; only runs when executed directly) ----
-if [ "${BASH_SOURCE[0]:-}" = "${0}" ]; then
-    VERSION="1.0.0"
-    _usage() {
-        cat <<'USAGE'
+# run_project_genes <project_dir> <gene_name_or_file> [report_path]
+#   Single gene  -> one combined table across every sample in the project
+#                   (one row per sample) + PROJECT SUMMARY (reuses
+#                   check_project_genes; values identical to single-sample).
+#   List file    -> one table per gene (each with its own PROJECT SUMMARY).
+#   Writes one combined report to [report_path] when given. rc = last failure.
+run_project_genes() {
+    local PROJ="${1%/}"
+    local TOKEN="${2:-}"
+    local REPORT="${3:-}"
+    if [ -z "$TOKEN" ]; then
+        echo "run_project_genes: <gene_name> or <gene_list_file> is required" >&2
+        return 2
+    fi
+    local GLIST
+    GLIST="$(mktemp "${TMPDIR:-/tmp}/custom_gene_check.XXXXXX")" || return 2
+    if [ -f "$TOKEN" ]; then
+        _zread "$TOKEN" | awk 'NF > 0 && $1 !~ /^#/ { print $1 }' > "$GLIST"
+    else
+        printf '%s\n' "$TOKEN" > "$GLIST"
+    fi
+    local NCOUNT
+    NCOUNT="$(awk 'NF>0' "$GLIST" | wc -l | awk '{print $1}')"
+    if [ "$NCOUNT" -eq 0 ]; then
+        echo "run_project_genes: no gene names to check (empty file?)" >&2
+        rm -f "$GLIST"
+        return 2
+    fi
+    local COMBINED="" RC=0 IDX=0
+    local g HDR BLK
+    while IFS= read -r g; do
+        [ -n "$g" ] || continue
+        IDX=$((IDX+1))
+        HDR=""
+        if [ "$NCOUNT" -gt 1 ]; then
+            HDR=$(printf '\n============================ gene %s (%s/%s) ============================' "$g" "$IDX" "$NCOUNT")
+        fi
+        if [ -t 2 ]; then
+            echo "run_project_genes: checking gene '${g}' (${IDX}/${NCOUNT}) ..." >&2
+        fi
+        BLK="$(check_project_genes "$PROJ" "$g")" || RC=$?
+        if [ -n "$HDR" ]; then
+            printf '%s\n' "$HDR"
+            COMBINED="${COMBINED}${HDR}"$'\n'
+        fi
+        if [ -n "$BLK" ]; then
+            printf '%s\n' "$BLK"
+            COMBINED="${COMBINED}${BLK}"$'\n\n'
+        fi
+    done < "$GLIST"
+    rm -f "$GLIST"
+    if [ -z "$COMBINED" ]; then
+        echo "run_project_genes: no samples produced a result under ${PROJ}" >&2
+        return "$RC"
+    fi
+    if [ -n "$REPORT" ]; then
+        printf '%s\n' "$COMBINED" | _to_csv > "$REPORT"
+        echo "CSV report written to: $REPORT" >&2
+    fi
+    return "$RC"
+}
+
+# ---- CLI runner ----
+
+VERSION="1.0.0"
+_usage() {
+    cat <<'USAGE'
 custom_gene_check.sh — report transgene expression in a cellranger count
 output: per gene, transgene-row counts (tg_*) vs endogenous-row counts
 (endo_*).
 Version: 1.0.0
 
 Usage:
-  bash custom_gene_check.sh --detect  <gene_name> <outs_dir> [report_path]
-  bash custom_gene_check.sh --list    <gene_name> <outs_dir>
-  bash custom_gene_check.sh --project <project_dir> <gene_name> [report_path]
-  bash custom_gene_check.sh --make-list <out_file> <gene_name> [gene_name ...]
-  bash custom_gene_check.sh <outs_dir> <feature_list_file> [report_path]
-  bash custom_gene_check.sh --version
-  bash custom_gene_check.sh --help
+  bash custom_gene_check.sh --sample-dir  <sample_dir>    <genes> [report_path]
+  bash custom_gene_check.sh --project-dir <project_dir> <genes> [report_path]
+  bash custom_gene_check.sh --list        <sample_dir>    <gene_name>
+  bash custom_gene_check.sh --version     Print the script version and exit.
+  bash custom_gene_check.sh --help        This text.
+
+Global flag (works at any position with --sample-dir / --project-dir):
+  --min-umi N   per-cell UMI detection threshold (default 3)
+
+A CSV report is always saved next to the input folder:
+  <input_dir>/custom_genes_<input_dir_name>.csv
+Override its location with the optional [report_path]. The same report is
+also printed to stdout.
+
+<genes> is ONE argument, either a single gene name OR a list file:
+  ZNF721          a gene name, matched EXACTLY against the reference
+  genes.txt       a file with one gene name per line; each matched EXACTLY
+  A reference that uses a prefixed name (e.g. GRCh38_ZNF721) must be passed
+  exactly -- use --list to find that exact row name first.
 
 Options:
-  --detect <gene_name> <outs_dir> [report_path]
-      One-shot check on one sample (one 'outs' dir).
-  --list <gene_name> <outs_dir>
-      Inspection only. Prints every row of the run's feature table
-      (filtered_feature_bc_matrix/features.tsv.gz) mentioning <gene_name>
-      and prints the transgene row (feature id == name), which is the line
-      to put in a feature-list file. Does not run the expression check.
-  --project <project_dir> <gene_name> [report_path]
-      Check one <gene_name> across all samples in a project: finds every
-      outs/filtered_feature_bc_matrix under <project_dir> (recursively),
-      runs the check on each sample, and prints one combined table
-      (one row per sample) plus a PROJECT SUMMARY line (EXPRESSED / SILENT
-      counts and how many samples lack the transgene row in their
-      reference). Per-sample values are identical to a single-sample run.
-  --make-list <out_file> <gene_name> ...
-      Writes a feature-list file, one gene name per line.
-  --version
-      Print the script version and exit.
-  --help
-      This text.
-
-  For --detect and --list, <gene_name> and <outs_dir> are accepted in
-  either order.
+  --sample-dir   <sample_dir> <genes> [report_path]
+        Check <genes> on one sample (one 'outs' dir).
+  --project-dir  <project_dir> <genes> [report_path]
+        Check <genes> on every sample under <project_dir> (recursively finds
+        outs/filtered_feature_bc_matrix/):
+          - a single gene  -> one table (one row per sample) + PROJECT SUMMARY
+          - a list file    -> one table per gene (each with its own summary)
+        Per-sample values are identical to a single-sample run.
+  --list         <sample_dir> <gene_name>
+        Inspection only. Prints every row of the run's feature table
+        (filtered_feature_bc_matrix/features.tsv.gz) mentioning <gene_name>
+        and marks the transgene row (feature id == name) -- that exact name is
+        the one to pass as <genes>. Does not run the expression check.
+  --min-umi N    Global flag (any position) for --sample-dir / --project-dir.
+        Minimum UMI count for a cell to count as detecting a row.
+        Default: 3. A gene is EXPRESSED when >=1 cell on its transgene row
+        reaches N. N must be an integer >= 1.
+  --version      Print the script version and exit.
+  --help         This text.
 
 Arguments:
   <gene_name>         name of the transgene/gene as present in the reference
-                      (e.g. ZNF721)
-  <outs_dir>          cellranger 'outs' directory (contains
+                      (e.g. ZNF721); matched exactly
+  <genes>             one gene name, OR a file with one gene name per line
+                      (first field of each line used; '#' comments and blank
+                      lines ignored); names matched exactly
+  <sample_dir>          cellranger 'outs' directory (contains
                       filtered_feature_bc_matrix/)
   <project_dir>       folder containing one or more samples (each with its
                       own outs/filtered_feature_bc_matrix/); searched
-                      recursively for --project
-  <feature_list_file> plain text, one gene name per line; first field of
-                      each line used; '#' comments and blank lines ignored
-  [report_path]       file to also write the report to; table is always
-                      printed to stdout
+                      recursively for --project-dir
+  [report_path]       path of the CSV report file. Defaults to
+                      <input_dir>/custom_genes_<input_dir_name>.csv.
+                      The report is always also printed to stdout.
 
 Transgene vs endogenous (report columns):
   tg_*   transgene row: the feature whose id equals the gene name
@@ -500,6 +590,7 @@ Transgene vs endogenous (report columns):
   endo_* endogenous row(s): same name, Ensembl id (e.g.
          'ENSG00000182903  ZNF721'); the genomic copy
   tg_*=0 with endo_>0: no uniquely-assigned reads to the appended contig
+  tg_cells/endo_cells only count cells with UMI >= --min-umi (default 3)
 
 Exit codes:
   0  check ran (per-gene status SILENT/EXPRESSED in the report)
@@ -508,42 +599,68 @@ Exit codes:
   3  <gene_name> has no transgene row in the run's reference, or the
      project contains no samples
 USAGE
-    }
-    case "${1:-}" in
-        --version|-v)  echo "${VERSION}" ;;
-        --help|-h)  _usage ;;
-        --list|-l)
-            [ $# -ge 3 ] || { echo "Usage: --list <gene_name> <outs_dir>" >&2; exit 2; }
-            if [ -d "${2%/}" ]; then list_custom_genes "$2" "$3"
-            elif [ -d "${3%/}" ]; then list_custom_genes "$3" "$2"
-            else list_custom_genes "$2" "$3"; fi
-            ;;
-        --detect|-d)
-            [ $# -ge 3 ] || { echo "Usage: --detect <gene_name> <outs_dir> [report_path]" >&2; exit 2; }
-            if [ -d "${2%/}" ]; then detect_custom_gene "$2" "$3" "${4:-}"
-            elif [ -d "${3%/}" ]; then detect_custom_gene "$3" "$2" "${4:-}"
-            else detect_custom_gene "$2" "$3" "${4:-}"; fi
-            ;;
-        --project|-p)
-            [ $# -ge 3 ] || { echo "Usage: --project <project_dir> <gene_name> [report_path]" >&2; exit 2; }
-            if [ -d "${2%/}" ]; then check_project_genes "$2" "$3" "${4:-}"
-            elif [ -d "${3%/}" ]; then check_project_genes "$3" "$2" "${4:-}"
-            else check_project_genes "$2" "$3" "${4:-}"; fi
-            ;;
-        --make-list|-m)
-            [ $# -ge 3 ] || { echo "Usage: --make-list <out_file> <symbol> [symbol ...]" >&2; exit 2; }
-            make_list_file "$2" "${@:3}"
-            ;;
-        *)
-            if [ $# -lt 2 ]; then
-                _usage
-                echo "" >&2
-                echo "ERROR: <feature_list_file> missing — one custom gene name per line." >&2
-                echo "  build one with: --make-list <out_file> <gene_name> ..." >&2
-                echo "  or run without a list file: --detect <gene_name> <outs_dir>" >&2
-                exit 1
-            fi
-            check_custom_genes "$@"
-            ;;
-    esac
+}
+# ---- optional global flag: --min-umi N (per-cell UMI detection threshold) ----
+MIN_UMI="3"
+_args=()
+while [ $# -gt 0 ]; do
+    if [ "$1" = "--min-umi" ]; then
+        if [ $# -lt 2 ]; then
+            echo "ERROR: --min-umi needs a value (integer >= 1)" >&2
+            exit 2
+        fi
+        MIN_UMI="$2"
+        shift
+    else
+        _args+=("$1")
+    fi
+    shift
+done
+set -- "${_args[@]}"
+if ! [[ "$MIN_UMI" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --min-umi must be an integer >= 1 (got '${MIN_UMI}')" >&2
+    exit 2
 fi
+
+case "${1:-}" in
+    --version|-v)  echo "${VERSION}" ;;
+    --help|-h)     _usage ;;
+    --list|-l)
+        if [ $# -lt 3 ]; then
+            echo "Usage: --list <sample_dir> <gene_name>" >&2
+            exit 2
+        fi
+        list_custom_genes "${2%/}" "$3"
+        ;;
+    --sample-dir|-s)
+        if [ $# -lt 3 ]; then
+            echo "Usage: --sample-dir <sample_dir> <genes> [report_path]" >&2
+            exit 2
+        fi
+        rep="${4:-}"
+        [ -n "$rep" ] || rep="$(_default_report "${2%/}")"
+        run_sample_dir "${2%/}" "$3" "$rep"
+        ;;
+    --project-dir|-p)
+        if [ $# -lt 3 ]; then
+            echo "Usage: --project-dir <project_dir> <genes> [report_path]" >&2
+            exit 2
+        fi
+        rep="${4:-}"
+        [ -n "$rep" ] || rep="$(_default_report "${2%/}")"
+        run_project_genes "${2%/}" "$3" "$rep"
+        ;;
+    *)
+        if [ $# -lt 2 ]; then
+            _usage >&2
+            echo "" >&2
+            echo "ERROR: <mode> and <genes> are required." >&2
+            echo "  sample mode :  --sample-dir  <sample_dir> <genes> [report]" >&2
+            echo "  project mode:  --project-dir <project>  <genes> [report]" >&2
+            exit 1
+        fi
+        echo "ERROR: unknown mode '${1}' (expected --sample-dir, --project-dir, or --list)." >&2
+        echo "  Run 'custom_gene_check.sh --help' for details." >&2
+        exit 2
+        ;;
+esac
