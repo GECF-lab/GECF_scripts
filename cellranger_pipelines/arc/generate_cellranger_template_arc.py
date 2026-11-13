@@ -31,8 +31,10 @@ CSV (the same 3-column layout cellranger-arc consumes) and one
         --tenx-cloud-token-path=/home/gecf/.config/txg/credentials
 
 Fastq leaf directories are resolved at generation time under
-``<run_dir>/fastq_bases2fastq/<batch>/Samples/<experiment>/<fastq_id>/``;
-when they cannot be resolved (raw data not mounted here) a clearly marked
+``<run_dir>/fastq_bases2fastq/<batch>/Samples/<experiment>/<fastq_id>/``
+(or — when a run has no ``fastq_bases2fastq`` level — directly under
+``<run_dir>/<batch>/Samples/<experiment>/<fastq_id>/``); when they
+cannot be resolved (raw data not mounted here) a clearly marked
 placeholder is emitted for the operator to fill in.
 """
 
@@ -96,7 +98,7 @@ from common.intake import (
 # ``-v``/``--version``.  Generator version == generated-script version;
 # the .sh kept in the archive tells you which one produced it.
 # Bump on any change to the generator.
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.2"
 
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc"
 
@@ -504,26 +506,64 @@ def is_excluded_batch(folder_name):
 def resolve_fastq_leaf(run_dir, fastq_id):
     """
     Resolve the fastq leaf directory for one fastq ID under the run
-    folder's ``fastq_bases2fastq/<batch>/Samples`` structure.
+    folder.
 
-    Returns the absolute leaf path, or None if not found.
+    Two known demux layouts are accepted (mirroring the depths that
+    ``common.intake.list_sample_dirs`` honours):
+
+      1. ``<run_dir>/fastq_bases2fastq/<batch>/Samples/<experiment>/<fastq_id>``
+         — the canonical layout (e.g. AVT0660);
+      2. ``<run_dir>/<batch>/Samples/<experiment>/<fastq_id>``
+         — demux output directly under the run folder, without the
+         ``fastq_bases2fastq`` level (e.g. AVT0654); the flat
+         ``<run_dir>/Samples/<experiment>/<fastq_id>`` form is preferred.
+
+    Layout 2 is only searched when ``fastq_bases2fastq`` is absent, so
+    runs with the canonical layout keep the exact previous behaviour.
+    Batch folders matching EXCLUDED_BATCH_PATTERNS (phix / unassigned /
+    for_check) are skipped.  Returns the absolute leaf path, or None if
+    the id cannot be resolved.
     """
     if not fastq_id:
         return None
-    root = os.path.join(run_dir, "fastq_bases2fastq")
-    if not os.path.isdir(root):
-        return None
-    for batch in sorted(os.listdir(root)):
-        if not batch or batch.startswith(".") or is_excluded_batch(batch):
-            continue
-        samples_dir = os.path.join(root, batch, "Samples")
+
+    def _in(samples_dir):
         if not os.path.isdir(samples_dir):
-            continue
+            return None
         for dirpath, dirnames, _ in os.walk(samples_dir):
             if fastq_id in dirnames:
                 leaf = os.path.join(dirpath, fastq_id)
                 if os.path.isdir(leaf):
                     return leaf
+        return None
+
+    strict_root = os.path.join(run_dir, "fastq_bases2fastq")
+    if os.path.isdir(strict_root):
+        # Canonical layout — unchanged from the previous behaviour.
+        for batch in sorted(os.listdir(strict_root)):
+            if not batch or batch.startswith(".") or is_excluded_batch(batch):
+                continue
+            hit = _in(os.path.join(strict_root, batch, "Samples"))
+            if hit:
+                return hit
+        return None
+
+    # No fastq_bases2fastq level: the demux output sits directly under the
+    # run folder.  Try the flat form first, then each top-level batch folder
+    # (same exclusions as the canonical layout).
+    try:
+        tops = sorted(os.listdir(run_dir))
+    except OSError:
+        return None
+    hit = _in(os.path.join(run_dir, "Samples"))
+    if hit:
+        return hit
+    for top in tops:
+        if not top or top.startswith(".") or is_excluded_batch(top):
+            continue
+        hit = _in(os.path.join(run_dir, top, "Samples"))
+        if hit:
+            return hit
     return None
 
 
@@ -555,13 +595,19 @@ _GEX, _ATAC = "Gene Expression", "Chromatin Accessibility"
 
 
 def build_script(reference_genome, groups, avt_run, user, run_dir,
-                 source_files=None, resolve=None):
+                 source_files=None, resolve=None, number_prefix=True):
     """Emit the ``cellranger-arc_AVT0XXX.sh`` text.
 
     ``resolve`` maps ``(sample_base, fastq_id)`` to a leaf directory (or
     None); resolved at generation time and baked into the .sh as literal
     path assignments.  When ``resolve`` is None the classic full-tree walk
     (``resolve_fastq_leaf``) is used directly.
+    *number_prefix* (default True): zero-pad the sample index (01_, 02_,
+    …) onto each per-sample run folder (--id / --output-dir) and its
+    companion files, keeping the folders in sample order even when the
+    names are not alphabetical.  Pass False (CLI: --no-number-prefix)
+    for bare sample names (the previous behaviour).
+
 
     Layout (top -> bottom) — items 5–8 of the arc/GEX parity list:
       1.  Header / constants (timestamp, reference, source files, requester,
@@ -593,6 +639,11 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     """
     _resolve = (resolve if resolve is not None
                 else (lambda base, fid: resolve_fastq_leaf(run_dir, fid)))
+    # Per-sample run folder name: 01_, 02_, … (ON by default) keeps the
+    # folders in sample order even when the names are not alphabetical.
+    # --no-number-prefix -> bare sample name (previous behaviour).
+    run_names = [f"{i:02d}_{b}" if number_prefix else b
+                 for i, b in enumerate(groups, 1)]
     L = []
 
     # ---- 1) header / constants -----------------------------------------------------------------
@@ -760,7 +811,8 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         desc = ",".join(fids) if fids else base
         n_gex = sum(1 for _, _, m in libs if m == _GEX)
         n_atac = sum(1 for _, _, m in libs if m == _ATAC)
-        csv_name = f"libraries_{base}.csv"
+        run_name = run_names[idx - 1]
+        csv_name = f"libraries_{run_name}.csv"
 
         L.append(f"# --- arc_sample_{idx}() — Sample {idx}: {base}  ({n_gex} GEX + {n_atac} ATAC) ---")
         L.append(f"arc_sample_{idx}() {{")
@@ -780,7 +832,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         # cellranger-arc count — flag_lines list = what runs AND appears in the .sh
         flag_lines = [
             'cellranger-arc count',
-            f'    --id={base}',
+            f'    --id={run_name}',
             f'    --description={desc}',
             '    --reference="${REFPATH}"',
             f'    --libraries={csv_name}',
@@ -804,7 +856,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         # single-quoted echo — which wrote the unexpanded ${...} template
         # into the log: parameter NAMES without VALUES.)
         L.append('    _cmd=( ' + " ".join(fl.strip() for fl in flag_lines) + ' )')
-        L.append(f'    _cmd_log="${{Server_folder}}/{base}_script_log.txt"')
+        L.append(f'    _cmd_log="${{Server_folder}}/{run_name}_script_log.txt"')
         L.append('    echo "${_cmd[@]}" > "${_cmd_log}"')
         L.append("")
         # Execute the command (same flag_lines list, line-continuation formatted)
@@ -814,12 +866,12 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append("")
 
         # Completion check: leftover tmp folders indicate cellranger-arc count did not finish
-        L.append(f'    _err_log="${{Server_folder}}/{base}_error_log.txt"')
-        L.append(f'    find "${{Server_folder}}/{base}" -mindepth 2 -maxdepth 2 '
+        L.append(f'    _err_log="${{Server_folder}}/{run_name}_error_log.txt"')
+        L.append(f'    find "${{Server_folder}}/{run_name}" -mindepth 2 -maxdepth 2 '
                  f'-type d -name "tmp" -print 2>/dev/null > "${{_err_log}}"')
         L.append('    if [ -s "${_err_log}" ]; then')
         L.append(f'        echo "Error: cellranger-arc count for {base} did not complete '
-                 f'(leftover tmp folders detected).\\nSee ${{Server_folder}}/{base}_error_log.txt" >&2')
+                 f'(leftover tmp folders detected).\\nSee ${{Server_folder}}/{run_name}_error_log.txt" >&2')
         L.append('    else')
         L.append('        rm -f "${_err_log}"')
         L.append('    fi')
@@ -827,59 +879,59 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
 
         # Harvest web summaries (joint + GEX_only + ATAC_only)
         L.append("    # Harvest web summaries (joint + GEX_only + ATAC_only)")
-        L.append(f'    if [ -f "${{Server_folder}}/{base}/outs/web_summary.html" ]; then')
-        L.append(f'        cp "${{Server_folder}}/{base}/outs/web_summary.html" '
-                 f'"${{metrics_folder}}/{base}_web_summary.html"')
+        L.append(f'    if [ -f "${{Server_folder}}/{run_name}/outs/web_summary.html" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{run_name}/outs/web_summary.html" '
+                 f'"${{metrics_folder}}/{run_name}_web_summary.html"')
         L.append("    fi")
-        L.append(f'    if [ -f "${{Server_folder}}/{base}/outs/summary.csv" ]; then')
-        L.append(f'        cp "${{Server_folder}}/{base}/outs/summary.csv" '
-                 f'"${{metrics_folder}}/{base}_summary.csv"')
-        L.append(f'    elif [ -f "${{Server_folder}}/{base}/outs/metrics_summary.csv" ]; then')
-        L.append(f'        cp "${{Server_folder}}/{base}/outs/metrics_summary.csv" '
-                 f'"${{metrics_folder}}/{base}_summary.csv"')
+        L.append(f'    if [ -f "${{Server_folder}}/{run_name}/outs/summary.csv" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{run_name}/outs/summary.csv" '
+                 f'"${{metrics_folder}}/{run_name}_summary.csv"')
+        L.append(f'    elif [ -f "${{Server_folder}}/{run_name}/outs/metrics_summary.csv" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{run_name}/outs/metrics_summary.csv" '
+                 f'"${{metrics_folder}}/{run_name}_summary.csv"')
         L.append('    else')
         L.append(f'        echo "  [warn] no summary.csv/metrics_summary.csv for {base}" >&2')
         L.append('    fi')
-        L.append(f'    if [ -f "${{Server_folder}}/{base}/outs/cell_types/web_summary_cell_types.html" ]; then')
-        L.append(f'        cp "${{Server_folder}}/{base}/outs/cell_types/web_summary_cell_types.html" '
-                 f'"${{metrics_folder}}/{base}_web_summary_cell_types.html"')
+        L.append(f'    if [ -f "${{Server_folder}}/{run_name}/outs/cell_types/web_summary_cell_types.html" ]; then')
+        L.append(f'        cp "${{Server_folder}}/{run_name}/outs/cell_types/web_summary_cell_types.html" '
+                 f'"${{metrics_folder}}/{run_name}_web_summary_cell_types.html"')
         L.append("    fi")
         # GEX-only web summary (from the CS tree — harvest before CS-tree deletion)
-        L.append(f'    _gex_web=$(find "${{Server_folder}}/{base}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/GEX_SUMMARIZE_REPORTS" \\')
+        L.append(f'    _gex_web=$(find "${{Server_folder}}/{run_name}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/GEX_SUMMARIZE_REPORTS" \\')
         L.append('        -path "*/files/web_summary.html" -type f 2>/dev/null | head -1 || true)')
         L.append('    if [ -n "${_gex_web}" ]; then')
-        L.append(f'        cp "${{_gex_web}}" "${{metrics_folder}}/GEX_only/{base}_web_summary.html"')
+        L.append(f'        cp "${{_gex_web}}" "${{metrics_folder}}/GEX_only/{run_name}_web_summary.html"')
         L.append('    else')
         L.append(f'        echo "  [warn] no GEX-only web summary for {base}" >&2')
         L.append('    fi')
         # ATAC-only web summary (from the CS tree)
-        L.append(f'    _atac_web=$(find "${{Server_folder}}/{base}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/_SC_ATAC_REPORTER/CREATE_WEBSUMMARY" \\')
+        L.append(f'    _atac_web=$(find "${{Server_folder}}/{run_name}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/_SC_ATAC_REPORTER/CREATE_WEBSUMMARY" \\')
         L.append('        -path "*/files/web_summary.html" -type f 2>/dev/null | head -1 || true)')
         L.append('    if [ -n "${_atac_web}" ]; then')
-        L.append(f'        cp "${{_atac_web}}" "${{metrics_folder}}/ATAC_only/{base}_web_summary.html"')
+        L.append(f'        cp "${{_atac_web}}" "${{metrics_folder}}/ATAC_only/{run_name}_web_summary.html"')
         L.append('    else')
         L.append(f'        echo "  [warn] no ATAC-only web summary for {base}" >&2')
         L.append('    fi')
         L.append("")
 
         # Delete the SC_ATAC_GEX_COUNTER_CS scratch tree (summaries already harvested)
-        L.append("    rm -r \"${Server_folder}/" + base + "/SC_ATAC_GEX_COUNTER_CS\" 2>/dev/null || true")
+        L.append("    rm -r \"${Server_folder}/" + run_name + "/SC_ATAC_GEX_COUNTER_CS\" 2>/dev/null || true")
         L.append("")
 
         # rsync sample dir + auxiliary files to the archive
         L.append("    # Archive this sample + auxiliary files")
         L.append('    if command -v rsync >/dev/null 2>&1; then')
-        L.append(f'        if [ -d "${{Server_folder}}/{base}" ]; then')
-        L.append(f'            rsync -avh "${{Server_folder}}/{base}" "${{archive_dir}}/"')
+        L.append(f'        if [ -d "${{Server_folder}}/{run_name}" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{run_name}" "${{archive_dir}}/"')
         L.append('        fi')
         L.append(f'        if [ -f "${{Server_folder}}/{csv_name}" ]; then')
         L.append(f'            rsync -avh "${{Server_folder}}/{csv_name}" "${{archive_dir}}/"')
         L.append('        fi')
-        L.append(f'        if [ -f "${{Server_folder}}/{base}_script_log.txt" ]; then')
-        L.append(f'            rsync -avh "${{Server_folder}}/{base}_script_log.txt" "${{archive_dir}}/"')
+        L.append(f'        if [ -f "${{Server_folder}}/{run_name}_script_log.txt" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{run_name}_script_log.txt" "${{archive_dir}}/"')
         L.append('        fi')
-        L.append(f'        if [ -f "${{Server_folder}}/{base}_error_log.txt" ]; then')
-        L.append(f'            rsync -avh "${{Server_folder}}/{base}_error_log.txt" "${{archive_dir}}/" 2>/dev/null || true')
+        L.append(f'        if [ -f "${{Server_folder}}/{run_name}_error_log.txt" ]; then')
+        L.append(f'            rsync -avh "${{Server_folder}}/{run_name}_error_log.txt" "${{archive_dir}}/" 2>/dev/null || true')
         L.append('        fi')
         L.append('    fi')
 
@@ -1002,7 +1054,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("#     no outs/summary.csv        -> cellranger-arc count never completed")
     L.append("# ============================================================")
     L.append("_overall_rc=0")
-    _dirs_bash = " ".join('"' + base + '"' for base in groups)
+    _dirs_bash = " ".join('"' + d + '"' for d in run_names)
     L.append("for _d in " + _dirs_bash + "; do")
     L.append('    if [ -s "${Server_folder}/${_d}_error_log.txt" ]; then')
     L.append('        echo "[FAIL] ${_d}  (see ${Server_folder}/${_d}_error_log.txt)" >&2')
@@ -1055,9 +1107,10 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append('SM_OUT="${Server_folder}/summary_metrics.csv"')
     L.append(': > "${SM_TMP}"')
     L.append('_sm_hdr_written=0')
-    for _base in groups:
-        L.append('    _sm_src="${Server_folder}/%s/outs/summary.csv"' % _base)
-        L.append('    [ -f "${_sm_src}" ] || _sm_src="${Server_folder}/%s/outs/metrics_summary.csv"' % _base)
+    for _i, _base in enumerate(groups, 1):
+        _dn = run_names[_i - 1]
+        L.append('    _sm_src="${Server_folder}/%s/outs/summary.csv"' % _dn)
+        L.append('    [ -f "${_sm_src}" ] || _sm_src="${Server_folder}/%s/outs/metrics_summary.csv"' % _dn)
         L.append('    if [ -f "${_sm_src}" ]; then')
         L.append('        _sm_hdr=$(head -n1 "${_sm_src}" | tr -d "\\t")')
         L.append('        _sm_dat=$(tail -n +2 "${_sm_src}" | head -n1 | tr -d "\\t")')
@@ -1065,7 +1118,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append('            echo "Samplename,${_sm_hdr}" > "${SM_TMP}"')
         L.append('            _sm_hdr_written=1')
         L.append('        fi')
-        L.append('        if [ -n "${_sm_dat}" ]; then echo "%s,${_sm_dat}" >> "${SM_TMP}"; fi' % _base)
+        L.append('        if [ -n "${_sm_dat}" ]; then echo "%s,${_sm_dat}" >> "${SM_TMP}"; fi' % _dn)
         L.append("    fi")
     L.append('if [ -s "${SM_TMP}" ]; then')
     L.append('    cp "${SM_TMP}" "${SM_OUT}"')
@@ -1191,6 +1244,18 @@ def main():
         help="Reference genome for non-interactive runs (default: human). "
              "Interactive runs always prompt.",
     )
+    parser.add_argument(
+        "--no-number-prefix",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not number the per-sample run folders (ON by default): "
+            "cellranger-arc count --id becomes '<sample>' instead of "
+            "'01_<sample>', and the folder keeps the bare sample name. "
+            "Numbering keeps the folders in sample order even when the "
+            "names are not alphabetical."
+        ),
+    )
     args = parser.parse_args()
 
     set_non_interactive(args.non_interactive)
@@ -1206,12 +1271,14 @@ def main():
             print(f"Warning: skipping '{path}' (not found or not .xlsx).")
             continue
         source_files.append(path)
+        print(f"Reading '{os.path.basename(path)}' …", flush=True)
         rows, avt = parse_xlsx(path)
         if rows:
             all_rows.extend(rows)
         if avt:
             detected_avts.append(avt)
         if not any_user:
+            print("Reading the requester (User) field …", flush=True)
             any_user = read_user_field(path)
 
     if not all_rows:
@@ -1337,7 +1404,8 @@ def main():
         return resolve_fastq_leaf(_run, _fid)     # full-tree walk (parity item 11)
 
     script = build_script(reference_genome, groups, any_avt, user, run_dir,
-                          resolve=resolve, source_files=source_files)
+                          resolve=resolve, source_files=source_files,
+                          number_prefix=not args.no_number_prefix)
     out_script = f"cellranger-arc_{any_avt}.sh"
     with open(out_script, "w") as f:
         f.write(script)
