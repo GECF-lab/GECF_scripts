@@ -178,28 +178,32 @@ The main entry point is <code>brbseq_pipeline.sh</code>. One invocation = one po
   <pre><code>BRBseq/
 ├── brbseq_pipeline.sh      # the main script
 └── utils/                  # required — keep in the same folder
-    ├── parse_libprep_xlsx.py
-    ├── prepare_barcodes.sh
-    ├── rename_matrix.py
-    ├── prepare_umi_matrix.py
-    ├── get_duplication_statistics.py
-    └── demultiplex_bam.sh</code></pre>
+    ├── parse_libprep_xlsx.py         # lib-prep workbook → sample/well/barcode manifest
+    ├── tsv_wells_to_manifest.py      # --barcode-tsv (well [TAB] sample_id) → manifest
+    ├── prepare_barcodes.sh           # build the barcode whitelist
+    ├── rename_matrix.py              # rename matrix samples
+    ├── prepare_umi_matrix.py         # gene × sample UMI matrix CSV
+    ├── get_duplication_statistics.py # duplication QC
+    ├── demultiplex_bam.sh            # per-sample BAM demux (picard)
+    └── make_pca.py                   # PCA of the UMI matrix (v1.3.0)</code></pre>
   If you move <code>brbseq_pipeline.sh</code> somewhere else, move <code>utils/</code>
   with it (or copy both together) — a missing <code>utils/</code> is the most common
   "script just dies" cause and isn't a data problem.
 </div>
 <p>
 You provide the samples→wells mapping either as the <strong>lib-prep workbook</strong>
-(recommended — the parser reads well positions, sample names, and infers the barcode
-plate from the workbook's own <em>Kit ref</em> row) or as a handmade
-two-column TSV where the first column is the <code>sample_id</code> and the second
-is the <code>barcode</code>, separated by <strong>one real tab character</strong>
-(i.e. <code>sample_id[tab]barcode</code>, not the word "tab" and not spaces).
+(recommended — the parser reads well positions and sample names) or as a handmade
+two-column TSV where the first column is the <code>well</code> and the second is the
+<code>sample_id</code>, separated by <strong>one real tab character</strong>
+(i.e. <code>well[tab]sample_id</code>, not the word "tab" and not spaces).
+In both modes the barcodes come from the plate file you pass with
+<code>--plate</code> (required) — never from the workbook or the TSV.
 </p>
 <h3>Example: workbook mode</h3>
 <pre><code>./brbseq_pipeline.sh \
   --species mouse \
   --libprep-xlsx /path/to/libprep_phxxx.xlsx \
+  --plate /home/gecf/NGS_pipelines/BRB-seq/BRB_plates/barcodes_96_V5D_brb.txt \
   --r1 /path/to/Daniel_pool1_S1_R1_001.fastq.gz \
   --r2 /path/to/Daniel_pool1_S1_R2_001.fastq.gz</code></pre>
 <p class="smallnote">In workbook mode <code>--run-name</code> is optional — it is inferred
@@ -208,29 +212,27 @@ either — see the output-directory note below.</p>
 <h3>Example: barcode-TSV mode</h3>
 <pre><code>./brbseq_pipeline.sh \
   --species human \
-  --barcode-tsv /path/to/sample_barcodes.tsv \
+  --barcode-tsv /path/to/sample_wells.tsv \
+  --plate /home/gecf/NGS_pipelines/BRB-seq/BRB_plates/barcodes_96_V5D_brb.txt \
   --run-name Daniel_pool1 \
   --r1 /path/to/Daniel_pool1_S1_R1_001.fastq.gz \
   --r2 /path/to/Daniel_pool1_S1_R2_001.fastq.gz</code></pre>
 
 <h4>What the TSV file must look like</h4>
 <p>Exactly <strong>two columns separated by one tab character</strong> —
-<code>sample_id</code> and <code>barcode</code> — one sample per line. The header row
-is optional (the script auto-detects it). The barcode is the 14-base BRB-seq cell
-barcode from the plate file. Do not write the word "tab" in the file, do not use
-spaces:</p>
-<pre><code>sample_id	barcode
-W0_WT_DOX_1	CAGGCAAGGCAACG
-W0_SH_DOX_1	CTACCGGAGAATTT
-W1_WT_No_DOX_1	AACGCTGCCGTAAT
-W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
+<code>well</code> and <code>sample_id</code> — one sample per line. The header row
+is optional (the script auto-detects it). The cell barcode for each well is read
+from the plate file you pass with <code>--plate</code>; well spellings like
+<code>A1</code> and <code>A01</code> are interchangeable:</p>
+<pre><code>well	sample_id
+A01	W0_WT_DOX_1
+B04	W0_SH_DOX_1
+C02	W1_WT_No_DOX_1
+D09	W3_SH_DOX_2</code></pre>
 <div class="warn">
-  <strong>The delimiter must be a real tab character</strong> — press the Tab key
-  between the two fields in your text editor. Each line looks like
-  <code>W1_WT_No_DOX_1[tab]AACGCTGCCGTAAT</code>, where <code>[tab]</code> is a
-  single <code>\t</code> character, <em>not</em> the three characters T-A-B and not
-  spaces — spaces will make the file unreadable to the parser. Save it as
-  <code>.txt</code> or <code>.tsv</code>, plain text.
+  <strong>Tip:</strong> press the <kbd>Tab</kbd> key between the two fields in your
+  text editor to insert the tab — that's what the <code>[tab]</code> in the example
+  means. Save the file as plain text (<code>.txt</code> or <code>.tsv</code>).
 </div>
 
 <div class="note">
@@ -256,11 +258,11 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
   <tr><td><code>--species</code></td><td>yes</td><td><code>mouse</code> or <code>human</code> (not read from the workbook)</td></tr>
   <tr><td><code>--r1</code> <code>--r2</code></td><td>yes</td><td>Your pool's two FASTQ files — <code>--r1</code> = barcode read (CB+UMI), <code>--r2</code> = cDNA read</td></tr>
   <tr><td><code>--star-genome</code></td><td class="opt">optional</td><td>Custom STAR index directory. Not needed on the server for <code>mouse</code>/<code>human</code> — the index is inferred from <code>--species</code>. Pass it only for a custom index / new species</td></tr>
-  <tr><td><code>--libprep-xlsx</code> <em>or</em> <code>--barcode-tsv</code></td><td>yes (exactly one)</td><td>Sample→well manifest source</td></tr>
+  <tr><td><code>--libprep-xlsx</code> <em>or</em> <code>--barcode-tsv</code></td><td>yes (exactly one)</td><td>Well→sample manifest source (workbook, or a two-column well/sample_id TSV)</td></tr>
   <tr><td><code>--run-name</code></td><td>yes in TSV mode</td><td>Name of the run folder (in workbook mode it can also be inferred from the workbook's <em>Researcher</em> row)</td></tr>
   <tr><td><code>--threads</code></td><td class="opt">optional</td><td>Number of CPU threads (default 8)</td></tr>
   <tr><td><code>--out-dir</code></td><td class="opt">optional</td><td>Root output dir — defaults to <code>/mnt/data/BRB-seq_output</code> on the server. Use local disk rather than a network share if you override it</td></tr>
-  <tr><td><code>--plate</code></td><td class="opt">optional</td><td>Barcode plate file; normally auto-inferred from the workbook's <em>Kit ref</em> (V5D vs V5A10 chemistry)</td></tr>
+  <tr><td><code>--plate</code></td><td><strong>required</strong> (both modes)</td><td>Well-matched barcode plate file (<code>A01</code>…<code>H12</code> + 14-nt barcode per line). The barcodes always come from this file; in workbook mode the workbook's <em>Kit ref</em> row is only cross-checked against it (a mismatch is a warning — the given plate wins)</td></tr>
   <tr><td><code>--skip-fastq</code></td><td class="opt">optional</td><td>Skip the FastQC step. The step runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-rseqc</code></td><td class="opt">optional</td><td>Skip the RSeQC read-distribution step. The step runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-dmux-bam</code></td><td class="opt">optional</td><td>Skip the per-sample BAM demux (picard) — the slowest step. It runs by default; add this flag to turn it off</td></tr>
@@ -275,18 +277,20 @@ W3_SH_DOX_2	CTGTATCCTGAGGT</code></pre>
 <div class="warn">
   <strong>Plate chemistry (V5D vs V5A10).</strong> The two plate files contain the
   same 96 barcodes but assigned to <em>different</em> wells — using the wrong one
-  silently swaps every sample's identity. Even when the pipeline reads the chemistry
-  from the Excel file, the value there can be wrong, so
-  <strong>always pass <code>--plate &lt;file&gt;</code> explicitly</strong> to
-  guarantee the correct file is used. The plate files (one per chemistry)
-  live in <code>/home/gecf/NGS_pipelines/BRB-seq/BRB_plates</code> — for example
-  <code>--plate /home/gecf/NGS_pipelines/BRB-seq/BRB_plates/barcodes_96_V5A10_brb.txt</code>
+  silently swaps every sample's identity. <code>--plate &lt;file&gt;</code> is
+  <strong>required</strong>: the pipeline takes its barcodes only from the file you
+  give it — it never guesses the chemistry from the Excel file, and in workbook
+  mode the workbook's <em>Kit ref</em> is only cross-checked against your file
+  (a mismatch warns, it does not block). So the choice is entirely yours:
+  <strong>pass the plate file that matches your kit's chemistry</strong>. The plate
+  files (one per chemistry) live in <code>/home/gecf/NGS_pipelines/BRB-seq/BRB_plates</code>
+  — for example <code>--plate /home/gecf/NGS_pipelines/BRB-seq/BRB_plates/barcodes_96_V5A10_brb.txt</code>
   when your kit is a V5A10 kit, and the matching <code>V5D</code> file for a V5D kit.
 </div>
 
 <h3>What happens inside a run</h3>
 <ol>
-  <li><strong>Manifest</strong> — samples, wells, and 14-nt barcodes are joined into a whitelist (empty plate wells included as <code>empty_well_XX</code> rows in workbook mode).</li>
+  <li><strong>Manifest</strong> — samples, wells, and 14-nt barcodes are joined into a whitelist (wells with no sample are included as <code>empty_well_XX</code> rows in both modes).</li>
   <li><strong>FastQC</strong> of both FASTQ files.</li>
   <li><strong>STARsolo alignment + counting</strong> — one alignment pass that strips the 14-nt CB + 14-nt UMI from read 1, aligns the 90-nt cDNA read, and writes per-barcode gene-count matrices (raw and UMI-deduplicated).</li>
   <li><strong>QC &amp; demux</strong> — RSeQC read distribution, per-sample BAM demux (picard) and per-sample FASTQ demux (fqtk).</li>
@@ -360,7 +364,7 @@ if you only need the expression matrices you can skip the demux steps entirely
 │   │   └── STAR.log
 │   ├── fastqc/                          per-FASTQ reports (.zip / .html)
 │   ├── rseqc/                           read distribution + BED12
-│   ├── demux_bam/   demux_fastq/        per-sample BAM / FASTQ files
+│   ├── demux_bam/   demux_fastq/        per-sample BAM / FASTQ (Sample_ID_R2.fq.gz + unmatched_R2.fq.gz — the 90-bp cDNA reads)
 │   ├── barcodes/                        manifest + provenance used for the run
 │   ├── logs/                            one log per step
 │   ├── pipeline.log                     supervisor log (step status + commands)
@@ -408,7 +412,7 @@ QC tables for the sequencing side:
 </p>
 <table>
   <tr><th>Column</th><th>Meaning</th></tr>
-  <tr><td><code>plate_well</code></td><td>Plate well (A01…H12); <code>NA</code> for samples without a well (e.g. <code>--barcode-tsv</code> mode)</td></tr>
+  <tr><td><code>plate_well</code></td><td>Plate well (A01…H12); unoccupied wells appear as <code>empty_well_<WELL></code></td></tr>
   <tr><td><code>sample_name</code></td><td>Your Sample_ID, <code>empty_well_&lt;WELL&gt;</code> for unoccupied wells, or <code>Unknown</code> for reads with a barcode not in the whitelist</td></tr>
   <tr><td><code>depth_mio</code></td><td>Total reads for that sample (mapped + unassigned), in millions — the whole sample's sequencing footprint</td></tr>
   <tr><td><code>mapped_reads_mio</code></td><td>Reads assigned to a gene feature (exon model), in millions</td></tr>
