@@ -137,7 +137,7 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # Generator version == generated-script version; the kept .sh in the
 # archive tells you which one produced it.  Bump on any change to the
 # generator.
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -396,10 +396,6 @@ def find_fastq_path(avt_run, fastq_id, preferred_sample_dir=None):
 #: Comments are user-facing: they describe what the user may type, so be
 #: explicit about allowed values instead of referring to the flag.
 _PER_SAMPLE_PARAMS = (
-    ("localcores",      LOCAL_CORES,
-     "max cores; blank => cellranger default"),
-    ("localmem",        LOCAL_MEM,
-     "max GB of memory; blank => cellranger default"),
     ("include_introns", "true",
      "true = count intronic reads (default); false = exonic reads only"),
     ("create_bam",      "true",
@@ -440,9 +436,9 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
       1. Header / constants (timestamp, reference genome, scriptversion,
          the source files list, the requester).
       2. RUN-WIDE PARAMETERS — one editable block at the top of the script:
-         keepdata, max_parallel, scratch_root, server_folder_name,
-         NGSruns_archive, and the per-sample FASTQ path_* variables
-         (resolved at generation time).
+         keepdata, max_parallel, localcores, localmem, scratch_root,
+         server_folder_name, NGSruns_archive, and the per-sample FASTQ
+         path_* variables (resolved at generation time).
       3. Per-sample parameter variables (one block per sample),
          editable in place; blank a value to drop the flag for that sample.
       4. Validation: ``--expect-cells`` and ``--force-cells`` are mutually
@@ -466,7 +462,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
          ``cell_types/web_summary_cell_types.html`` and
          ``metrics_summary.csv`` into ``raw_metrics_folder/`` (renamed
          ``<sample>_...``), and build a merged ``summary_metrics.csv`` with
-         a Samplename column in the GECF metric order (1,2,3,8,4,21,20,19,13,17).
+         a Samplename column and every metric column (no filtering / reordering).
       7b. Copy this .sh into the working folder and the archive as the
          provenance record.
       7d. A single ``md5sums.txt`` over the entire run folder (replaces
@@ -536,13 +532,17 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append('#               "no"  = delete it (data already rsynced to the archive).')
     lines.append('keepdata="no"')
     lines.append('#   max_parallel : how many cellranger counts to run at the same time.')
-    lines.append('#   1 = serial (one sample after another, previous behaviour).')
-    lines.append('#   N>1 = rolling pool of N jobs: sample 1..N start first; whenever one')
-    lines.append('#          finishes the next one starts until all samples are done.')
-    lines.append('#   Each sample still caps its own CPU (--localcores_<#>) and RAM')
-    lines.append('#   (--localmem_<#>): default 32 cores / 126 GB, so max_parallel=3')
-    lines.append('#   tops out at 96 cores and 378 GB — set max_parallel=1 to disable.')
+    lines.append('#   1 = serial (one sample after another); N>1 = rolling pool of N jobs,')
+    lines.append('#          the next sample starts as soon as a slot frees up.')
+    lines.append('#   localcores : CPU cores per cellranger count (applies to ALL samples);')
+    lines.append('#                blank = cellranger default.')
+    lines.append('#   localmem   : RAM in GB per cellranger count (applies to ALL samples);')
+    lines.append('#                blank = cellranger default.')
+    lines.append('#   With max_parallel>1, total = max_parallel x (localcores cores, localmem GB),')
+    lines.append("#   so all three must fit within the server's resources together.")
     lines.append('max_parallel=3')
+    lines.append(f'localcores="{LOCAL_CORES}"')
+    lines.append(f'localmem="{LOCAL_MEM}"')
     lines.append("#   scratch_root : root on the analysis server where cellranger count")
     lines.append("#                  output is written (fixed convention — change only if")
     lines.append("#                  the mount point differs on your server).")
@@ -609,8 +609,6 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("#       - number / text -> emitted as --flag=<value>")
     lines.append("#       - leave a default as-is to keep it")
     lines.append("#   * Allowed values (chemistry is the only one with a fixed list):")
-    lines.append("#     localcores      : number of cores, or blank")
-    lines.append("#     localmem        : memory in GB, or blank")
     lines.append("#     include_introns: true | false")
     lines.append("#     create_bam     : true | false")
     lines.append("#     chemistry      : threeprime | fiveprime | SC3Pv1 | SC3Pv2 | SC3Pv3 |")
@@ -717,6 +715,9 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
             '    --cell-annotation-model=auto',
             '    --tenx-cloud-token-path="/home/gecf/.config/txg/credentials"',
             '    --output-dir="' + SFR + '/' + numbered_dir + '"',
+            # CPU/memory caps are run-wide (localcores / localmem), not per-sample
+            '    ${localcores:+--localcores=$localcores}',
+            '    ${localmem:+--localmem=$localmem}',
         ]
         # Per-sample conditional knobs. Blank value -> flag omitted for this
         # sample only. custom_options is deliberately UNQUOTED on the last
@@ -810,8 +811,8 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("#   max_parallel=1 : serial, one sample after another (previous behaviour)")
     lines.append("#   max_parallel=N : rolling pool of N concurrent cellranger counts; the")
     lines.append("#                    next sample starts as soon as one slot frees up")
-    lines.append("#   Per-sample resource caps still apply (--localcores_<i> / --localmem_<i>),")
-    lines.append("#   so max_parallel=3 @ defaults (32 cores / 126 GB) tops out at 96 cores /")
+    lines.append("#   Resource caps are run-wide (localcores / localmem), so")
+    lines.append("#   max_parallel=3 @ defaults (32 cores / 126 GB) tops out at 96 cores /")
     lines.append("#   378 GB - within the 128-core / ~500 GB analysis box.")
     lines.append(_DASH)
     lines.append("NSAMPLES=" + str(_N))
@@ -938,7 +939,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     #   metrics_summary.csv into ${Server_folder}/raw_metrics_folder renamed
     #   as <sample>_... ; strip comma thousands-separators inside quoted
     #   fields (awk -F'"'); strip "N%" -> "N" (sed); build summary_metrics.csv
-    #   with Samplename column; reorder to metric order 1,2,3,8,4,21,20,19,13,17.
+    #   with Samplename column and all metric columns (no filtering / reordering).
     SFR = "${Server_folder}"
     # literal sample-name list (no dynamic expansion in the emitted bash)
     # — must match the per-sample dir names used in the cellranger count
@@ -988,10 +989,15 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append('    echo -n "${_sd}," >> "${SM_TMP}"')
     lines.append('    sed -n "2p" "${file}" >> "${SM_TMP}"')
     lines.append("done")
-    lines.append("# Reorder metric columns:")
-    lines.append("#   1, 2, 3, 8, 4, 21, 20, 19, 13, 17")
-    lines.append("awk -F',' '{ print $1, $2, $3, $8, $4, $21, $20, $19, $13, $17 }' OFS=',' \"${SM_TMP}\" > \"${SM_OUT}\"")
-    lines.append('rm -f "${SM_TMP}"')
+    # Promote the full merged table. SM_TMP already holds Samplename plus
+    # every metric column from the per-sample summaries (10X natural order),
+    # so no column is filtered or reordered.
+    lines.append("# Promote the full merged table (Samplename + all metric columns, none filtered).")
+    lines.append('if [ -f "${SM_TMP}" ]; then')
+    lines.append('    mv "${SM_TMP}" "${SM_OUT}"')
+    lines.append('else')
+    lines.append('    echo "WARNING: no per-sample metrics_summary.csv found; summary_metrics.csv not created" >&2')
+    lines.append('fi')
     lines.append('rsync -avh "${metrics_folder}" "${NGSruns_folder}"')
     lines.append('rsync -avh "${SM_OUT}" "${NGSruns_folder}"')
     lines.append("")

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GEX pipeline — How to use it</title>
+<title>GEX pipeline: How to use it</title>
 <style>
   :root {
     --ink: #1f2933; --muted: #5f6b7a; --accent: #0b5fa5; --soft: #eef4fa;
@@ -35,50 +35,52 @@
 </head>
 <body>
 <main>
-  <h1>GEX pipeline — How to use it</h1>
+  <h1>GEX pipeline: How to use it</h1>
   <p class="subtitle">Generate the script from your Excel file, adjust any settings you need, then run it.</p>
 
-  <h2>Step 1 — Generate the script</h2>
+  <h2>Step 1: Generate the script</h2>
   <p>Run the generator with your run's Excel file (the one named after the run, e.g. <code>AVT0571_Arianna_GECF Copy.xlsx</code>):</p>
   <pre><code>python3 generate_cellranger_template_gex.py "AVT0571_Arianna_GECF Copy.xlsx"</code></pre>
-  <p>Keep the quotes around the file name — the paths contain spaces. To combine several runs, list each file after the command in its own quotes; all samples go into one script.</p>
+  <p>Keep the file name in quotes, since the paths contain spaces. To combine several runs, list each file after the command in its own quotes; all samples go into one script.</p>
   <pre><code>python3 generate_cellranger_template_gex.py "AVT0571_….xlsx" "AVT0572_….xlsx"</code></pre>
 
   <h3>Numbered sample folders (on by default)</h3>
-  <p>Each sample's output folder is prefixed with its number in sample order — <code>01_Name_of_sample</code>, <code>02_…</code>, <code>03_…</code> — so the folders always appear in the order of your samples, even when the names themselves are not alphabetical (from 10 samples up the numbers continue 10, 11, …). If you prefer bare sample names without the number, add <code>--no-number-prefix</code> to the command:</p>
+  <p>Each sample's output folder is prefixed with its number in sample order (<code>01_Name_of_sample</code>, <code>02_…</code>, <code>03_…</code>), so the folders always appear in the order of your samples, even when the names themselves are not alphabetical (from 10 samples up the numbers continue 10, 11, …). If you prefer bare sample names without the number, add <code>--no-number-prefix</code> to the command:</p>
   <pre><code>python3 generate_cellranger_template_gex.py --no-number-prefix "AVT0571_Arianna_GECF Copy.xlsx"</code></pre>
 
-  <p>It asks up to four questions, each answered by typing a number (or a path) and pressing enter. Not every run needs every question — the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
+  <p>It asks up to four questions, each answered by typing a number (or a path) and pressing enter. Not every run needs every question: the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
   <ol>
-    <li><strong>AVT run name</strong> — only when some samples have no detected run name; confirm the detected value or type the correct <code>AVT0XXX</code>.</li>
+    <li><strong>AVT run name:</strong> only when some samples have no detected run name. Confirm the detected value, or type the correct <code>AVT0XXX</code>.</li>
     <li><strong>Samples.</strong> Detected samples are listed. Keep the ones to run; a sample missing from the list can be added by its full data-folder path. Ends with a summary of the final sample list.</li>
-    <li><strong>Data folder</strong> — shown only when a sample name exists in more than one run folder. Pick the correct one by number; a single match is used automatically.</li>
-    <li><strong>Genome</strong> — 1 human, 2 mouse, 3 the combined human + mouse reference. You can also type a full path to any other reference genome directory to use a custom one. The exact genome file/folder name inside each reference is resolved automatically, so no need to specify it.</li>
+    <li><strong>Data folder:</strong> shown only when a sample name exists in more than one run folder. Pick the correct one by number; a single match is used automatically.</li>
+    <li><strong>Genome:</strong> 1 human, 2 mouse, 3 the combined human + mouse reference. You can also type a full path to any other reference genome directory to use a custom one. The exact genome file/folder name inside each reference is resolved automatically, so no need to specify it.</li>
   </ol>
 
   <p>On success it writes <code>cellranger-count_AVT0XXX.sh</code> in the current directory. That file is your pipeline.</p>
 
-  <h2>Step 2 — Edit the script</h2>
-  <p>Open the generated script in a text editor. From the terminal, in the folder where the script was written, <code>code cellranger-count_AVT0571.sh</code> opens it in VS Code, or open it through your file manager. Any editor works. To change a setting, edit the value inside the quotes on its line. When you are done, save the file (Ctrl+S, or File → Save) and close it before running the pipeline. Most lines can stay as they are; the ones worth knowing are below.</p>
+  <h2>Step 2: Edit the script</h2>
+  <p>Open the generated script in a text editor. From the terminal, in the folder where the script was written, <code>nano cellranger-count_AVT0571.sh</code> opens it (use the arrow keys to move around). To change a setting, edit the value inside the quotes on its line. When you are done, press <code>Ctrl+O</code> and hit Enter to save the file, then <code>Ctrl+X</code> to close nano, before running the pipeline. Most lines can stay as they are; the ones worth knowing are below.</p>
 
   <h3>Run-wide (all samples)</h3>
   <table>
     <tr><th>Setting</th><th>Meaning</th></tr>
-    <tr><td><code>keepdata</code></td><td>Keep the local working folder after the run. Default <code>no</code> is correct — results are already in the central archive. Set <code>yes</code> only to keep a local copy too.</td></tr>
-    <tr><td><code>max_parallel</code></td><td>Number of samples counted simultaneously. <code>1</code> is serial. Default <code>3</code> suits a large server; lower it for a smaller box or when other heavy jobs are running.</td></tr>
-    <tr><td><code>scratch_root</code></td><td>Where <code>cellranger count</code> writes its working output (fixed convention on the analysis server — only change if the mount differs on your box).</td></tr>
+    <tr><td><code>keepdata</code></td><td>Keep the local working folder after the run. Default <code>no</code> is correct, since the results are already in the central archive. Set <code>yes</code> only to keep a local copy too.</td></tr>
+    <tr><td><code>max_parallel</code></td><td>Number of samples counted simultaneously. <code>1</code> is serial. Default <code>3</code> suits a large server (like ptegsrv3); lower it for a smaller box or when other heavy jobs are running.</td></tr>
+    <tr><td><code>localcores</code></td><td>Maximum CPU cores per sample (applies to all samples). Default 32.</td></tr>
+    <tr><td><code>localmem</code></td><td>Maximum memory in GB per sample (applies to all samples). Default 126.</td></tr>
+    <tr><td><code>scratch_root</code></td><td>Where <code>cellranger count</code> writes its working output (fixed convention on the analysis server; change it only if the mount differs on your box).</td></tr>
     <tr><td><code>reference_genome_used</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
     <tr><td><code>server_folder_name</code></td><td>Output folder name, prefilled with run + user + timestamp. Leave as is unless renaming is wanted.</td></tr>
-    <tr><td><code>NGSruns_archive</code></td><td>Central archive the results are copied to at the end (fixed shared target — leave as is).</td></tr>
-    <tr><td><code>path_&lt;#&gt;_&lt;avid&gt;</code></td><td>Data location per sample, prefilled. A <code>FIXME_LOCATE_</code> marker instead of a real path means it could not be resolved — set the real folder there before running.</td></tr>
+    <tr><td><code>NGSruns_archive</code></td><td>Central archive the results are copied to at the end (fixed shared target; leave as is).</td></tr>
+    <tr><td><code>path_&lt;#&gt;_&lt;avid&gt;</code></td><td>Data location per sample, prefilled. A <code>FIXME_LOCATE_</code> marker instead of a real path means it could not be resolved; set the real folder there before running.</td></tr>
   </table>
+
+  <div class="warn"><strong>Note.</strong> <code>localcores</code> and <code>localmem</code> apply to every sample, and up to <code>max_parallel</code> samples run at the same time, so the box effectively needs <code>max_parallel × (cores, memory)</code>. Example: at the defaults, 3 concurrent samples × 32 cores / 126 GB needs roughly 96 cores / 378 GB of free space. If the run is bigger than that, lower <code>max_parallel</code> or the cores/memory values.</div>
 
   <h3>Per-sample (the suffix is the sample number)</h3>
   <p>Leave blank to use the built-in default. The <code>_&lt;#&gt;</code> matches the sample to change.</p>
   <table>
     <tr><th>Setting</th><th>Meaning</th></tr>
-    <tr><td><code>localcores_&lt;#&gt;</code></td><td>Maximum CPU cores for this sample. Default 32.</td></tr>
-    <tr><td><code>localmem_&lt;#&gt;</code></td><td>Maximum memory in GB for this sample. Default 126.</td></tr>
     <tr><td><code>expect_cells_&lt;#&gt;</code></td><td>Approximate expected cell count, if known.</td></tr>
     <tr><td><code>force_cells_&lt;#&gt;</code></td><td>Exact cell count to force. See the note below before setting this or <code>expect_cells</code>.</td></tr>
     <tr><td><code>chemistry_&lt;#&gt;</code></td><td>Kit chemistry, if known. Blank lets cellranger decide.</td></tr>
@@ -89,9 +91,9 @@
     <tr><td><code>custom_options_&lt;#&gt;</code></td><td>Additional flags for this sample, written in full inside the quotes.</td></tr>
   </table>
 
-  <div class="warn"><strong>Note.</strong> <code>expect_cells</code> and <code>force_cells</code> are mutually exclusive per sample — if both are set, the script aborts before running. Leave both blank if unsure.</div>
+  <div class="warn"><strong>Note.</strong> <code>expect_cells</code> and <code>force_cells</code> are mutually exclusive per sample, if both are set the script aborts before running. Leave both blank if unsure.</div>
 
-  <h2>Step 3 — Run it</h2>
+  <h2>Step 3: Run it</h2>
   <p>From the same directory as the script:</p>
   <pre><code>./cellranger-count_AVT0571.sh</code></pre>
   <p>The <code>./</code> prefix is required to run a script from the current directory. To run it in the background and capture output to a log:</p>
