@@ -41,6 +41,7 @@ placeholder is emitted for the operator to fill in.
 import argparse
 import os
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -98,7 +99,7 @@ from common.intake import (
 # ``-v``/``--version``.  Generator version == generated-script version;
 # the .sh kept in the archive tells you which one produced it.
 # Bump on any change to the generator.
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.2.4"
 
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc"
 
@@ -235,23 +236,23 @@ DELETE_FALLBACK = (
 # per sample at the top of the generated .sh (mirrors gex._PER_SAMPLE_PARAMS,
 # restricted to cellranger-arc's knobs: no include_introns/chemistry/
 # expect_cells/force_cells/r1_length/r2_length).
-#   * localcores            : number of cores, or blank (cellranger default)
-#   * localmem              : memory in GB, or blank (cellranger default)
 #   * create_bam            : true | false — emit aligned fastq BAM
 #   * cell_annotation_model : auto | <model name>, or blank (=auto)
 #   * custom_options        : extra flags as-is, e.g. --nosecondary --localvmem=300
 # A blank value ("") drops that flag for that sample.
+# CPU/memory limits are NOT per-sample: localcores / localmem are run-wide
+# parameters (see the RUN-WIDE PARAMETERS block in build_script).
 _ARC_PER_SAMPLE_PARAMS = (
-    ("localcores",            LOCAL_CORES,
-     "max cores; blank => cellranger default"),
-    ("localmem",              LOCAL_MEM,
-     "max GB of memory; blank => cellranger default"),
     ("create_bam",            "true",
      "true = emit aligned BAM (default); false = faster + smaller output"),
     ("cell_annotation_model", "auto",
      "auto | <cellranger-arc annotation model name>; blank = auto (default)"),
     ("custom_options",        "",
      "extra flags passed through as-is; e.g. --nosecondary --localvmem=300"),
+    ("gex_exclude_introns",   "",
+     "any non-blank value adds --gex-exclude-introns for this sample (skip GEX "
+     "intronic reads); blank (default) = include introns.  Feeds the 'Include "
+     "introns?' column of the stats sheet."),
 )
 
 
@@ -594,8 +595,198 @@ def print_groups_table(groups):
 _GEX, _ATAC = "Gene Expression", "Chromatin Accessibility"
 
 
+def _probe_arc_version():
+    """Best-effort generation-time probe of ``cellranger-arc --version`` so the
+    generated .sh carries a sane fallback for the 'Cell Ranger arc version'
+    stats column.  At run time the .sh re-queries the binary and only falls
+    back to this value.  Returns "" on any failure — never required."""
+    try:
+        proc = subprocess.run(["cellranger-arc", "--version"],
+                              capture_output=True, text=True, timeout=30)
+        raw = (proc.stdout or "") + " " + (proc.stderr or "")
+        m = re.search(r"(\d+\.\d+(?:\.\d+)?)", raw)
+        return ("v" + m.group(1)) if m else ""
+    except Exception:
+        return ""
+
+
+# Embedded Python that assembles the two-sheet stats workbook (or a two-CSV
+# fallback when openpyxl is unavailable).  Emitted verbatim into the .sh
+# inside a quoted heredoc; kept free of backslash escapes so it survives
+# here-doc processing intact.
+_PY_STATS = [
+    "import sys, os",
+    "gex_tsv, atac_tsv, genome, arc_ver, flags, outxlsx = sys.argv[1:7]",
+    "gex_hdr = ['Official sample name', 'GECF library label (L_xxx)', 'GECF library exp code', 'seq. run', 'fastq code GEX (nxid, nvid)', 'R2 length', 'Cell Ranger arc version', 'genome assembly*', 'Include introns?']",
+    "atac_hdr = ['Official sample name', 'GECF library label (L_xxx)', 'GECF library exp code', 'seq. Run ATAC', 'fastq code ATAC (nxid, nvid)', 'R2 length ATAC', 'Cell Ranger arc version', 'genome assembly*', 'Include introns?']",
+    "sep = chr(9)",
+    "def _rows(path):",
+    "    if not os.path.isfile(path):",
+    "        return []",
+    "    out = []",
+    "    with open(path) as fh:",
+    "        for ln in fh:",
+    "            ln = ln.rstrip(chr(10))",
+    "            if not ln.strip():",
+    "                continue",
+    "            p = ln.split(sep)",
+    "            if len(p) < 6:",
+    "                continue",
+    "            while len(p) < 7:",
+    "                p.append('')",
+    "            i = int(p[0])",
+    "            inc = 'no' if (len(flags) >= i and flags[i - 1] == 'n') else 'yes'",
+    "            out.append([p[1], p[2], p[3], p[4], p[5], p[6], arc_ver, genome, inc])",
+    "    return out",
+    "gexrows = _rows(gex_tsv)",
+    "atarows = _rows(atac_tsv)",
+    "def _write_csv(path, hdr, rows):",
+    "    import csv",
+    "    with open(path, 'w', newline='') as fh:",
+    "        w = csv.writer(fh)",
+    "        w.writerow(hdr)",
+    "        w.writerows(rows)",
+    "try:",
+    "    import openpyxl",
+    "    wb = openpyxl.Workbook()",
+    "    ws = wb.active",
+    "    ws.title = 'GEX'",
+    "    ws.append(gex_hdr)",
+    "    for r in gexrows:",
+    "        ws.append(r)",
+    "    ws2 = wb.create_sheet('ATAC')",
+    "    ws2.append(atac_hdr)",
+    "    for r in atarows:",
+    "        ws2.append(r)",
+    "    wb.save(outxlsx)",
+    "    print('STATS: wrote ' + outxlsx + '  (GEX %d row(s), ATAC %d row(s))' % (len(gexrows), len(atarows)))",
+    "except Exception as e:",
+    "    gex_csv = os.path.splitext(outxlsx)[0] + '_GEX.csv'",
+    "    atac_csv = os.path.splitext(outxlsx)[0] + '_ATAC.csv'",
+    "    _write_csv(gex_csv, gex_hdr, gexrows)",
+    "    _write_csv(atac_csv, atac_hdr, atarows)",
+    "    print('STATS: WARNING openpyxl unavailable (%s) - wrote a CSV fallback instead of the xlsx:' % (e,))",
+    "    print('       ' + gex_csv)",
+    "    print('       ' + atac_csv)",
+]
+
+
+def build_stats_block(groups, fid_avt, avt_run, reference_genome):
+    """Emit the 'STATS' section of the generated .sh.
+
+    Produces a two-sheet ``<avt>_stats.xlsx`` (GEX + ATAC) in ``Server_folder``;
+    one row per sample per modality with columns:
+
+      official sample name | GECF library label | GECF library exp code
+      seq. run             | fastq code         | R2 length
+      cellranger-arc version*  | genome assembly* | Include introns?
+
+    (*resolved at run time on the analysis host; the first six columns are
+    baked in at generation time from the submission sheet).  The GECF library
+    exp code and R2 length are left blank — they are not present in the run
+    data (LPX codes live only in the deleted submission xlsx, and R2 length is
+    derived from the manifest mask, not the CR output).
+
+    Non-fatal: without python3 the step warns and skips; with python3 but
+    without openpyxl it writes a two-CSV fallback.  Either way the run
+    proceeds, and the workbook (or CSVs) is md5'd + rsync'd to the archive.
+    """
+    fid_avt = fid_avt or {}
+    gen_arc = _probe_arc_version()
+    gen_genome = os.path.basename((reference_genome or "").rstrip("/"))
+    n = len(groups)
+
+    # ---- static rows (known at generation time) ---------------------------------------------
+    # Row = [sample_idx, official, label, exp_code, seq_run, fastq, r2_length]
+    gex_rows, atac_rows = [], []
+    gcnt = acnt = 0
+    for idx, (_base, libs) in enumerate(groups.items(), start=1):
+        for full, fid, modality in libs:
+            if modality == _GEX:
+                gcnt += 1
+                gex_rows.append([idx, full, "GEX_L_%d" % gcnt, "",
+                                 fid_avt.get(fid, avt_run) or "", fid, ""])
+                break
+        for full, fid, modality in libs:
+            if modality == _ATAC:
+                acnt += 1
+                atac_rows.append([idx, full, "AT_L_%d" % acnt, "",
+                                  fid_avt.get(fid, avt_run) or "", fid, ""])
+                break
+
+    def _tsv(rows):
+        return "\n".join("\t".join(str(c) for c in r) for r in rows)
+
+    out_name = "%s_stats.xlsx" % avt_run
+    L = []
+    L.append("# ============================================================")
+    L.append("# STATS -- two-sheet %s  (one row per sample per modality)" % out_name)
+    L.append("#   official name | GECF library label | exp code | seq. run | fastq | R2 length")
+    L.append("#   + (run-time)  cellranger-arc version | genome assembly | Include introns?")
+    L.append("#   Baked-in columns from the submission sheet; the last three resolved at run")
+    L.append("#   time.  Written into ${Server_folder} so md5 + rsync below ship it.")
+    L.append("#   Non-fatal: no python3 -> warn + skip; no openpyxl -> two CSVs.  Run proceeds.")
+    L.append("# ============================================================")
+    L.append('STATS_OUT="${Server_folder}/%s"' % out_name)
+
+    if gex_rows:
+        L.append("cat > \"${Server_folder}/.stats_gex.tsv\" <<'STATS_GEX_EOF'")
+        L.extend(_tsv(gex_rows).split("\n"))
+        L.append("STATS_GEX_EOF")
+    else:
+        L.append(': > "${Server_folder}/.stats_gex.tsv"')
+    if atac_rows:
+        L.append("cat > \"${Server_folder}/.stats_atac.tsv\" <<'STATS_ATAC_EOF'")
+        L.extend(_tsv(atac_rows).split("\n"))
+        L.append("STATS_ATAC_EOF")
+    else:
+        L.append(': > "${Server_folder}/.stats_atac.tsv"')
+
+    # ---- runtime-resolved values -----------------------------------------------------------
+    L.append("_ARC_VERSION=\"\"")
+    L.append("if command -v cellranger-arc >/dev/null 2>&1; then")
+    L.append("  _av=\"$(cellranger-arc --version 2>/dev/null)\"")
+    L.append("  _v=\"\"")
+    L.append("  for _t in ${_av}; do")
+    L.append("    case \"${_t}\" in")
+    L.append("      *.* ) _d=\"${_t//[!0-9]/}\"; if [ -n \"${_d}\" ]; then _v=\"${_t}\"; break; fi ;;")
+    L.append("    esac")
+    L.append("  done")
+    L.append("  [ -n \"${_v}\" ] && _ARC_VERSION=\"v${_v}\"")
+    L.append("fi")
+    L.append("[ -z \"${_ARC_VERSION}\" ] && _ARC_VERSION=\"%s\"" % (gen_arc or ""))
+    L.append("_GENOME_ASSEMBLY=\"$(basename \"${REFPATH}\" 2>/dev/null)\"")
+    L.append("[ -z \"${_GENOME_ASSEMBLY}\" ] && _GENOME_ASSEMBLY=\"%s\"" % (gen_genome or ""))
+    L.append("_INTRON_FLAGS=\"\"")
+    _intr_line = '  if [ -n "${gex_exclude_introns_%d:-}" ]; then _INTRON_FLAGS="${_INTRON_FLAGS}n"; else _INTRON_FLAGS="${_INTRON_FLAGS}y"; fi'
+    for _i in range(1, n + 1):
+        L.append(_intr_line % _i)
+
+    # ---- write the workbook (xlsx preferred; CSV fallback) --------------------------------
+    L.append("if command -v python3 >/dev/null 2>&1; then")
+    L.append('  echo "STATS: building ${STATS_OUT} ..."')
+    L.append("  python3 - \"${Server_folder}/.stats_gex.tsv\" \"${Server_folder}/.stats_atac.tsv\" \"${_GENOME_ASSEMBLY}\" \"${_ARC_VERSION}\" \"${_INTRON_FLAGS}\" \"${STATS_OUT}\" <<'STATS_PY_EOF' || echo \"  [warn] STATS: could not write the stats workbook (see above); run continues.\" >&2")
+    L.extend(_PY_STATS)
+    L.append("STATS_PY_EOF")
+    L.append("else")
+    L.append("  echo '  [warn] STATS: python3 not found on this host - the stats workbook' >&2")
+    L.append("  echo '         was not generated.  Install python3 + openpyxl on the analysis server.' >&2")
+    L.append("fi")
+
+    # ---- ship whichever artifact was produced to the archive --------------------------------
+    L.append("if command -v rsync >/dev/null 2>&1; then")
+    L.append("  for _f in \"${Server_folder}/%s_stats.xlsx\" \"${Server_folder}/%s_stats_GEX.csv\" \"${Server_folder}/%s_stats_ATAC.csv\"; do" % (avt_run, avt_run, avt_run))
+    L.append("    [ -f \"${_f}\" ] && rsync -avh \"${_f}\" \"${archive_dir}/\" 2>/dev/null || true")
+    L.append("  done")
+    L.append("fi")
+    L.append('rm -f "${Server_folder}/.stats_gex.tsv" "${Server_folder}/.stats_atac.tsv"')
+    L.append("")
+    return L
+
+
 def build_script(reference_genome, groups, avt_run, user, run_dir,
-                 source_files=None, resolve=None, number_prefix=True):
+                 source_files=None, resolve=None, fid_avt=None,
+                 number_prefix=True):
     """Emit the ``cellranger-arc_AVT0XXX.sh`` text.
 
     ``resolve`` maps ``(sample_base, fastq_id)`` to a leaf directory (or
@@ -613,12 +804,17 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
       1.  Header / constants (timestamp, reference, source files, requester,
           scriptversion stamp, REFPATH, avt_run, user).
       2.  RUN-WIDE PARAMETERS (editable at the top): keepdata, max_parallel,
-          scratch_root, server_folder_name, NGSruns_archive, then all FASTQ
-          path variables (resolved at generation time), then derived vars
-          (Server_folder, metrics_folder, archive_dir), mkdir, ref check.
-      3.  PER-SAMPLE PARAMETERS (item 5 — one block per sample): localcores,
-          localmem, create_bam, cell_annotation_model, custom_options;
+          localcores, localmem, scratch_root, server_folder_name,
+          NGSruns_archive, then all FASTQ path variables (resolved at
+          generation time).
+      3.  PER-SAMPLE PARAMETERS (item 5 — one block per sample): create_bam,
+          cell_annotation_model, custom_options, gex_exclude_introns;
           blank a value to drop that flag for that sample.
+          All user-editable blocks (2 + 3) stay contiguous at the top of the
+          script; the non-editable housekeeping sits just below them.
+      3b. PIPELINE PLUMBING: reference-genome existence check (fails fast,
+          before any mkdir), then derived vars (Server_folder,
+          metrics_folder, archive_dir) and the output-folder mkdirs.
       4.  One ``arc_sample_<i>()`` function per sample: builds the libraries
           CSV, runs ``cellranger-arc count`` (flags from the ``*_<i>``
           variables in block 3), checks for leftover tmp folders, harvests
@@ -693,11 +889,16 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append('#   max_parallel : how many cellranger-arc counts to run at the same time.')
     L.append('#   1 = serial (one sample after another); N>1 = rolling pool of N jobs,')
     L.append('#         the next sample starts as soon as a slot frees up.  Default is 3,')
-    L.append('#         i.e. 3 concurrent runs.  Each sample still caps its own CPU')
-    L.append('#         (--localcores_<#>) and RAM (--localmem_<#>), so max_parallel x these')
-    L.append('#         must fit within the server\'s total resources — set max_parallel=1')
-    L.append('#         to disable concurrency.')
+    L.append('#         i.e. 3 concurrent runs.')
     L.append('max_parallel=3')
+    L.append('#   localcores : CPU cores per cellranger-arc count (applies to ALL samples);')
+    L.append('#                blank = cellranger default.')
+    L.append('#   localmem   : RAM in GB per cellranger-arc count (applies to ALL samples);')
+    L.append('#                blank = cellranger default.')
+    L.append('#   With max_parallel>1, total = max_parallel x (localcores cores, localmem GB),')
+    L.append('#   so all three must fit within the server\'s resources together.')
+    L.append(f'localcores="{LOCAL_CORES}"')
+    L.append(f'localmem="{LOCAL_MEM}"')
     L.append('#   scratch_root : root on the analysis server where cellranger-arc output is written')
     L.append('#                  (fixed convention — change only if the mount differs on your server).')
     L.append('scratch_root="' + SCRATCH_ROOT + '"')
@@ -741,33 +942,16 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
               file=sys.stderr)
     L.append("")
 
-    # Derived working-dir variables (used throughout the sample functions)
-    L.append('Server_folder="${scratch_root}/${server_folder_name}"')
-    L.append('metrics_folder="${Server_folder}/raw_metrics_folder"')
-    L.append('archive_dir="${NGSruns_archive}/${server_folder_name}"')
-    L.append('mkdir -p "${metrics_folder}/GEX_only" "${metrics_folder}/ATAC_only"')
-    L.append('mkdir -p "${archive_dir}"')
-    L.append('mkdir -p "${Server_folder}/tso_report_parts"')
-    L.append("")
-
-    # Reference genome existence check (MUST run before any side effects beyond mkdir)
-    L.append("# Check that the reference genome directory exists")
-    L.append('if [[ ! -d "${REFPATH}" ]]; then')
-    L.append('    echo "Reference genome ${REFPATH} does not exist. Aborting." >&2')
-    L.append("    exit 1")
-    L.append("fi")
-    L.append("")
-
     # ---- 3) PER-SAMPLE PARAMETERS (item 5) ------------------------------------------------------
     L.append("# ============================================================")
     L.append("# PER-SAMPLE PARAMETERS  (one block per sample — edit values in place)")
     L.append("# ----------------------------------------------------------------")
     L.append('#   * blank a value ( value="" )  -> that flag is DROPPED for that sample')
-    L.append("#   * localcores             : number of cores, or blank (cellranger default)")
-    L.append("#   * localmem               : memory in GB, or blank (cellranger default)")
     L.append("#   * create_bam             : true | false")
     L.append("#   * cell_annotation_model  : auto | <model name>, or blank (=auto)")
     L.append("#   * custom_options         : extra flags as-is, e.g. --nosecondary --localvmem=300")
+    L.append("#   * gex_exclude_introns    : any value adds --gex-exclude-introns (skip GEX introns);")
+    L.append("#                             blank (default) = include introns.  Feeds 'Include introns?'.")
     L.append("# ============================================================")
     for idx, (base, libs) in enumerate(groups.items(), start=1):
         L.append(f"# Sample {idx}: {base}")
@@ -775,6 +959,39 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             base_str = f'{suffix}_{idx}="{default}"'
             pad = max(1, 56 - len(base_str))
             L.append(f"    {base_str}{' ' * pad}# {comment}")
+    L.append("")
+
+    # ---- 3b) PIPELINE PLUMBING (derived from the parameters above) ----------------------------
+    # Emitted BELOW all editable blocks (RUN-WIDE / FASTQ / PER-SAMPLE) so the
+    # user-facing "edit here" region stays contiguous at the top of the
+    # script.  The reference-genome check fails fast BEFORE any mkdir, so a
+    # bad REFPATH leaves no stray directories behind.  A banner marks the
+    # user/code boundary unambiguously.
+    L.append("")
+    L.append("# " + "=" * 73)
+    L.append("#   ***  END OF USER-EDITABLE SECTION  ***")
+    L.append("#")
+    L.append("#   Everything ABOVE is yours to edit: RUN-WIDE PARAMETERS, FASTQ PATHS,")
+    L.append("#   PER-SAMPLE PARAMETERS.")
+    L.append("#")
+    L.append("#   Everything BELOW is pipeline machinery — pure code, DO NOT EDIT.")
+    L.append("# " + "=" * 73)
+    L.append("")
+    L.append("# PIPELINE PLUMBING  (derived from the parameters above)")
+    # Reference genome existence check (MUST run before any side effects)
+    L.append("# Check that the reference genome directory exists")
+    L.append('if [[ ! -d "${REFPATH}" ]]; then')
+    L.append('    echo "Reference genome ${REFPATH} does not exist. Aborting." >&2')
+    L.append("    exit 1")
+    L.append("fi")
+    L.append("")
+    # Derived working-dir variables (used throughout the sample functions)
+    L.append('Server_folder="${scratch_root}/${server_folder_name}"')
+    L.append('metrics_folder="${Server_folder}/raw_metrics_folder"')
+    L.append('archive_dir="${NGSruns_archive}/${server_folder_name}"')
+    L.append('mkdir -p "${metrics_folder}/GEX_only" "${metrics_folder}/ATAC_only"')
+    L.append('mkdir -p "${archive_dir}"')
+    L.append('mkdir -p "${Server_folder}/tso_report_parts"')
     L.append("")
 
     # ---- tso_percent() library-quality helper (inlined from common/TSO_percent.sh) ----
@@ -836,11 +1053,16 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             f'    --description={desc}',
             '    --reference="${REFPATH}"',
             f'    --libraries={csv_name}',
+            # CPU/memory caps are run-wide (localcores / localmem), not per-sample
+            '    ${localcores:+--localcores=$localcores}',
+            '    ${localmem:+--localmem=$localmem}',
         ]
         for suffix, _default, _comment in _ARC_PER_SAMPLE_PARAMS:
             v = f"{suffix}_{idx}"
             if suffix == "custom_options":
                 flag_lines.append(f"    ${{{v}}}")
+            elif suffix == "gex_exclude_introns":
+                flag_lines.append(f"    ${{{v}:+--gex-exclude-introns}}")
             else:
                 flag = "--" + suffix.replace("_", "-")
                 flag_lines.append(f"    ${{{v}:+{flag}=${v}}}")
@@ -850,8 +1072,9 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         # (one readable line).  A single bash array (_cmd) is built from the
         # SAME flag_lines list the execution line uses, so the log can never
         # drift from what actually runs: `echo "${_cmd[@]}"` expands
-        # ${REFPATH}, ${localcores_N:+--localcores=N}, ${localmem_N:+...} and
-        # the per-sample flag values exactly as the execution sees them.
+        # ${REFPATH}, ${localcores:+--localcores=$localcores},
+        # ${localmem:+--localmem=$localmem} and the per-sample flag values
+        # exactly as the execution sees them.
         # (The old version printf'd a Python-repr()'d string — a
         # single-quoted echo — which wrote the unexpanded ${...} template
         # into the log: parameter NAMES without VALUES.)
@@ -1131,6 +1354,13 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("fi")
     L.append("")
 
+    # ---- 6b) per-run stats workbook (GEX + ATAC) -> Server_folder ----
+    #   Two-sheet xlsx (9 cols, one row per sample per modality), built at run
+    #   time from the run data.  Written into ${Server_folder} so the
+    #   whole-folder md5 below (item 8a) covers it; its own rsync ships it to
+    #   the archive.  Non-fatal: no python3 -> warn+skip, no openpyxl -> CSVs.
+    L.extend(build_stats_block(groups, fid_avt, avt_run, reference_genome))
+
     # ---- 7) rsync raw_metrics_folder -------------------------------------------------------------
     L.append("# ============================================================")
     L.append("# POST-PROCESSING  (rsync raw_metrics_folder to the archive)")
@@ -1405,6 +1635,7 @@ def main():
 
     script = build_script(reference_genome, groups, any_avt, user, run_dir,
                           resolve=resolve, source_files=source_files,
+                          fid_avt=fid_avt,
                           number_prefix=not args.no_number_prefix)
     out_script = f"cellranger-arc_{any_avt}.sh"
     with open(out_script, "w") as f:
