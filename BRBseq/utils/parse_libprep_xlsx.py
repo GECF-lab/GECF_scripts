@@ -314,8 +314,15 @@ def main(argv: list[str] | None = None) -> int:
         fam_note = f"  [family: {kit_family}]" if kit_family else "  [no barcode family recognised]"
         print(f"parse_libprep_xlsx: kit ref   = {kit_raw}{fam_note}")
     else:
-        print("NOTE: no 'Kit ref' row was found in this workbook, so the pipeline cannot cross-check that the barcode plate being used matches the plate family that was actually used in the lab (for example V5A vs V5D). If you are telling the pipeline which plate file to use yourself, that is fine and you can keep going. If you normally rely on the pipeline picking the plate automatically from the workbook, add or check the workbook's 'Kit ref' row so it records the plate family used.",
-              file=sys.stderr)
+        if args.plate:
+            # Pipeline behaviour (v1.4.0+): --plate is mandatory and
+            # authoritative, so a missing 'Kit ref' row is NOT an error —
+            # just skip the family cross-check and a one-line record,
+            # nothing else. (No stderr, no NOTE.)
+            print("parse_libprep_xlsx: kit ref   = (row not found — no family cross-check possible; using the given --plate file as-is)")
+        else:
+            print("NOTE: no 'Kit ref' row was found in this workbook, so the pipeline cannot cross-check that the barcode plate being used matches the plate family that was actually used in the lab (for example V5A vs V5D). If you are telling the pipeline which plate file to use yourself, that is fine and you can keep going. If you normally rely on the pipeline picking the plate automatically from the workbook, add or check the workbook's 'Kit ref' row so it records the plate family used.",
+                  file=sys.stderr)
 
     # ---- determine plate file -------------------------------------------
     plate_path = args.plate

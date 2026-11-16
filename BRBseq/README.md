@@ -1,6 +1,6 @@
 # BRB-seq single-pool RNA-seq pipeline
 
-`brbseq_pipeline.sh` (v1.3.0) — end-to-end pre-processing for
+`brbseq_pipeline.sh` (v1.4.0) — end-to-end pre-processing for
 **one pool/run** of MERCURIUS 3' BRB-seq data:
 barcode prep → STARsolo alignment + gene/UMI counts → mandatory duplication
 statistics → sample-named matrices → FastReadCounter read-distribution report
@@ -16,11 +16,12 @@ single alignment.
 
 | File | Purpose |
 |---|---|
-| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.3.0) |
+| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.4.0) |
 | `build_star_index.sh` | One-time STAR genomeDir build (Mercurius guide 1.1; no Ensembl fetch) |
 | `brbseq-env.yaml` | Conda environment (`brbseq`) — STAR, samtools, fastqc, picard, fqtk, RSeQC tools, python/openpyxl |
 | `utils/prepare_barcodes.sh` | Builds `barcode_whitelist.txt` + demux maps from the manifest (TSV `Sample_ID` → `bar`) |
-| `utils/parse_libprep_xlsx.py` | Reads the Mercurius lib-prep workbook (samples, plate wells, Kit ref → `bar`) |
+| `utils/parse_libprep_xlsx.py` | Reads the Mercurius lib-prep workbook (samples, plate wells, Kit ref cross-check vs `--plate`) |
+| `utils/tsv_wells_to_manifest.py` | **v1.4.0 — maps the `--barcode-tsv` wells to the `--plate` barcodes; emits `empty_well_<WELL>` rows + the provenance TSV (well column for the report grid)** |
 | `utils/rename_matrix.py` | Renames STARsolo's `Gene/raw` barcode-matrix to `Sample_ID` columns (into `star/samples/` or `star/samples_all_wells/`) |
 | `utils/prepare_umi_matrix.py` | Flattens `star/samples/umiDedup-*.mtx` into the two matrix CSVs (`umi_matrix`, `reads_matrix`) |
 | `utils/get_duplication_statistics.py` | Per-well + pool duplication stats from NoDedup vs 1MM_Directional matrices |
@@ -78,18 +79,40 @@ and skips that step rather than aborting.
   flag: `basename` → cut at the first `_S<digit>` occurrence. E.g.
   `pool_poolA_S1_R1_001.fastq.gz` → pool `pool_poolA`. (No `--pool` flag, no
   `AVT` env override.)
+- **`--plate <file>`** — **required in both manifest modes.** The
+  well-matched barcode plate file: one line per well — `well (A01..H12)
+  <TAB> 14-nt barcode` (e.g. `barcodes_96_V5D_....txt`; a header row is
+  optional and auto-skipped).  In `--barcode-tsv` mode it supplies the
+  barcode of every well listed in the TSV; in workbook mode it is
+  **authoritative** — the workbook's `Kit ref` row is still cross-checked,
+  but a family disagreement is only a loud warning (the named `--plate` file
+  wins).
 - **Manifest** — exactly one of:
-  - `--barcode-tsv <tsv>` (TSV of `Sample_ID<TAB>barcode`; a header row is
-    auto-detected and skipped automatically when present), **or**
-  - `--libprep-xlsx <xlsx>` — Mercurius lib-prep workbook; the barcode plate
-    is joined by well, plate family inferred from the `Kit ref` row
-    (V5D / V5A10) unless `--plate <file>` is given.
+  - `--barcode-tsv <tsv>` (v1.4.0+) — a 2-column TSV:
+    `well (A01..H12) <TAB> sample_id`, one sample per line; a header row on
+    line 1 is auto-detected and skipped when present (headerless is the
+    default expectation).  Each well's barcode is looked up in `--plate`,
+    and **every plate well not listed is emitted as `empty_well_<WELL>`** —
+    the same full-plate output as workbook mode (whitelist, provenance,
+    all-wells matrix, report grid).  The **old `Sample_ID<TAB>barcode`
+    layout is no longer accepted** — such files are rejected with a
+    conversion hint (rename column 1 to the well, column 2 to the sample
+    id; barcodes come from `--plate`), **or**
+  - `--libprep-xlsx <xlsx>` — Mercurius lib-prep workbook (sample code +
+    Oligo-dT primer well); the barcode of the listed wells comes from
+    `--plate`.  If the workbook's `Kit ref` row names a different plate
+    family that is a loud warning (the `--plate` file still wins); if the
+    workbook has **no `Kit ref` row at all** it is only a quiet one-line
+    record and the run continues (`--plate` is authoritative).
+- Sample IDs are used as-is (no sanitization), must not contain `/`, and
+  must not repeat within one manifest; a well may appear at most once.
 - `--species human|mouse|<custom>`; custom species require
   `--star-genome <genomeDir>` built with `build_star_index.sh`.
 
-## Workbook mode (`--libprep-xlsx`) — always on, no flag needed
+## Full-plate handling (empty wells) — always on in both manifest modes
 
-In lib-prep workbook mode:
+Both manifest modes (workbook and well/sample TSV — v1.4.0+) produce a
+list that carries `empty_well_<WELL>` rows, so in either mode:
 
 * Every **unoccupied plate well** is kept in the barcode whitelist and named
   `empty_well_<WELL>` (reserved prefix: a real sample name may not start with
@@ -246,10 +269,10 @@ workflow. Everything below is the shipped baseline:
     manifest).  `Gene_id` is col 1 (unique per row), `gene_symbol` is col 2
     (annotation).  No folding, no value change — a 1:1 value-verbatim
     projection of the matrix rows.
-- **Empty wells are the default in lib-prep workbook mode** (no flag, no
-  per-run choice) — details in the **Workbook mode** section.  In
-  `--barcode-tsv` mode the manifest is samples-only (no plate, no empty-well
-  concept).
+- **Empty wells are the default in both manifest modes** (no flag, no
+  per-run choice — v1.4.0+) — details in the **Full-plate handling**
+  section.  Only `Sample_ID<TAB>barcode` lists from pre-v1.4.0 runs have no
+  empty-well concept (still supported for `--resume-dir`).
 - **Per-sample demux runs over samples only** — `empty_well_*` rows are
   filtered out of the demux maps before picard/fqtk run.
 - **Two-layer logging** — the run dir has:
@@ -337,23 +360,25 @@ workflow. Everything below is the shipped baseline:
 ```bash
 # no conda activate needed — the brb/brbseq env is located automatically
 
-# Barcode TSV manifest
+# Well/sample TSV manifest (v1.4.0: well<TAB>sample_id, 2 columns) + plate
 ./brbseq_pipeline.sh \
     --species mouse \
     --r1  /data/POOL/S1_R1_001.fastq.gz \
     --r2  /data/POOL/S1_R2_001.fastq.gz \
-    --barcode-tsv /data/POOL/sample_barcode.tsv \
+    --barcode-tsv /data/POOL/sample_wells.tsv \
+    --plate /data/plates/barcodes_96_V5D_brb_STAR_solo.txt \
     --run-name    Alireza \
     --out-dir /data/BRBseq_output
 
-# Or use the Mercurius lib-prep workbook (barcodes read from it;
-# plate inferred from the 'Kit ref' row unless --plate is given)
+# Or use the Mercurius lib-prep workbook (plate still required;
+# the workbook's 'Kit ref' row is cross-checked against it — a family
+# disagreement is a loud warning, the named --plate file wins)
 ./brbseq_pipeline.sh \
     --species human \
     --r1  /data/POOL/S1_R1_001.fastq.gz \
     --r2  /data/POOL/S1_R2_001.fastq.gz \
     --libprep-xlsx "Mercurius HS BRB-seq RNA lib prep GECF.xlsx" \
-    --plate /data/plates/Lib_01.tsv \
+    --plate /data/plates/barcodes_96_V5D_brb_STAR_solo.txt \
     --run-name Daniel
 
 # Dry run (no side effects) — emits the planned commands + exits 0

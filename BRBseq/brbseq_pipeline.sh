@@ -62,13 +62,14 @@
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
 DEMUX_BAM="${UTILS_DIR}/demultiplex_bam.sh"
 DUP_STATS="${UTILS_DIR}/get_duplication_statistics.py"
 PARSE_LIBPREP="${UTILS_DIR}/parse_libprep_xlsx.py"
+TSV_WELLS_MAP="${UTILS_DIR}/tsv_wells_to_manifest.py"
 RENAME_MATRIX="${UTILS_DIR}/rename_matrix.py"
 UMI_MATRIX_PREP="${UTILS_DIR}/prepare_umi_matrix.py"
 MAKE_PCA="${UTILS_DIR}/make_pca.py"
@@ -80,10 +81,10 @@ POOL=""                           # pool label — inferred from the FASTQ names
 THREADS="${THREADS:-8}"
 R1_BARCODE=""                    # R1: 14 bp CB + 14 bp UMI  (barcode read)
 R2_GENOMIC=""                    # R2: genomic/cDNA read
-BARCODE_TSV=""                   # manifest: Sample_ID<TAB>Barcode
-# Lib-prep workbook mode (alternative to --barcode-tsv):
+BARCODE_TSV=""                   # manifest source: 2-column TSV — well<TAB>sample_id (barcode derived from --plate)
+# Lib-prep workbook mode (the alternative to --barcode-tsv):
 LIBPREP_XLSX=""                  # Mercurius lib-prep .xlsx (sample code + Oligo-dT primer well)
-BARCODES_PLATE=""                # well-matched barcode plate (well + 14-nt CB per line); empty = infer from the workbook's 'Kit ref' row
+BARCODES_PLATE=""                # REQUIRED: well-matched barcode plate (well + 14nt CB per line); authoritative in both modes (workbook mode cross-checks the workbook's 'Kit ref' row against it)
 SPECIES=""                       # human | mouse | <custom name>
 STAR_INDEX=""                    # STAR --genomeDir; resolved from --species if unset
 
@@ -140,18 +141,32 @@ REQUIRED FLAGS
                         taken from the workbook 'Researcher' row (first
                         name) unless given here. Required in --barcode-tsv
                         mode (no workbook to read).
+  --plate <file>        REQUIRED in both manifest modes. Well-matched barcode
+                        plate file: one line per well —
+                        well (A01..H96) [TAB] 14-nt barcode (a header row is
+                        allowed), e.g. barcodes_96_V5D_....txt.
+                        In --barcode-tsv mode it supplies the barcode of every
+                        well in the TSV. In --libprep-xlsx mode it is
+                        authoritative: the workbook's 'Kit ref' row is still
+                        read, but a family disagreement is only a loud
+                        warning — the named plate file is used as-is.
 
   MANIFEST SOURCE — exactly one of these two:
     (a)  --barcode-tsv <tsv>
-    (b)  --libprep-xlsx <xlsx>   (+ optional --plate <file>)
-         Mercurius lib-prep workbook (sample code + Oligo-dT primer well). The
-         barcode plate is joined by well. If --plate is omitted, it is
-         inferred from the workbook's 'Kit ref' row (V5A/V5D ->
-         barcodes_96_<family>_*.txt in the plate directory
-         /home/gecf/NGS_pipelines/BRB-seq/BRB_plates, override: $BRB_PLATE_DIR);
-         if given, it is authoritative — a family disagreement with the
-         workbook's 'Kit ref' only produces a loud warning (the named file is
-         used as-is).
+         2-column TSV: well (column 1, A01..H96) + sample_id (column 2);
+         an optional header row on line 1 is auto-detected and skipped.
+         Each well's barcode is looked up in the --plate file, and every
+         plate well not listed ends up as an empty_well_<WELL> row — the
+         same full-plate output (whitelist, provenance, report grid) as
+         workbook mode.
+         (b)  --libprep-xlsx <xlsx>
+         Mercurius lib-prep workbook (sample code + Oligo-dT primer well).
+         The barcode plate from --plate is joined by well; if the workbook's
+         'Kit ref' row names a different plate family, that is a loud warning
+         (the --plate file still wins). The 'Kit ref' row also still lets the
+         parser find the matching plate file automatically
+         (V5A/V5D -> barcodes_96_<family>_*.txt in the plate directory
+         /home/gecf/NGS_pipelines/BRB-seq/BRB_plates, override: $BRB_PLATE_DIR).
 
 OPTIONAL FLAGS
   --star-genome <dir>   STAR genomeDir (built with build_star_index.sh);
@@ -196,18 +211,20 @@ OPTIONAL FLAGS
   --version             print version and exit
 
 EXAMPLES
-  # TSV manifest:
+  # TSV of wells (well<TAB>sample_id) + plate:
   ./brbseq_pipeline.sh --species mouse \
       --r1 /data/POOL/S1_R1_001.fastq.gz \
       --r2 /data/POOL/S1_R2_001.fastq.gz \
-      --barcode-tsv /data/POOL/sample_barcode.tsv \
+      --barcode-tsv /data/POOL/sample_wells.tsv \
+      --plate /data/plates/barcodes_96_V5D_brb_STAR_solo.txt \
       --run-name Daniel --threads 16 --out-dir /mnt/data/BRB-seq_output
 
-  # Lib-prep workbook instead of a TSV (plate inferred from the workbook):
+  # Lib-prep workbook instead of a TSV (plate still required):
   ./brbseq_pipeline.sh --species mouse \
       --r1 /data/POOL/S1_R1_001.fastq.gz \
       --r2 /data/POOL/S1_R2_001.fastq.gz \
-      --libprep-xlsx "Mercurius HS BRB-seq RNA lib prep GECF.xlsx"
+      --libprep-xlsx "Mercurius HS BRB-seq RNA lib prep GECF.xlsx" \
+      --plate /data/plates/barcodes_96_V5D_brb_STAR_solo.txt
 
   # Custom species: build a STAR index once, then pass it:
   ./build_star_index.sh --fasta genome.fa --gtf genes.gtf --outdir star_index --sjdbOverhang 89
@@ -257,12 +274,12 @@ done
 
 #--- validate required inputs ------------------------------------------------
 # Exactly one manifest source must be provided:
-#   --barcode-tsv  (2-col Sample_ID/Barcode TSV),  OR
-#   --libprep-xlsx  (+ optional --plate).
-# The plate is optional in workbook mode: parse_libprep_xlsx.py infers it from
-# the workbook's 'Kit ref' row (barcodes_96_<family>_*.txt next to the
-# workbook); an explicitly given plate is authoritative (a family mismatch with
-# the Kit ref is a loud warning, not an abort).
+#   --barcode-tsv  (2-col well/sample_id TSV; barcode comes from --plate),  OR
+#   --libprep-xlsx  (+ required --plate).
+# --plate is REQUIRED in both modes: in --barcode-tsv mode it supplies the
+# barcode of every well; in workbook mode it is AUTHORITATIVE — the parser
+# still reads the workbook's 'Kit ref' row, but a family mismatch with the
+# given plate is a loud warning, never an abort, and the given plate wins.
 if [[ -n "$BARCODE_TSV" && -n "$LIBPREP_XLSX" ]]; then
   die "You specified both --barcode-tsv and --libprep-xlsx, but only one of them can be used (both define the sample ↔ barcode mapping).  Remove one of the two flags and re-run. (With --resume-dir the manifest inside the run dir is used — no new manifest source is needed.)"
 fi
@@ -358,11 +375,12 @@ fi
 MISSING=()
 [[ -n "$R1_BARCODE"  ]] || MISSING+=( "--r1" )
 [[ -n "$R2_GENOMIC"  ]] || MISSING+=( "--r2" )
-# manifest source: exactly one of (a) --barcode-tsv  or  (b) --libprep-xlsx.
-if [[ -z "$LIBPREP_XLSX" && -n "$BARCODES_PLATE" && -z "$RESUME_DIR" ]]; then
-  die "--plate only makes sense together with the lib-prep workbook, but --libprep-xlsx was not given. Either add --libprep-xlsx <workbook.xlsx>, or remove --plate and let the workbook's 'Kit ref' row choose the plate automatically."
-elif [[ "$LIBPREP_MODE" -ne 1 && -z "$BARCODE_TSV" ]]; then
-  MISSING+=( "manifest source: --barcode-tsv <tsv>   or   --libprep-xlsx <xlsx>  (+ optional --plate <file>)" )
+# manifest source: exactly one of (a) --barcode-tsv  or  (b) --libprep-xlsx;
+# --plate is required in BOTH modes once a manifest source is present.
+if [[ "$LIBPREP_MODE" -ne 1 && -z "$BARCODE_TSV" && -z "$RESUME_DIR" ]]; then
+  MISSING+=( "manifest source: --barcode-tsv <tsv> (well + sample_id, 2 columns)  or  --libprep-xlsx <xlsx>" )
+elif [[ -z "$RESUME_DIR" && -z "$BARCODES_PLATE" ]]; then
+  MISSING+=( "--plate <file> (required in both modes: one line per well — well <TAB> 14-nt barcode)" )
 fi
 [[ -n "$SPECIES"     ]] || MISSING+=( "--species" )
 [[ -n "$RUN_NAME" || -n "$AVT_ID" || "$LIBPREP_MODE" -eq 1 ]]   || MISSING+=( "--run-name <name>" )
@@ -501,17 +519,15 @@ log "reference = ${SPECIES}  ->  STAR index $STAR_INDEX"
 #--- validate file/directory inputs ------------------------------------------
 [[ -f "$R1_BARCODE"  ]] || die "The R1 (barcode-channel) FASTQ file was not found: $R1_BARCODE.  Check that the path in --r1 is correct and the file is still there, then re-run."
 [[ -f "$R2_GENOMIC"  ]] || die "The R2 (genomic-channel) FASTQ file was not found: $R2_GENOMIC.  Check that the path in --r2 is correct and the file is still there, then re-run."
-# In lib-prep mode the manifest is generated later; only validate the workbook
-# here.  The plate is optional: when omitted, the
-# parser infers it from the workbook's 'Kit ref' row.
+# The manifest list is generated in place in both manifest modes (workbook
+# mode parses the xlsx; well/sample TSV mode maps wells against the plate),
+# so here we only check the user-side input files that actually exist.
 if [[ "$LIBPREP_MODE" -eq 1 && -z "$RESUME_DIR" ]]; then
   [[ -f "$LIBPREP_XLSX" ]] || die "The lib-prep workbook (--libprep-xlsx) file could not be found: $LIBPREP_XLSX. Check the path and re-run."
-  [[ -z "$BARCODES_PLATE" || -f "$BARCODES_PLATE" ]] || die "The barcode plate file (--plate) could not be found: $BARCODES_PLATE. Check the path and re-run."
-elif [[ "$LIBPREP_MODE" -eq 1 && -n "$RESUME_DIR" ]]; then
-  :   # resume mode: the manifest lives inside the run dir (validated above)
-else
-  [[ -f "$BARCODE_TSV" ]] || die "The sample manifest (--barcode-tsv) file could not be found: $BARCODE_TSV. It should be a plain-text file with exactly two tab-separated columns: sample_id  [TAB]  barcode (one sample per line). Check the path and re-run."
-fi
+  [[ -f "$BARCODES_PLATE" ]] || die "The barcode plate file (--plate) could not be found: $BARCODES_PLATE. Expected format: one line per well — well (A01..H96) [TAB] 14-nt barcode (e.g. A01<TAB>TACGTTATTCCGAA); a header row is allowed. Check the path and re-run."
+elif [[ -z "$RESUME_DIR" && -n "$BARCODE_TSV" ]]; then
+  [[ -f "$BARCODE_TSV" ]] || die "The well/sample list (--barcode-tsv) could not be found: $BARCODE_TSV. Expected format: exactly two tab-separated columns per line — well (A01..H96) [TAB] sample_id (one sample per line); an optional header row on line 1 is auto-detected. The barcode for each well comes from the --plate file. Check the path and re-run."
+fi   # --resume-dir mode: the manifest lives inside the run dir (validated above)
 [[ -d "$STAR_INDEX"  ]] || die "The STAR genome index directory could not be found: $STAR_INDEX. Check the --star-genome value (or the built-in path for your --species) and re-run. If the index was deleted or moved, you will need to rebuild it with build_star_index.sh."
 if [[ "$RUN_OPT_RSEQC" -eq 1 ]]; then
   if [[ -z "$BED_FILE" && -z "$RSEQC_GTF" ]]; then
@@ -529,8 +545,10 @@ fi
 for req in "$PREPARE_BARCODES" "$DEMUX_BAM" "$DUP_STATS" "$RENAME_MATRIX" "$UMI_MATRIX_PREP"; do
   [[ -f "$req" ]] || die "The pipeline's own supporting helper file is missing from this installation: $req — these small helper scripts should live in a 'utils' folder right next to brbseq_pipeline.sh. This means the pipeline installation itself is incomplete (for example the 'utils' folder was not copied when the pipeline was being set up on this machine). Fix: make sure the whole BRBseq folder (including its 'utils' subfolder) is intact in one place, point the pipeline at it again, and re-run. If you just copied files between machines, this is usually where a step got dropped."
 done
-if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+if [[ "$LIBPREP_MODE" -eq 1 && -z "$RESUME_DIR" ]]; then
   [[ -f "$PARSE_LIBPREP" ]] || die "The pipeline's own small helper program that reads the lib-prep Excel workbook is missing from this installation: $PARSE_LIBPREP — it should sit in a 'utils' folder right next to brbseq_pipeline.sh. This means the pipeline installation itself is incomplete (for example the 'utils' folder was not copied when the pipeline was being set up on this machine). Fix: make sure the whole BRBseq folder (including its 'utils' subfolder) is intact in one place, point the pipeline at it again, and re-run."
+elif [[ -z "$RESUME_DIR" && -n "$BARCODE_TSV" ]]; then
+  [[ -f "$TSV_WELLS_MAP" ]] || die "The pipeline's own small helper program that maps the well/sample list to the plate barcodes is missing from this installation: $TSV_WELLS_MAP — it should sit in a 'utils' folder right next to brbseq_pipeline.sh. This means the pipeline installation itself is incomplete (for example the 'utils' folder was not copied when the pipeline was being set up on this machine). Fix: make sure the whole BRBseq folder (including its 'utils' subfolder) is intact in one place, and re-run."
 fi
 
 #--- run name (resolution, pre-layout) ---------------------------------------
@@ -617,15 +635,16 @@ DUP_CSV="${RUN_DIR}/duplication_statistics.csv"
 MATRIX_DIR="${RUN_DIR}/matrices"
 UMI_MATRIX_CSV="${MATRIX_DIR}/${POOL}_umi_matrix.csv"
 READS_MATRIX_CSV="${MATRIX_DIR}/${POOL}_reads_matrix.csv"
-# In --barcode-tsv mode the manifest lives where the user put it (no generation);
-# in lib-prep mode the manifest is generated into <run>/barcodes/ and survives re-runs.
-MANIFEST="$BARCODE_TSV"
+# In both manifest modes the sample→barcode list is generated IN-PLACE into
+# <run>/barcodes/ and survives re-runs/resume (workbook mode: parsed from the
+# xlsx; well/sample TSV mode: wells mapped against the --plate file).
+MANIFEST="${BARCODES_DIR}/barcode_manifest.tsv"
 if [[ -n "${RESUME_MANIFEST:-}" ]]; then
   # --resume-dir: reuse exactly the sample→barcode list the run was started with.
   MANIFEST="$RESUME_MANIFEST"
-  # If the lib-prep provenance survived the original run, keep it: the report
-  # grid uses Sample_ID→Well to fill the plate_well column (without it every
-  # row falls back to 'NA'). No provenance file → same NA fallback as before.
+  # The provenance file (if it survived the original run) carries
+  # Sample_ID→Well: the report grid uses it to fill the plate_well column
+  # (without it every row falls back to 'NA').
   if [[ -s "${RESUME_MANIFEST}_provenance.tsv" ]]; then
     LIBPREP_PROV="${RESUME_MANIFEST}_provenance.tsv"
   else
@@ -635,19 +654,19 @@ elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   MANIFEST="${BARCODES_DIR}/manifest_from_libprep.tsv"
   LIBPREP_PROV="${MANIFEST}_provenance.tsv"
 else
-  LIBPREP_PROV=""
+  LIBPREP_PROV="${MANIFEST}_provenance.tsv"
 fi
 
 #--- manifest header decision (auto-detected, no flag) ----------------------
-# parse_libprep_xlsx.py (GECF utility parser) always emits a header row on
-# line 1, so in lib-prep mode the answer is known without inspecting the file.
-# For user-supplied --barcode-tsv (and for --resume-dir lists, where a
-# staged/reconstructed copy always carries a header but a hand-copied TSV
-# might not), auto-detect from line 1: a valid line-1
+# Generated manifests (workbook mode and well/sample TSV mode) always carry a
+# header row on line 1, so for fresh runs the answer is known without
+# inspecting the file.  For --resume-dir lists, where a staged/reconstructed
+# copy always carries a header but a hand-copied TSV might not, auto-detect
+# from line 1: a valid line-1
 # barcode cell (14-nt ACGTN, matches the Alithea BRB-seq kit constraint the
 # STAR call hardcodes via --soloCBlen 14) means "no header"; anything else
 # (a word, empty, or wrong length) means "has header".
-if [[ "$LIBPREP_MODE" -eq 1 && -z "${RESUME_MANIFEST:-}" ]]; then
+if [[ -z "${RESUME_MANIFEST:-}" ]]; then
   MANIFEST_HEADER=1
 else
   # Read line 1 as a pure string; guard with `|| true` so a missing file
@@ -743,6 +762,30 @@ if [[ "$LIBPREP_MODE" -eq 1 ]] && ! _py_has_openpyxl "$PYTHON"; then
   die "Reading the lib-prep Excel workbook needs a Python that has the 'openpyxl' package, but the Python currently in use ($PYTHON) does not. The 'brbseq' Conda environment ships it — that environment is normally auto-detected, so this usually means the brbseq environment is missing or incomplete on this machine. Fix: create it once from this script's folder —  conda env create -f ${SCRIPT_DIR}/brbseq-env.yaml  then  conda activate brbseq  and re-run; or point the pipeline at it:  BRBSEQ_ENV=<path-to-env>."
 fi
 
+#--- generate manifest from the well/sample TSV (barcode-tsv mode) ----------
+# tsv_wells_to_manifest.py maps column-1 wells to the barcodes of the --plate
+# file, emits every unoccupied well as empty_well_<WELL>, and writes the
+# provenance (Sample_ID, raw, Well, Barcode) used for the plate_well report
+# column.  Stdlib-only Python: nothing but the detected $PYTHON is needed.
+if [[ "$LIBPREP_MODE" -ne 1 && -z "${RESUME_MANIFEST:-}" && -n "$BARCODE_TSV" && ! -s "$MANIFEST" ]]; then
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$BARCODES_DIR"
+    log "--barcode-tsv mode: mapping the wells of $BARCODE_TSV to the barcodes of $BARCODES_PLATE"
+    # Capture the mapper's exit code explicitly (a bare "cmd; rc=$?" is killed
+    # by set -e before the assignment; "cmd || rc=$?" is the set-e-safe idiom).
+    map_rc=0
+    "$PYTHON" "$TSV_WELLS_MAP" --tsv "$BARCODE_TSV" --plate "$BARCODES_PLATE" --manifest "$MANIFEST" --provenance "$LIBPREP_PROV" || map_rc=$?
+    if [[ "$map_rc" -ne 0 ]]; then
+      rm -f "$MANIFEST"
+      die "Mapping the well/sample list to the plate barcodes failed (error code ${map_rc}; the specific reason is printed in the lines above this message — start there). Typical causes: a well in the TSV that does not exist on the plate file, the same well listed twice, or a TSV still in the OLD 'sample_id <TAB> barcode' layout (that format is no longer accepted — column 1 must be the well, column 2 the sample_id). Fix the TSV and/or the --plate file, then re-run."
+    fi
+    [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been generated from the well/sample TSV plus the plate ended up completely empty (file: $MANIFEST) — see the messages printed above this one for the specific problem. Delete the stale file at $MANIFEST and re-run once it is fixed."
+    log "manifest   = ${MANIFEST}  (generated from --barcode-tsv wells + --plate; unoccupied wells emitted as empty_well_<WELL> rows)"
+  else
+    log "manifest   = (would be generated from the wells of $BARCODE_TSV + $BARCODES_PLATE — skipped in dry-run)"
+  fi
+fi
+
 #--- generate manifest from lib-prep workbook (workbook mode) ----------------
 # parse_libprep_xlsx.py needs python+openpyxl (verified above); the caller
 # activates their own environment before launching.
@@ -759,16 +802,17 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   parse_rc=0
   "$PYTHON" "$PARSE_LIBPREP" "${parse_args[@]}" || parse_rc=$?
   if [[ "$parse_rc" -ne 0 ]]; then
-    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline normally finds the matching barcode plate file automatically using the 'Kit ref' row of the workbook, and expects a file like  barcodes_96_<family>_*.txt  in the plate directory /home/gecf/NGS_pipelines/BRB-seq/BRB_plates (override: \$BRB_PLATE_DIR). If that file is missing or named differently, either fix the plate directory, or pass the file explicitly with  --plate <file>. Then re-run."
+    die "The step that reads the lib-prep Excel workbook and builds the sample→barcode list failed (error code ${parse_rc}; the specific reason is printed in the lines above this message — start there). In this 'workbook' mode the pipeline builds the sample→barcode list by joining the workbook's well positions with the --plate file (authoritative: the workbook's 'Kit ref' row is only cross-checked). Typical causes: the --plate file is missing/misnamed, the workbook cannot be read, or well positions in the workbook that don't exist on that plate. Fix one of those and re-run — nothing else in the command line needs to change."
   fi
   [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
   log "manifest   = ${MANIFEST}  (generated from lib-prep workbook)"
 elif [[ "$LIBPREP_MODE" -eq 1 && "${RESUME_TSV_LIST:-0}" -ne 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 1 ]]; then
   log "manifest   = (workbook mode; would generate from lib-prep workbook — skipped in dry-run)"
 elif [[ "$LIBPREP_MODE" -eq 1 && "${RESUME_TSV_LIST:-0}" -eq 1 ]]; then
-  # --barcode-tsv run being resumed: the list has no empty-well concept by
-  # definition (the empty-well check below is for lib-prep workbook lists
-  # only), so this branch just records the reuse.
+  # --barcode-tsv run being resumed: just record the reuse. (New-format
+  # well/sample lists already carry empty_well_<WELL> rows; old sample_id+
+  # barcode lists don't — the empty-well check below is not needed for
+  # either, so this branch only logs the reuse.)
   log "manifest   = ${MANIFEST}  (list of the --barcode-tsv run that started this folder, reused)"
 elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   # manifest already on disk (resume).  Workbook mode ALWAYS emits
@@ -799,13 +843,24 @@ log "optional:  fastqc=${RUN_OPT_FASTQ}  rseqc=${RUN_OPT_RSEQC}  demux_bam=${RUN
 log "tools:     STAR=${HAVE_STAR}  fastqc=${HAVE_FASTQC}  samtools=${HAVE_SAMTOOLS}  rseqc=${HAVE_RSEQC}  picard=${HAVE_PICARD}  fqtk=${HAVE_FQTK}  java=${HAVE_JAVA}"
 log "python     = ${PYTHON}"
 if [[ -n "$LIBPREP_PROV" ]]; then
-  log "lib-prep   = ${LIBPREP_XLSX}"
+  if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+    log "lib-prep   = ${LIBPREP_XLSX}"
+  fi
   if [[ -n "$BARCODES_PLATE" ]]; then
     log "plate      = ${BARCODES_PLATE}"
   else
-    log "plate      = (not given — inferred from the workbook's 'Kit ref' row)"
+    log "plate      = (from the original run — the manifest in barcodes/ is the ground truth)"
   fi
   log "empty wells = ON (default: unoccupied plate wells are always emitted as empty_well_<WELL> rows)"
+fi
+
+# Whether the manifest this run uses carries empty_well_* rows — workbook
+# lists and the new well/sample TSV lists do, old sample_id+barcode lists
+# don't.  This single flag (instead of "was it a workbook run?") drives the
+# full-plate handling below for BOTH manifest modes.
+MANIFEST_HAS_EMPTY_WELLS=0
+if [[ -s "$MANIFEST" ]] && grep -q $'^empty_well_' "$MANIFEST" 2>/dev/null; then
+  MANIFEST_HAS_EMPTY_WELLS=1
 fi
 
 #--- execute (or dry-run) ----------------------------------------------------
@@ -953,35 +1008,11 @@ BAM_BARCODES="${BARCODES_DIR}/bam_barcodes.tsv"
 HDR_ARGS=()
 [[ "$MANIFEST_HEADER" -eq 1 ]] && HDR_ARGS+=("-H")
 
-# --barcode-tsv provenance + resume support: stage a canonical copy of the
-# sample→barcode list into the run dir.  In tsv mode the manifest lives at
-# the caller's own path; without a copy inside the run dir, a later
-# --resume-dir cannot recover the list if that file is moved or deleted.
-# Canonical form = 'sample_id<TAB>barcode' header + uppercase-normalized rows
-# (exactly what prepare_barcodes.sh emits into fastq_sample_metadata.tsv),
-# so the resume-time header detection and the whitelist cross-check agree.
-# (Resumes are excluded: their manifest already sits inside the run dir.)
-STAGED_MANIFEST="${BARCODES_DIR}/barcode_manifest.tsv"
-if [[ "${LIBPREP_MODE}" -ne 1 && -z "${RESUME_MANIFEST:-}" && -n "${MANIFEST}" && "${DRY_RUN}" -eq 0 && "${MANIFEST}" != "${STAGED_MANIFEST}" ]]; then
-  if { printf 'sample_id\tbarcode\n'
-     if [[ "${MANIFEST_HEADER}" -eq 1 ]]; then
-       awk -F'\t' 'NR>1 && NF>=2 {print $1"\t"toupper($2)}' "$MANIFEST"
-     else
-       awk -F'\t' 'NF>=2 {print $1"\t"toupper($2)}' "$MANIFEST"
-     fi
-   } > "${STAGED_MANIFEST}.tmp"; then
-    if [[ -s "${STAGED_MANIFEST}.tmp" ]]; then
-      mv "${STAGED_MANIFEST}.tmp" "${STAGED_MANIFEST}"
-      log "manifest   = ${STAGED_MANIFEST}  (staged copy of ${MANIFEST} — provenance + --resume-dir support)"
-    else
-      rm -f "${STAGED_MANIFEST}.tmp"
-      die "the staged copy of the sample→barcode list came out empty from ${MANIFEST} — its rows are malformed (expected: sample_id <TAB> barcode per line). Check the manifest and re-run."
-    fi
-  else
-    rm -f "${STAGED_MANIFEST}.tmp"
-    die "could not create the staged copy of the sample→barcode list from ${MANIFEST} (read/parse problem). Check that the file is readable and has the two tab-separated columns sample_id and barcode, then re-run."
-  fi
-fi
+# (v1.4.0: the --barcode-tsv manifest is generated in place by
+# tsv_wells_to_manifest.py into ${BARCODES_DIR}/barcode_manifest.tsv — the
+# provenance file sits alongside it — so the former "staged copy" step no
+# longer exists.  The caller's own well/sample TSV is never modified by the
+# pipeline.)
 
 run_or_skip "prepare_barcodes" "$WHITELIST" "" "mandatory" \
   bash "$PREPARE_BARCODES" \
@@ -1235,7 +1266,8 @@ fi
 #=== Sample-named count matrix  [MANDATORY] =================================
 # Rename the barcode-labelled matrix columns (barcodes.tsv in
 # ${POOL}_Solo.out/Gene/raw) to the Sample_IDs from the run manifest:
-#   workbook mode (always): two outputs from the SAME single STAR matrix
+#   when the manifest carries empty_well_* rows (workbook mode and the new
+#   well/sample TSV mode): two outputs from the SAME single STAR matrix
 #     (one STAR call — the rename is a cheap post-processing step, not a
 #     second alignment):
 #     ${STAR_DIR}/samples_all_wells/  samples + empty_well_<WELL> (debug:
@@ -1243,15 +1275,14 @@ fi
 #     ${STAR_DIR}/samples/            samples only (empty_well_* excluded);
 #                                     the final UMI/reads CSVs are built
 #                                     from THIS directory
-#   --barcode-tsv mode:
-#     ${STAR_DIR}/samples/            samples only (there is no plate and no
-#                                     empty-well concept); samples_all_wells
-#                                     is simply absent
+#   old sample_id+barcode lists (resumed runs of that format):
+#     ${STAR_DIR}/samples/            samples only (no plate / empty-well
+#                                     concept); samples_all_wells is absent
 # The raw barcode-labelled matrix in ${POOL}_Solo.out/Gene/raw is left untouched —
 # in workbook mode it is the full-plate view (up to 96 barcode columns).
 log ""
 log "sample-named count matrix (mandatory)"
-if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+if [[ "${MANIFEST_HAS_EMPTY_WELLS:-0}" -eq 1 ]]; then
   run_or_skip "rename matrix (all wells: samples + empty wells)" "${RENAME_ALL_DIR}/barcodes.tsv" "" "mandatory" \
     "$PYTHON" "$RENAME_MATRIX" \
       --raw-dir   "$RAW_DIR" \
@@ -1286,7 +1317,9 @@ log "  (barcode->sample map: ${RENAME_DIR}/sample_barcode_map.tsv; raw matrix un
 #          (<parent> = BRBseq_<name>_<timestamp>; pre-v1.2.0 runs keep
 #          <run>/files_for_report_and_CLC/)
 # The ~50 MB FRC intermediates (fastreadcounter/counts.*) are deleted after
-# the two report CSVs are built.
+# the two report CSVs are built.  Consequence for resume: a fully completed
+# run has NO fastreadcounter/ folder, so this section must read "report CSVs
+# present" as done, never "folder missing == step never ran".
 #
 # The jar path is the production location (same as the legacy pipeline);
 # update FRC_JAR here when the jar is upgraded.
@@ -1323,20 +1356,43 @@ log "FastReadCounter + report (mandatory)"
 #--- FRC call (one line, as in the legacy pipeline) -------------------------
 # FRC 1.2.0 has an explicit thread flag (-t / --threads, default = 1). Hardcode it.
 FRC_THREADS=16
-run_or_skip "FRC FastReadCounter" "$FRC_DETAILED" "java" "mandatory" \
+# Resume: run FRC only when nothing it can rebuild from is on disk — neither
+# of its intermediates, AND neither of the report CSVs it derives.  (The
+# intermediates live in fastreadcounter/, which a completed run has already
+# cleaned up; keying the skip check on them would re-run this step on every
+# resume of a finished run.)
+if [[ -s "$FRC_DETAILED" || -s "$FRC_RENAMED" || ( -s "$ALL_STATS" && -s "$REPORT_CSV" ) ]]; then
+  if [[ -s "$FRC_DETAILED" ]]; then
+    log "SKIP FRC FastReadCounter (already done: $FRC_DETAILED)"
+  else
+    log "SKIP FRC FastReadCounter (already done: report CSVs $ALL_STATS, $REPORT_CSV — the intermediates in $FRC_DIR were cleaned up after that build)"
+  fi
+else
+  have java || die "The step 'FRC FastReadCounter' needs a program called 'java' to run, but that program is not installed in the current environment. It normally ships inside the 'brbseq' Conda environment — activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it), then re-run the pipeline. Because this is a required step, the pipeline has stopped here."
+  FRC_STEP_LOG="${LOGS_DIR}/FRC_FastReadCounter.log"
+  log "RUN  FRC FastReadCounter: java -jar \"$FRC_JAR\" --bam \"$STAR_BAM\" --gtf \"$FRC_GTF\" --umi-dedup none --barcodeFile \"$WHITELIST\" --threads $FRC_THREADS -o \"$FRC_DIR\""
+  log "  step log -> ${FRC_STEP_LOG}"
+  FRC_RC=0
   java -jar "$FRC_JAR" \
     --bam    "$STAR_BAM" \
     --gtf    "$FRC_GTF" \
     --umi-dedup none \
     --barcodeFile "$WHITELIST" \
     --threads  "$FRC_THREADS" \
-    -o "$FRC_DIR"
-[[ -s "$FRC_DETAILED" ]] || die "FastReadCounter did not finish cleanly (its result file ${FRC_DETAILED} is missing or empty). See the FRC step log in ${LOGS_DIR} for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so the earlier steps are not redone)."
+    -o "$FRC_DIR" >"$FRC_STEP_LOG" 2>&1 || FRC_RC=$?
+  if [[ "$FRC_RC" -ne 0 ]]; then
+    log "  step log tail (last 30 lines of ${FRC_STEP_LOG}):"
+    tail -30 "$FRC_STEP_LOG" >&2 2>/dev/null || true
+    die "The required step 'FRC FastReadCounter' ran into an error and could not be completed, so the pipeline has stopped. Full output is in the step log: ${FRC_STEP_LOG}. Re-run the pipeline with --resume-dir pointing at this same run folder so the steps that already finished are not redone."
+  fi
+  [[ -s "$FRC_DETAILED" ]] || die "FastReadCounter did not finish cleanly (its result file ${FRC_DETAILED} is missing or empty). See the FRC step log in ${LOGS_DIR} for the specific reason, fix it, and re-run (use --resume-dir pointing at this same folder so the earlier steps are not redone)."
+fi
 
 #--- rename_count_table (ported): barcode columns → Sample_ID ---------------
 # The all-wells barcode→name table from the rename-matrix step already covers
 # all 96 plate barcodes (real samples + empty_well_<well>).  Falls back to
-# the samples-only map in --barcode-tsv mode (no plate / empty-well concept).
+# the samples-only map when the manifest carried no empty-well rows (old
+# Sample_ID<TAB>barcode lists).
 SAMPLE_MAP="${RENAME_ALL_DIR}/sample_barcode_map.tsv"
 if [[ ! -s "$SAMPLE_MAP" ]]; then
   SAMPLE_MAP="${STAR_DIR}/samples/sample_barcode_map.tsv"
@@ -1345,6 +1401,8 @@ fi
 
 if [[ -s "$FRC_RENAMED" ]]; then
   log "SKIP rename FRC count table (already done: $FRC_RENAMED)"
+elif [[ -s "$ALL_STATS" && -s "$REPORT_CSV" ]]; then
+  log "SKIP rename FRC count table (report CSVs already built: $ALL_STATS, $REPORT_CSV — the renamed file lived in the cleaned-up fastreadcounter/ folder)"
 else
   log "RUN  rename FRC count table (barcode -> Sample_ID)"
   awk -v lookup="$SAMPLE_MAP" '
@@ -1398,12 +1456,14 @@ fi
 
 #--- report_stats (ported), step 2: <pool>_report_summary.csv ----------------
 # Join each sample row with its plate well.  Well source (in order):
-#   * real samples: the lib-prep provenance TSV (Sample_ID <TAB> ... <TAB> Well)
+#   * real samples: the provenance TSV (Sample_ID <TAB> Sample_raw <TAB> Well
+#                   <TAB> Barcode) — written by both workbook mode and the
+#                   new well/sample TSV mode
 #   * empty wells  : the well is already embedded in 'empty_well_<well>'
 #   * Unknown / no well available: NA  (same fallback as the legacy pipeline)
 #
-# In --barcode-tsv mode there is no plate or lib-prep provenance, so every
-# sample gets well 'NA' — the legacy pipeline's 'well not found' fallback.
+# Only an old sample_id+barcode manifest (no provenance file) gets well 'NA'
+# for every sample — the legacy pipeline's 'well not found' fallback.
 WLOOKUP="$(mktemp)"
 if [[ -n "${LIBPREP_PROV:-}" && -s "${LIBPREP_PROV}" ]]; then
   awk '
@@ -1427,7 +1487,7 @@ else
   awk 'BEGIN{FS="\t"} {print $2 "\tNA"}' "$SAMPLE_MAP" > "$WLOOKUP"
   echo -e "Unknown\tNA" >> "$WLOOKUP"
 fi
-[[ -s "$WLOOKUP" ]] || { rm -f "$WLOOKUP"; die "The well-lookup table for the report grid could not be built. Inputs checked: lib-prep provenance (\"${LIBPREP_PROV:-<none>}\") and sample map ($SAMPLE_MAP). See earlier messages for why neither was usable. (In --barcode-tsv mode with no plate there is no provenance — the pipeline still writes 'Unknown,NA' + all samples as 'NA'.)"; }
+[[ -s "$WLOOKUP" ]] || { rm -f "$WLOOKUP"; die "The well-lookup table for the report grid could not be built. Inputs checked: provenance (\"${LIBPREP_PROV:-<none>}\") and sample map ($SAMPLE_MAP). See earlier messages for why neither was usable. (An old sample_id+barcode manifest has no provenance — in that case the pipeline writes 'Unknown,NA' + all samples as 'NA'.)"; }
 
 if [[ -s "$REPORT_CSV" ]]; then
   log "SKIP report_summary (already done: $REPORT_CSV)"
@@ -1610,8 +1670,10 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
       log "  R1 barcode = 14 BP (CB) + 14 BP (UMI)   |   R2 = 90 BP (cDNA)"
       log "  step log -> ${fqtk_log}"
       # Reads are demultiplexed off the 14-bp CB in R1 (R1 = 14B + 14M; R2 = 90T cDNA),
-      # per the Mercurius BRB-seq guide §1.8. Output: one cDNA FASTQ per sample (named
-      # *_R1.fq.gz by fqtk, despite holding the R2/cDNA bases) + unmatched + demux-metrics.
+      # per the Mercurius BRB-seq guide §1.8. Output: one cDNA FASTQ per sample
+      # + unmatched + demux-metrics. fqtk names its files <name>.R1.fq.gz because
+      # it demuxes on the barcode read; the files actually hold the R2/cDNA bases,
+      # so right after this call the pipeline renames them to <name>_R2.fq.gz (below).
       fqtk demux \
         -i "$R1_BARCODE" "$R2_GENOMIC" \
         -r "14B14M" "90T" \
@@ -1628,6 +1690,21 @@ if [[ "$RUN_OPT_DEMUX_FQ" -eq 1 ]]; then
       warn "This optional step (splitting the raw sequence files into one per sample) cannot run because 'fqtk' is not installed in the current environment. It ships inside the 'brbseq' Conda environment — activate it with 'conda activate brbseq' (create it first with 'conda env create -f brbseq-env.yaml' if you have never made it). The rest of the pipeline will continue as normal; only this per-sample split will be missing from this run's output."
     fi
   fi
+  # fqtk names every per-sample file after the read it demuxes on (.R1.fq.gz,
+  # the 28-bp barcode read), but the file holds the 90-bp cDNA read (R2).
+  # Rename <name>.R1.fq.gz -> <name>_R2.fq.gz so the name matches the content.
+  # Idempotent: a second pass finds nothing left to rename, so this also
+  # fixes up output from an older run that stored the original names.
+  n_re=0
+  for f in "$DMUX_FQ_DIR"/*.R1.fq.gz; do
+    [[ -e "$f" ]] || continue
+    if mv -- "$f" "${f%.R1.fq.gz}_R2.fq.gz"; then
+      n_re=$((n_re + 1))
+    else
+      warn "Could not rename ${f} to _R2 — the file keeps its original name (safe to rename by hand)."
+    fi
+  done
+  (( n_re > 0 )) && log "renamed ${n_re} demuxed FASTQ(s) <name>.R1.fq.gz -> <name>_R2.fq.gz (they hold the cDNA read)"
 else
   log ""; log "FASTQ demux — skipped (--skip-dmux-fq)"
 fi
@@ -1723,7 +1800,7 @@ write_run_readme() {
       echo '<li><code>'"${_b}"'/</code> — one aligned BAM per sample (split from the pool BAM; real samples only).</li>'
     fi
     if [[ -n "$_f" ]]; then
-      echo '<li><code>'"${_f}"'/</code> — one demultiplexed cDNA FASTQ per sample (real samples only). Files are named <code>Sample_ID_R1.fq.gz</code> by fqtk convention but hold the 90-bp cDNA read; the 14-bp cell barcode and 14-bp UMI are carried in each read name. Plus <code>unmatched.R1.fq.gz</code> (reads with no matching barcode) and <code>demux-metrics.txt</code> (per-assignment stats).</li>'
+      echo '<li><code>'"${_f}"'/</code> — one demultiplexed cDNA FASTQ per sample (real samples only). Files are named <code>Sample_ID_R2.fq.gz</code> — they hold the 90-bp cDNA read (fqtk writes <code>.R1.fq.gz</code>, the pipeline renames to match the content). The 14-bp cell barcode and 14-bp UMI are carried in each read name. Plus <code>unmatched_R2.fq.gz</code> (reads with no matching barcode) and <code>demux-metrics.txt</code> (per-assignment stats).</li>'
     fi
     echo "<li><code>pipeline.log</code> — supervisor log: every step's status and exact command.</li>"
     echo '<li><code>logs/</code> — one full output log per pipeline step.</li>'
