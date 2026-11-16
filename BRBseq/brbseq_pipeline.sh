@@ -62,7 +62,7 @@
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
@@ -113,6 +113,10 @@ S_FASTQ=0; S_RSEQC=0; S_DMBAM=0; S_DMFQ=0; S_PCA=0
 # Alithea BRB-seq production SAM tag set (fixed, not user-configurable).
 SAM_ATTRS="NH HI nM AS CR UR CB UB GX GN sS sQ sM"
 RESUME_DIR="${RESUME_DIR:-}"     # --resume-dir: target an existing run dir in place
+RESUME_MANIFEST=""               # --resume-dir: the manifest file to reuse inside that folder
+RESUME_TSV_LIST=0                # 1 = resume manifest came from a --barcode-tsv run (not the lib-prep workbook list)
+RESUME_RUN_DIR=""                # --resume-dir: resolved sample folder (may sit one level below the folder that was passed)
+RECON_WROTE=0                    # 1 = we wrote a reconstructed manifest into the resume dir during this invocation (safe to remove on a later mismatch)
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON="${PYTHON:-python3}"
 
@@ -168,11 +172,17 @@ OPTIONAL FLAGS
                         using the sample→barcode list already stored in that
                         folder (barcodes/) — so pass --r1 --r2 --species
                         again, not a new --libprep-xlsx/--barcode-tsv/--plate.
+                        Works for runs started with --libprep-xlsx AND with
+                        --barcode-tsv (whose list is reused, or reconstructed
+                        from the barcode step's own metadata if the original
+                        manifest file is no longer at hand).
                         (See the "Resuming an incomplete run" section of
                         README.html.)
-                        New layout: point it at the SAMPLE folder INSIDE
+                        Point it at the SAMPLE folder INSIDE
                         BRBseq_<name>_<timestamp>  (e.g.
-                        .../BRBseq_Alireza_20261022_171136/Lib_01); a
+                        .../BRBseq_Alireza_20261022_171136/Lib_01), or just
+                        at the BRBseq_<name>_<timestamp> project folder when
+                        it holds one sample; a
                         pre-v1.2.0 single-tier BRBseq_<name>_<timestamp>
                         folder also works.
   --skip-fastq          skip fastqc  (on by default)
@@ -260,23 +270,90 @@ LIBPREP_MODE=0
 if [[ -n "$LIBPREP_XLSX" ]]; then
   LIBPREP_MODE=1
 fi
-# --resume-dir: the run was already STARTED — the sample→barcode list must
-# exist inside that run dir (barcodes/manifest_from_libprep.tsv for workbook
-# mode, or the user TSV for --barcode-tsv mode).  No new manifest source is
-# generated or required for this re-run.
+# --resume-dir: the run was already STARTED — the sample→barcode list is
+# recovered from inside that run dir (see the resolver below):
+#   workbook mode:  barcodes/manifest_from_libprep.tsv  (generated there)
+#   --barcode-tsv:  barcodes/barcode_manifest.tsv       (staged since v1.3.1)
+#                   else reconstructed from
+#                   barcodes/fastq_sample_metadata.tsv  (older --barcode-tsv
+#                   runs; prepare_barcodes.sh wrote exactly that list there)
+# No new manifest source (--libprep-xlsx/--barcode-tsv/--plate) is accepted
+# or required for this re-run — the list is always the original run's.
 if [[ -n "$RESUME_DIR" ]]; then
   LIBPREP_MODE=1
   if [[ -n "$LIBPREP_XLSX" || -n "$BARCODE_TSV" || -n "$BARCODES_PLATE" ]]; then
     die "--resume-dir uses the sample→barcode list already stored inside ${RESUME_DIR} — do not also pass --libprep-xlsx / --barcode-tsv / --plate. (If you WANT to regenerate the list from a new workbook that is a fresh run: drop --resume-dir and give --run-name for a new folder.)"
   fi
   [[ -d "$RESUME_DIR" ]] || die "--resume-dir folder not found: ${RESUME_DIR} (this should be the sample folder inside a BRBseq_<name>_<timestamp> run, e.g. .../BRBseq_Alireza_20261022_171136/Lib_01, or a pre-v1.2.0 single-tier BRBseq_<name>_<timestamp> folder). Use --help for the full list of options."
+  # Reuse exactly the manifest the original run used, so a different sample
+  # list is never mixed with the outputs the original run already computed.
+  # - workbook mode:   barcodes/manifest_from_libprep.tsv (generated there)
+  # - --barcode-tsv:   barcodes/barcode_manifest.tsv (staged copy; v1.3.1+ runs)
+  #                    OR reconstructed from barcodes/fastq_sample_metadata.tsv —
+  #                    OLDER --barcode-tsv runs kept the manifest only at the
+  #                    caller's original path, but prepare_barcodes.sh wrote
+  #                    exactly that list there (header sample_id<TAB>barcode,
+  #                    one row per sample, normalized barcodes).
+  _rd="${RESUME_DIR%/}"
+  # Accept the project parent too (v1.2.0 layout: the sample folder sits one
+  # level down, e.g. .../BRBseq_Estelle_pool2_20261113_165113/pool_pool2).
+  if [[ ! -e "${_rd}/barcodes" ]]; then
+    _rd_subs=()
+    for _d in "${_rd}"/*/; do
+      [[ -d "${_d%/}/barcodes" ]] && _rd_subs+=("${_d%/}")
+    done
+    case "${#_rd_subs[@]}" in
+      1) log "note       = --resume-dir pointed at the project folder; using its only sample folder that holds barcodes/ (${_rd_subs[0]})"
+         _rd="${_rd_subs[0]}" ;;
+      2) die "--resume-dir pointed at the project folder ${RESUME_DIR}, which contains ${#_rd_subs[@]} sample folders with a barcodes/ directory: ${_rd_subs[*]}. --resume-dir must be exactly the sample folder you want to resume (the one holding barcodes/, star/, ...). Re-run with that specific folder." ;;
+      *) : ;;  # no subfolder holds barcodes/ -> the targeted die below says which file is missing
+    esac
+  fi
+  RESUME_RUN_DIR="$_rd"
+  [[ -s "${_rd}/barcodes/barcode_whitelist.txt" ]] || die "--resume-dir needs the barcode whitelist (${_rd}/barcodes/barcode_whitelist.txt) which the original run produced, but it is missing or empty — the barcode-prep step did not complete in that run. See its entry in that folder's pipeline.log, fix that step first (see --help), then re-run into the same folder."
   _rd_manifest=""
-  for _mf in "${RESUME_DIR%/}/barcodes/manifest_from_libprep.tsv" "${RESUME_DIR%/}/barcodes/barcode_manifest.tsv"; do
+  for _mf in "${_rd}/barcodes/manifest_from_libprep.tsv" "${_rd}/barcodes/barcode_manifest.tsv"; do
     if [[ -s "$_mf" ]]; then _rd_manifest="$_mf"; break; fi
   done
-  [[ -n "$_rd_manifest" ]] || die "--resume-dir needs the sample→barcode list (${RESUME_DIR}/barcodes/manifest_from_libprep.tsv) which the original run produced, but it is missing or empty there. Either that run never got as far as the barcode step, or the folder was pruned. Check the folder's pipeline.log to see how far it got, then fix that step first (see --help) and re-run into the same folder."
+  if [[ -z "$_rd_manifest" ]]; then
+    _fqmeta="${_rd}/barcodes/fastq_sample_metadata.tsv"
+    if [[ -s "$_fqmeta" ]]; then
+      _rd_manifest="${_rd}/barcodes/barcode_manifest.tsv"
+      if [[ "$DRY_RUN" -eq 0 ]]; then
+        if { printf 'sample_id\tbarcode\n'
+             awk -F'\t' 'NR>1 && NF>=2 {print $1"\t"$2}' "$_fqmeta"
+           } > "${_rd_manifest}.tmp"; then
+          [[ -s "${_rd_manifest}.tmp" ]] && mv "${_rd_manifest}.tmp" "${_rd_manifest}" || rm -f "${_rd_manifest}.tmp"
+        else
+          rm -f "${_rd_manifest}.tmp"
+        fi
+        [[ -s "$_rd_manifest" ]] || die "could not reconstruct the sample→barcode list from ${_fqmeta} (no data rows survived) — the barcode step's own metadata is incomplete. Fix the barcode step (see --help) from the original --barcode-tsv manifest, or start a fresh run with a new --run-name."
+        RECON_WROTE=1
+        log "manifest   = ${_rd_manifest}  (reconstructed from fastq_sample_metadata.tsv — older --barcode-tsv runs did not store their manifest in the run dir; check it against your original TSV if you still have it)"
+      else
+        log "manifest   = ${_rd_manifest}  (would be reconstructed from ${_fqmeta} — dry-run: not written)"
+      fi
+    fi
+  fi
+  [[ -n "$_rd_manifest" ]] || die "--resume-dir needs the sample→barcode list under ${_rd}/barcodes/ (manifest_from_libprep.tsv or barcode_manifest.tsv), or a non-empty fastq_sample_metadata.tsv to reconstruct one from — none of those is present. So that run never got as far as the barcode step, or the folder was pruned. Check the folder's pipeline.log to see how far it got, then fix that step first (see --help) and re-run into the same folder — for a run started with --barcode-tsv that means supplying your original two-column manifest again (or a fresh run with a new --run-name)."
   RESUME_MANIFEST="$_rd_manifest"
-  [[ -s "${RESUME_DIR%/}/barcodes/barcode_whitelist.txt" ]] || die "--resume-dir needs the barcode whitelist (${RESUME_DIR}/barcodes/barcode_whitelist.txt) which the original run produced, but it is missing or empty — the barcode-prep step did not complete in that run. See its entry in that folder's pipeline.log, fix that step first (see --help), then re-run into the same folder."
+  [[ "$_rd_manifest" == *manifest_from_libprep.tsv ]] && RESUME_TSV_LIST=0 || RESUME_TSV_LIST=1
+  # Safety net: the list in use must agree with the whitelist the folder
+  # already computed, or a manually swapped/stale manifest would silently
+  # re-demux the wrong barcodes. Read-only comparison, so it also applies in
+  # dry-run (which then reports instead of proceeding); in dry-run the check
+  # falls back to the barcode step's metadata, which a real run would
+  # reconstruct the list from.
+  _chk="$_rd_manifest"
+  [[ -s "$_chk" ]] || _chk="${_fqmeta:-}"
+  if [[ -n "${_chk:-}" && -s "${_chk:-}" ]]; then
+    _mb="$(awk -F'\t' 'toupper($2) ~ /^[ACGTN]+$/{print toupper($2)}' "$_chk" | sort -u)"
+    _wb="$(tr '[:lower:]' '[:upper:]' < "${_rd}/barcodes/barcode_whitelist.txt" | awk 'NF' | sort -u)"
+    if [[ "$_mb" != "$_wb" ]]; then
+      if [[ "$DRY_RUN" -eq 0 && "${RECON_WROTE:-0}" -eq 1 ]]; then rm -f "$_rd_manifest"; fi   # only drop a copy WE recreated this run; leave pre-existing staged files for inspection
+      die "the sample→barcode list in this folder (${_chk}) disagrees with barcode_whitelist.txt in the same folder (different sets of barcodes) — resuming would silently demux the wrong barcodes. If you need to run this folder with a different sample set, start a fresh run with a new --run-name; otherwise restore the list the original run used (for a --barcode-tsv run: your original two-column TSV) and re-run."
+    fi
+  fi
 fi
 MISSING=()
 [[ -n "$R1_BARCODE"  ]] || MISSING+=( "--r1" )
@@ -515,7 +592,9 @@ if [[ -n "$RESUME_DIR" ]]; then
   # Every step re-checks its own completion state (see the resume
   # logic per step below), so finished steps are skipped and the one that
   # did not finish (e.g. the failed fastq demultiplex) is re-run.
-  RUN_DIR="${RESUME_DIR%/}"
+  # RESUME_RUN_DIR is the resolved sample folder (the resolver above may have
+  # found it one level below the folder that was passed — v1.2.0 layout).
+  RUN_DIR="${RESUME_RUN_DIR:-${RESUME_DIR%/}}"
   PARENT_DIR="$(dirname "${RUN_DIR}")"
   if [[ "$(basename "${RUN_DIR}")" =~ ^BRBseq_(.+)_.{15}$ ]]; then
     OLD_LAYOUT=1   # pre-v1.2.0 folder: report grids keep the old placement (inside the leaf)
@@ -562,11 +641,13 @@ fi
 #--- manifest header decision (auto-detected, no flag) ----------------------
 # parse_libprep_xlsx.py (GECF utility parser) always emits a header row on
 # line 1, so in lib-prep mode the answer is known without inspecting the file.
-# For user-supplied --barcode-tsv, auto-detect from line 1: a valid line-1
+# For user-supplied --barcode-tsv (and for --resume-dir lists, where a
+# staged/reconstructed copy always carries a header but a hand-copied TSV
+# might not), auto-detect from line 1: a valid line-1
 # barcode cell (14-nt ACGTN, matches the Alithea BRB-seq kit constraint the
 # STAR call hardcodes via --soloCBlen 14) means "no header"; anything else
 # (a word, empty, or wrong length) means "has header".
-if [[ "$LIBPREP_MODE" -eq 1 ]]; then
+if [[ "$LIBPREP_MODE" -eq 1 && -z "${RESUME_MANIFEST:-}" ]]; then
   MANIFEST_HEADER=1
 else
   # Read line 1 as a pure string; guard with `|| true` so a missing file
@@ -610,8 +691,9 @@ _detect_tools() {
   HAVE_SAMTOOLS=0;  have samtools             && HAVE_SAMTOOLS=1
   HAVE_RSEQC=0;     have read_distribution.py && HAVE_RSEQC=1
   HAVE_PICARD=0;    have picard               && HAVE_PICARD=1
-  HAVE_FQTK=0;      have fqtk                 && HAVE_FQTK=1
-  HAVE_JAVA=0;      have java                 && HAVE_JAVA=1
+  HAVE_FQTK=0;      have fqtk               && HAVE_FQTK=1
+  HAVE_JAVA=0;      have java               && HAVE_JAVA=1
+  return 0   # the 'have X && HAVE_X=1' idiom above returns non-zero when a tool is ABSENT; a bare function return of 1 would trip 'set -e' mid-script with no message. Availability is already carried in the HAVE_* flags.
 }
 
 # Locate the brbseq conda env; first candidate with a bin/ wins:
@@ -681,8 +763,13 @@ if [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 0 ]]; then
   fi
   [[ -s "$MANIFEST" ]] || die "The sample→barcode list that should have been produced from the Excel workbook ended up completely empty (file: $MANIFEST) — meaning none of the samples in the workbook were successfully matched to a barcode. See the messages printed above this one for the specific mismatches (e.g. a well position in the workbook that does not exist on the plate file). Fix those in the workbook or the plate file, then delete this same output folder (or the stale file at $MANIFEST) and re-run so the list is generated afresh."
   log "manifest   = ${MANIFEST}  (generated from lib-prep workbook)"
-elif [[ "$LIBPREP_MODE" -eq 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 1 ]]; then
+elif [[ "$LIBPREP_MODE" -eq 1 && "${RESUME_TSV_LIST:-0}" -ne 1 && ! -s "$MANIFEST" && "$DRY_RUN" -eq 1 ]]; then
   log "manifest   = (workbook mode; would generate from lib-prep workbook — skipped in dry-run)"
+elif [[ "$LIBPREP_MODE" -eq 1 && "${RESUME_TSV_LIST:-0}" -eq 1 ]]; then
+  # --barcode-tsv run being resumed: the list has no empty-well concept by
+  # definition (the empty-well check below is for lib-prep workbook lists
+  # only), so this branch just records the reuse.
+  log "manifest   = ${MANIFEST}  (list of the --barcode-tsv run that started this folder, reused)"
 elif [[ "$LIBPREP_MODE" -eq 1 ]]; then
   # manifest already on disk (resume).  Workbook mode ALWAYS emits
   # empty_well_<WELL> rows (unconditionally since 2026-10-22), so a manifest
@@ -865,6 +952,36 @@ FQ_META="${BARCODES_DIR}/fastq_sample_metadata.tsv"
 BAM_BARCODES="${BARCODES_DIR}/bam_barcodes.tsv"
 HDR_ARGS=()
 [[ "$MANIFEST_HEADER" -eq 1 ]] && HDR_ARGS+=("-H")
+
+# --barcode-tsv provenance + resume support: stage a canonical copy of the
+# sample→barcode list into the run dir.  In tsv mode the manifest lives at
+# the caller's own path; without a copy inside the run dir, a later
+# --resume-dir cannot recover the list if that file is moved or deleted.
+# Canonical form = 'sample_id<TAB>barcode' header + uppercase-normalized rows
+# (exactly what prepare_barcodes.sh emits into fastq_sample_metadata.tsv),
+# so the resume-time header detection and the whitelist cross-check agree.
+# (Resumes are excluded: their manifest already sits inside the run dir.)
+STAGED_MANIFEST="${BARCODES_DIR}/barcode_manifest.tsv"
+if [[ "${LIBPREP_MODE}" -ne 1 && -z "${RESUME_MANIFEST:-}" && -n "${MANIFEST}" && "${DRY_RUN}" -eq 0 && "${MANIFEST}" != "${STAGED_MANIFEST}" ]]; then
+  if { printf 'sample_id\tbarcode\n'
+     if [[ "${MANIFEST_HEADER}" -eq 1 ]]; then
+       awk -F'\t' 'NR>1 && NF>=2 {print $1"\t"toupper($2)}' "$MANIFEST"
+     else
+       awk -F'\t' 'NF>=2 {print $1"\t"toupper($2)}' "$MANIFEST"
+     fi
+   } > "${STAGED_MANIFEST}.tmp"; then
+    if [[ -s "${STAGED_MANIFEST}.tmp" ]]; then
+      mv "${STAGED_MANIFEST}.tmp" "${STAGED_MANIFEST}"
+      log "manifest   = ${STAGED_MANIFEST}  (staged copy of ${MANIFEST} — provenance + --resume-dir support)"
+    else
+      rm -f "${STAGED_MANIFEST}.tmp"
+      die "the staged copy of the sample→barcode list came out empty from ${MANIFEST} — its rows are malformed (expected: sample_id <TAB> barcode per line). Check the manifest and re-run."
+    fi
+  else
+    rm -f "${STAGED_MANIFEST}.tmp"
+    die "could not create the staged copy of the sample→barcode list from ${MANIFEST} (read/parse problem). Check that the file is readable and has the two tab-separated columns sample_id and barcode, then re-run."
+  fi
+fi
 
 run_or_skip "prepare_barcodes" "$WHITELIST" "" "mandatory" \
   bash "$PREPARE_BARCODES" \
