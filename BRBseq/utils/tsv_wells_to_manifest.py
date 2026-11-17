@@ -5,7 +5,12 @@ Turns the new-style ``--barcode-tsv`` input — a 2-column TSV with
 ``well <TAB> sample_id`` (an optional header row is auto-detected and
 skipped) — into the full-plate sample→barcode manifest the rest of the
 BRB-seq pipeline consumes (the SAME contract parse_libprep_xlsx.py
-produces in workbook mode):
+produces in workbook mode).  Sample names are canonicalised to a
+column-safe id with the SAME rules as workbook mode (see
+``sanitize_sample_id`` below, which MUST stay in sync with
+``parse_libprep_xlsx.py:sanitize_sample_id``) — so both manifest sources
+give the SAME Sample_ID for the SAME name.  The original name is kept in
+the provenance file's ``sample_raw`` column.
 
     manifest:    sample_id <TAB> barcode   (header row; plus
                     empty_well_<WELL> rows for every plate well that no
@@ -34,6 +39,23 @@ import sys
 
 WELL_RE = re.compile(r"^[A-H][0-9]{1,2}$")
 BARCODE_RE = re.compile(r"^[ACGTN]{14}$")
+MAX_ID_LEN = 64
+
+
+def sanitize_sample_id(raw):
+    """Turn a free-text sample name into a safe, unique-ish column id.
+
+    Rules (MUST stay in sync with utils/parse_libprep_xlsx.py:
+    sanitize_sample_id, so TSV and workbook mode name the same sample the
+    same way): whitespace runs and common separators ('/', '\\', '-', '.')
+    become '_', anything outside [A-Za-z0-9_] is dropped, '_' runs
+    collapse, ends are stripped, length capped at 64.
+    """
+    s = re.sub(r"\s+", "_", str(raw).strip())
+    s = re.sub(r"[/\\\-\.]+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_]", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:MAX_ID_LEN].rstrip("_")
 
 
 def norm_well(well):
@@ -193,45 +215,57 @@ def main():
     bar_of = dict(plate)
     rows, header = parse_tsv_rows(args.tsv)
 
-    # --- reserved / colliding sample names --------------------------------
-    for i, well, sid in rows:
+    # --- canonicalise sample names (same rules as workbook mode) -----------
+    clean_rows = []  # (lineno, well, raw_name, cleaned_sid)
+    for i, well, raw in rows:
+        sid = sanitize_sample_id(raw)
+        if not sid:
+            die(f"well/sample list line {i}: sample_id '{raw}' leaves no letters "
+                f"or numbers after cleaning (spaces and symbols like '/', '#', "
+                f"'!' become '_' or are dropped), so it cannot become a usable "
+                f"name. Rename that sample with at least one letter or number "
+                f"(e.g. a patient or cohort identifier) and re-run.")
+        clean_rows.append((i, well, raw, sid))
+
+    # --- reserved sample names ---------------------------------------------
+    for i, well, raw, sid in clean_rows:
         if sid.lower().startswith("empty_well"):
-            die(f"well/sample list line {i}: sample_id '{sid}' starts with the "
-                f"reserved prefix 'empty_well' — unoccupied plate wells are named "
-                f"empty_well_<WELL> automatically, so real samples may not use it. "
-                f"Rename that sample and re-run.")
+            die(f"well/sample list line {i}: sample_id '{raw}' (cleaned: '{sid}') "
+                f"starts with the reserved prefix 'empty_well' — unoccupied plate "
+                f"wells are named empty_well_<WELL> automatically, so real samples "
+                f"may not use it. Rename that sample and re-run.")
         if sid == "Unknown":
-            die(f"well/sample list line {i}: sample_id 'Unknown' is reserved for "
-                f"the unassigned-reads bucket of the read-distribution report — "
-                f"a real sample may not use that exact name. Rename it and re-run.")
-        if "/" in sid:
-            die(f"well/sample list line {i}: sample_id '{sid}' contains '/' — "
-                f"sample IDs must not contain that character (it is used as a path "
-                f"separators downstream). Remove it and re-run.")
+            die(f"well/sample list line {i}: sample_id '{raw}' (cleaned: '{sid}') "
+                f"is reserved for the unassigned-reads bucket of the "
+                f"read-distribution report — a real sample may not use that exact "
+                f"name. Rename it and re-run.")
 
     # --- duplicates (well and sample), and unmappable wells -----------------
     seen_wells = {}
     unmapped = []
-    for i, well, sid in rows:
+    for i, well, raw, sid in clean_rows:
         if well not in bar_of:
             unmapped.append((i, well))
             continue
         if well in seen_wells:
-            j, other_sid = seen_wells[well]
+            j, other_raw = seen_wells[well]
             die(f"well {well} appears more than once: line {j} (sample "
-                f"'{other_sid}') and line {i} (sample '{sid}'). One sample per "
+                f"'{other_raw}') and line {i} (sample '{raw}'). One sample per "
                 f"well — merge the two rows into one or move one sample to a "
                 f"different, unused well, then re-run.")
-        seen_wells[well] = (i, sid)
+        seen_wells[well] = (i, raw)
 
     seen_ids = {}
-    for i, well, sid in rows:
-        if sid in seen_ids:
-            prev_line, prev_well = seen_ids[sid]
-            die(f"sample_id '{sid}' appears more than once: line {prev_line} "
-                f"(well {prev_well}) and line {i}. Each sample may be listed "
-                f"once per run — remove the duplicate row and re-run.")
-        seen_ids[sid] = (i, well)
+    for i, well, raw, sid in clean_rows:
+        key = sid.lower()
+        if key in seen_ids:
+            prev_line, prev_well, prev_raw = seen_ids[key]
+            die(f"two samples clean to the SAME name '{sid}': line {prev_line} "
+                f"('{prev_raw}', well {prev_well}) and line {i} ('{raw}', well "
+                f"{well}). Once cleaned (spaces → '_', other symbols dropped) the "
+                f"pipeline can no longer tell these two apart. Give the two samples "
+                f"clearly different names and re-run.")
+        seen_ids[key] = (i, well, raw)
 
     if unmapped:
         listing = "; ".join(f"line {i}: well {w}" for i, w in unmapped[:12])
@@ -242,14 +276,14 @@ def main():
             f"named A01..H96), then re-run.")
 
     # --- emit manifest + provenance ----------------------------------------
-    occupied = {w for _, w, _ in rows}
+    occupied = {w for _, w, _, _ in clean_rows}
     manifest_lines = ["sample_id\tbarcode"]
     prov_lines = ["sample_id\tsample_raw\twell\tbarcode"]
     n_empty = 0
-    for i, well, sid in rows:  # TSV order first (samples)
+    for i, well, raw, sid in clean_rows:  # TSV order first (samples)
         barcode = bar_of[well]
         manifest_lines.append(f"{sid}\t{barcode}")
-        prov_lines.append(f"{sid}\t{sid}\t{well}\t{barcode}")
+        prov_lines.append(f"{sid}\t{raw}\t{well}\t{barcode}")
     for well, barcode in plate:  # then empty wells, in plate-file order
         if well not in occupied:
             n_empty += 1
