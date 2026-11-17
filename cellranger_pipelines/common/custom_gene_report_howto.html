@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom-gene (transgene) report: How to use it</title>
+<style>
+  :root {
+    --ink: #1f2933; --muted: #5f6b7a; --accent: #0b5fa5; --soft: #eef4fa;
+    --code-bg: #f6f8fa; --border: #d9e2ec;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color: var(--ink); margin: 0; line-height: 1.6; background: #fff; }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 1.9em; margin: 0 0 6px; }
+  h2 { font-size: 1.3em; margin-top: 2.4em; padding-bottom: 6px; border-bottom: 2px solid var(--soft); }
+  h3 { font-size: 1.05em; margin-top: 1.6em; }
+  p { margin: 0.7em 0; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 1.02em; }
+  ol, ul { margin: 0.6em 0; padding-left: 1.3em; }
+  ol li, ul li { margin: 0.45em 0; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; line-height: 1.55; margin: 12px 0 18px; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 22px; font-size: 0.95em; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--soft); }
+  td code { white-space: nowrap; }
+  .warn { background: #fff7e9; border-left: 3px solid #d98a00;
+          padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 16px 0; font-size: 0.96em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Custom-gene (transgene) report: How to use it</h1>
+  <p class="subtitle">Turns a cellranger count result plus transgene names into one or more self-contained HTML files. Open them offline in any browser &#8212; each file stands on its own.&nbsp;</p>
+
+  <h2>What it does</h2>
+  <p>For each gene you name, it reports how that gene is expressed across the cells in one sample&#8217;s filtered feature matrix, and (in project mode) compares the samples. Per gene the report includes:</p>
+  <ul>
+    <li>A status row (&#8212; <code>EXPRESSED</code> / <code>SILENT</code> / <code>NO-ROW</code>) plus detected cells, % of all cells, cells at &#8805;1 and &#8805;3 UMI, total transgene UMIs, reads from called cells (needs a BAM), mean and median UMI in positive cells, and the endogenous cell/UMI context.</li>
+    <li>Plots: UMI histogram, per-sample % positive and mean-UMI dot plot, positive/negative depth, and a UMAP coloured by the gene.</li>
+    <li>A read-start coverage track along the transgene contig.</li>
+  </ul>
+  <p>The transgene row is the feature whose id equals the gene name (the appended-contig convention from the GECF custom genome). Any other feature rows carrying the same name are used as the endogenous reference.</p>
+
+  <h2>What it needs</h2>
+  <ul>
+    <li><strong>Required.</strong> A cellranger <code>count</code> <code>outs</code> folder &#8212; either one sample (Step&nbsp;1) or a project folder holding several (Step&nbsp;2) &#8212; and the gene name(s).</li>
+    <li><strong>Optional (best-effort).</strong> An aligned BAM, which adds the coverage track and the &#8220;reads (called cells)&#8221; column; and a UMAP projection CSV from the analysis folder (auto-detected), which adds the UMAP panels. If either is missing, its panel shows &#8220;n/a&#8221; and everything else is still produced.</li>
+    <li><strong>Python.</strong> Plotly is required to build the report; <code>numpy</code>/<code>scipy</code> are optional accelerators and <code>samtools</code> is only needed for the BAM. No environment setup is required: if the Python you launch the script with lacks the packages, it transparently re-runs itself under the lab&#8217;s <code>brbseq</code> conda environment (falling back to <code>basecaller</code>) with your original arguments &#8212; so plain <code>python3</code> from any shell is fine, no <code>conda activate</code>. Set <code>CGR_NO_ENV_SWITCH=1</code> to disable the auto-switch.</li>
+  </ul>
+  <pre><code>cd &lt;folder containing&gt; cellranger_pipelines/common
+python3 custom_gene_report.py &lt;options&gt;</code></pre>
+
+  <h2>Step 1 &#8212; one sample</h2>
+  <p>Give the parent of the count <code>outs</code> directory (the sample folder), the gene name(s), and where to write the report:</p>
+  <pre><code>python custom_gene_report.py \
+  --sample-dir /path/to/sample \
+  --genes tRFP \
+  -o /path/to/report</code></pre>
+  <p><code>--genes</code> takes either a single name or a space/comma-separated list, or a file with one gene per line (blank lines and <code>#</code> comments allowed). The transgene name must match the row id exactly as it appears in <code>features.tsv</code>.</p>
+
+  <h2>Step 2 &#8212; all samples in a project</h2>
+  <p>Point at the project root; every sample&#8217;s <code>outs/filtered_feature_bc_matrix</code> under it is picked up automatically, and the report adds an across-samples comparison:</p>
+  <pre><code>python custom_gene_report.py \
+  --project-dir /path/to/project \
+  --genes tRFP \
+  -o /path/to/report</code></pre>
+
+  <h2>Options</h2>
+  <table>
+    <tr><th>Option</th><th>Meaning</th></tr>
+    <tr><td><code>--sample-dir</code></td><td>One sample folder (parent of the count <code>outs/</code> directory).</td></tr>
+    <tr><td><code>--project-dir</code></td><td>Project root. All sample <code>outs</code> directories underneath are found and reported together.</td></tr>
+    <tr><td><code>--genes</code></td><td>Gene name(s): one per line in a file, or inline space/comma-separated exact ids. Required.</td></tr>
+    <tr><td><code>--min-umi</code></td><td>Per-cell transgene-UMI threshold for the &#8220;detected&#8221; count and the <code>EXPRESSED</code>/SILENT status. Default 3.</td></tr>
+    <tr><td><code>--per-file</code></td><td>Max transgenes per detail file. When you list more than this many, the report splits into an index (tables for all genes + coverage tracks) plus numbered detail files this size (each carries the tables for its batch plus the plots). Default 50; <code>0</code> = one combined file.</td></tr>
+    <tr><td><code>--bam</code></td><td>Aligned BAM for the coverage track and the &#8220;reads (called cells)&#8221; column. If left unset it is auto-detected in the sample folder (<code>possorted_genome_bam.bam</code> and a few other common names); when no BAM is used, the reads column and the coverage track are shown as n/a.</td></tr>
+    <tr><td><code>-o, --out</code></td><td>Folder to write the report into. Default is the input folder.</td></tr>
+    <tr><td><code>--version</code></td><td>Print the version and exit.</td></tr>
+  </table>
+  <p>The main file is always named <code>custom_genes_&lt;sample-or-project&gt;.html</code> in the output folder and is your starting point. With splitting on (see <code>--per-file</code>) it is the index: status tables for <em>all</em> transgenes, the coverage tracks, and links to the plot files <code>custom_genes_&lt;sample-or-project&gt;_part01.html</code>, <code>_part02.html</code>, &#8230;. Each file is fully self-contained &#8212; the plotting library is embedded in the files that contain plots &#8212; so any of them can be opened offline on its own.</p>
+
+  <h2>Many transgenes? The report splits itself</h2>
+  <p>The interactive plots scale with the number of transgenes, so one very long list in a single file can get too heavy to open. By default the report therefore splits into small files:</p>
+  <ul>
+    <li><strong>Index</strong> (the <code>custom_genes_&lt;sample-or-project&gt;.html</code> you open first): status tables for <em>all</em> transgenes, the coverage tracks, and a linked list of the plot files. It stays small no matter how many genes you list.</li>
+    <li><strong>Plot detail files</strong> (<code>_part01.html</code>, <code>_part02.html</code>, &#8230;): the interactive plots for a batch of transgenes (50 per file by default). Each also carries the status tables for its batch and a link back to the index.</li>
+  </ul>
+  <p>Use <code>--per-file</code> to change the batch size, and <code>--per-file 0</code> to put everything back into one file. For one or a handful of transgenes there is no splitting at all &#8212; you just get the single report.</p>
+
+  <h2>Reading the report</h2>
+  <table>
+    <tr><th>Status</th><th>Meaning</th></tr>
+    <tr><td><code>EXPRESSED</code></td><td>The transgene row is present and at least one cell carries &#8805; <code>--min-umi</code> UMI for it.</td></tr>
+    <tr><td><code>SILENT</code></td><td>The transgene row is present, but no cell reaches the threshold.</td></tr>
+    <tr><td><code>NO-ROW</code></td><td>The gene&#8217;s row is not in this sample&#8217;s feature table (nothing was appended/aligned for it).</td></tr>
+  </table>
+  <div class="warn"><strong>Note.</strong> A row that is present but has no cells above the threshold is <code>SILENT</code>, not <code>NO-ROW</code>. Lowering <code>--min-umi</code> (e.g. to 1) re-evaluates the threshold&#8212; if a <code>SILENT</code> gene has any single-UMI cells it will then show as expressed at &#8805;1. Read counts and the coverage track depend on the BAM, and the UMAP panels depend on a UMAP projection file; without them those panels read &#8220;n/a&#8221; rather than changing the status.</div>
+
+  <p style="margin-top:40px;color:var(--muted);font-size:0.9em">See <code>python3 common/custom_gene_report.py --help</code> for the full command-line help.</p>
+</main>
+</body>
+</html>
