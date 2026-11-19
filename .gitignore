@@ -116,3 +116,4 @@ cellranger-multi_AVT*.sh
 cellranger*_AVT*.sh
 
 .local/
+cellranger_pipelines/common/kzfp_genes.txt
