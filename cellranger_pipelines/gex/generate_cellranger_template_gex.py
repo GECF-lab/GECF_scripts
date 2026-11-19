@@ -805,7 +805,10 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         fastqs = samples_to_fastqs[sn]
         numbered_dir = dir_names[idx - 1]
         fq_list_str = ",".join(fq for fq, _ in fastqs)
-        fq_paths = ", ".join(f"${{path_{idx}_{fq}}}" for fq, _ in fastqs)
+        # NB: comma-separated WITHOUT spaces — cellranger splits --fastqs on
+        # "," only and does not trim, so "A, B" would submit " B" (nonexistent
+        # -> "invalid value ... No such file or directory").
+        fq_paths = ",".join(f"${{path_{idx}_{fq}}}" for fq, _ in fastqs)
         SFR = "${Server_folder}"
 
         flag_lines = [

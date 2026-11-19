@@ -48,6 +48,8 @@
   <p>Each sample's output folder is prefixed with its number in sample order (<code>01_Name_of_sample</code>, <code>02_…</code>, <code>03_…</code>), so the folders always appear in the order of your samples, even when the names themselves are not alphabetical (from 10 samples up the numbers continue 10, 11, …). If you prefer bare sample names without the number, add <code>--no-number-prefix</code> to the command:</p>
   <pre><code>python3 generate_cellranger_template_gex.py --no-number-prefix "AVT0571_Arianna_GECF Copy.xlsx"</code></pre>
 
+  <p><strong>Combining several Excel files:</strong> the numbering follows the sample order from your files. If all files list the samples in the same order, that order is used. If the files list them differently, the order of the <em>first</em> file (the one listed first on the command) is used, and samples that only appear in the later files are added at the end.</p>
+
   <p>It asks up to four questions, each answered by typing a number (or a path) and pressing enter. Not every run needs every question: the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
   <ol>
     <li><strong>AVT run name:</strong> only when some samples have no detected run name. Confirm the detected value, or type the correct <code>AVT0XXX</code>.</li>
