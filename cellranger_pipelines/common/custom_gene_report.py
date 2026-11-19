@@ -18,7 +18,8 @@ of custom genes and writes a self-contained HTML report with:
       - UMI histogram of positive cells (>= 1 UMI), per sample
       - % positive cells per sample (bars) + mean-UMI dot plot (project mode)
       - positive-vs-negative total-UMIs-per-cell depth boxplot, per sample
-      - UMAP coloured by the gene + binary positive/negative panel
+      - one interactive UMAP per sample: one canvas re-coloured client-side
+        as you pick a gene (dropdown; expression view, log10 UMI colour scale)
       - coverage track along the transgene contig
         (needs BAM + samtools + coordinate-bearing feature rows)
 
@@ -50,8 +51,9 @@ import argparse
 import errno
 import gzip
 import html
-import math
+import json
 import os
+import random
 import shutil
 import statistics
 import subprocess
@@ -214,13 +216,21 @@ def discover_sample(out_dir):
 
 
 def read_features(path):
-    """-> list[(idx1based, feature_id, name)]."""
+    """-> list[(idx1based, feature_id, name, feature_type_or_None)].
+
+    feature_type is None for lines without a 3rd column. Multi-modal
+    3' runs add a feature_type column ('Gene Expression', 'Antisense',
+    ...); the caller may then restrict per-cell total UMI to the
+    'Gene Expression' rows. If every line lacks the column, feature_type
+    is None everywhere and the caller behaves exactly as before.
+    """
     out = []
     for i, line in enumerate(read_lines(path), start=1):
         parts = line.split("\t")
         fid = parts[0]
         name = parts[1] if len(parts) > 1 and parts[1].strip() else fid
-        out.append((i, fid, name))
+        ftype = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        out.append((i, fid, name, ftype))
     return out
 
 
@@ -304,8 +314,10 @@ def bam_gene_depth(bam, contig):
     if st is None:
         return None
     try:
+        # -a reports zero-depth positions (gaps are not drawn as ramps) and
+        # -d 0 removes the default 8000x cap, so the true maximum depth shows.
         out = subprocess.check_output(
-            [st, "depth", "-r", contig, bam],
+            [st, "depth", "-a", "-d", "0", "-r", contig, bam],
             stderr=subprocess.DEVNULL, timeout=900, text=True)
     except Exception:
         return None
@@ -327,19 +339,20 @@ def bam_gene_reads(bam, contig, genes, called):
     (CB tag matching a matrix barcode, with or without a -N duplicate
     suffix).
 
-    One `samtools view -r <contig>` pass. Returns {gene: n}; {} when the
-    scan could not run."""
+    One `samtools view -r <contig>` pass. Returns {gene: n}; None when the
+    scan could not run at all (the caller must then show n/a, never a
+    silent 0)."""
     if not bam or not os.path.isfile(bam):
-        return {}
+        return None
     st = samtools_cmd()
     if st is None:
-        return {}
+        return None
     try:
         out = subprocess.check_output(
             [st, "view", bam, contig],   # region is a positional arg for `view`
             stderr=subprocess.DEVNULL, timeout=900, text=True)
     except Exception:
-        return {}
+        return None
     geneset = set(genes)
     reads = {g: 0 for g in genes}
     for line in out.splitlines():
@@ -376,9 +389,13 @@ def sample_bam_summary(data, genes):
     """Per-sample BAM summary: transgene contig, base coverage, and reads
     per gene from called cells.
 
-    Two lightweight passes, each opening the BAM once: `samtools depth -r`
-    for the coverage track (numbers exactly as `depth` reports them) and
-    `samtools view -r` for the primary-alignment read count.
+    Every gene that matches a contig (BAM @SQ name) is scanned on its own
+    contig: one `samtools view -r <contig>` pass each, counting primary
+    alignments tagged GN:<gene> from called cells. So ALL genes in the list
+    get their own count -- earlier versions returned after the first
+    matched gene, leaving every other gene's 'reads (called cells)' at 0.
+    The coverage track keeps the first matched contig (single plot per
+    sample, as the renderer expects).
 
     Returns a dict {gene, contig, length, depth, reads, contigs_n, no_contig}
     or None when no usable BAM/header is available for this sample.
@@ -393,22 +410,30 @@ def sample_bam_summary(data, genes):
     for bc in data.get("barcodes") or []:      # called cells
         called.add(bc)
         called.add(bc.split("-", 1)[0])        # CB tag without a -N dedup suffix
+    reads = {g: None for g in genes}  # type: dict  # filled later: int | None
+    primary = None                            # first matched gene -> coverage track
     for g in genes:
         m = match_contig([g], contigs)
         if m is None:
             continue
         gene, cname = m
-        length = contigs.get(cname) or 0
-        depth = bam_gene_depth(bam, cname)
-        reads = bam_gene_reads(bam, cname, genes, called)
-        if depth is None and not reads:
-            continue
-        return {"gene": gene, "contig": cname, "length": length,
-                "depth": depth, "reads": reads,
-                "contigs_n": len(contigs), "no_contig": False}
-    return {"gene": genes[0], "contig": None, "length": 0, "depth": None,
-            "reads": None, "contigs_n": len(contigs),
-            "no_contig": True}
+        if primary is None:
+            primary = {"gene": gene, "contig": cname,
+                       "length": contigs.get(cname) or 0,
+                       "depth": bam_gene_depth(bam, cname)}
+        gr = bam_gene_reads(bam, cname, [gene], called)
+        # A failed BAM scan returns None: keep the gene at None ("n/a" in
+        # the table) instead of a silent 0. Genes with no exactly-named
+        # contig also stay None.
+        if gr is not None:
+            reads[gene] = gr.get(gene, 0)
+    if primary is None:
+        return {"gene": genes[0], "contig": None, "length": 0, "depth": None,
+                "reads": None, "contigs_n": len(contigs),
+                "no_contig": True}
+    return {"gene": primary["gene"], "contig": primary["contig"],
+            "length": primary["length"], "depth": primary["depth"],
+            "reads": reads, "contigs_n": len(contigs), "no_contig": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -422,7 +447,15 @@ def compute_sample(sample_dir, bam, genes, threshold):
 
     tg_rows = {}    # gene -> [feature idx, ...]   (transgene rows: id == name)
     endo_rows = {}  # gene -> [feature idx, ...]   (id != name, context rows)
-    for idx, fid, name in read_features(fbm["features"]):
+    gex_rows = None  # multi-modal runs (features.tsv 3rd column): 1-based rows
+                     # that are 'Gene Expression'; None when the column is
+                     # absent, in which case per-cell total UMI counts all rows
+    for idx, fid, name, ftype in read_features(fbm["features"]):
+        if ftype is not None:
+            if gex_rows is None:
+                gex_rows = set()
+            if ftype.lower() == "gene expression":
+                gex_rows.add(idx)
         if name not in wanted:
             continue
         if fid == name:
@@ -444,7 +477,7 @@ def compute_sample(sample_dir, bam, genes, threshold):
     try:
         # fast path: scipy C parser + numpy sums (C speed even on big runs)
         _scan_matrix_numpy(fbm["matrix"], barcodes, tg_rows, endo_rows,
-                           threshold, stats, bc_total, bc_gene)
+                           threshold, stats, bc_total, bc_gene, gex_rows)
     except Exception as exc:
         # no scipy, or a matrix mmread can't handle -> stdlib line scan
         try:
@@ -454,8 +487,23 @@ def compute_sample(sample_dir, bam, genes, threshold):
                 % exc.__class__.__name__)
         except Exception:
             pass
+        # The numpy scan may have partially filled these before it failed;
+        # the stdlib scan recomputes from scratch, so reset first or every
+        # count would be double-counted.
+        bc_total.clear()
+        bc_gene.clear()
+        for g in genes:
+            s = stats[g]
+            s["n_pos"] = 0
+            s["ge1"] = 0
+            s["ge3"] = 0
+            s["det"] = 0
+            s["umi"] = 0
+            s["pos_vals"] = []
+            s["endo_cells"] = 0
+            s["endo_umi"] = 0
         _scan_matrix_python(fbm["matrix"], barcodes, tg_rows, endo_rows,
-                            threshold, stats, bc_total, bc_gene)
+                            threshold, stats, bc_total, bc_gene, gex_rows)
 
     for g in genes:
         s = stats[g]
@@ -473,7 +521,7 @@ def compute_sample(sample_dir, bam, genes, threshold):
 
 
 def _scan_matrix_numpy(matrix_path, barcodes, tg_rows, endo_rows,
-                       threshold, stats, bc_total, bc_gene):
+                       threshold, stats, bc_total, bc_gene, gex_rows=None):
     """Fast matrix scan: scipy C parser (+ numpy) instead of a Python loop.
 
     The whole sparse matrix is read once by scipy's C code, then:
@@ -487,15 +535,34 @@ def _scan_matrix_numpy(matrix_path, barcodes, tg_rows, endo_rows,
     import numpy as np
     from scipy.io import mmread
 
-    X = mmread(str(matrix_path), spmatrix=True)
+    try:
+        X = mmread(str(matrix_path), spmatrix=True)
+    except TypeError:
+        # SciPy < 1.12: mmread has no `spmatrix` keyword. Read without it
+        # and convert whatever (sparse) matrix we get to CSR ourselves.
+        X = mmread(str(matrix_path))
+        if hasattr(X, "tocsr"):
+            X = X.tocsr()
     ncells = len(barcodes)
     if X.shape[1] != ncells:
         raise ValueError("matrix has %d cells, barcodes.tsv has %d"
                          % (X.shape[1], ncells))
     csr = X if X.format == "csr" else X.tocsr()
 
-    # total UMI per cell: one C pass over every nonzero in the matrix
-    colsum = np.asarray(csr.sum(axis=0)).ravel()
+    # total UMI per cell: one C pass over every nonzero in the matrix.
+    # Multi-modal runs (gex_rows given): count only the 'Gene Expression'
+    # rows; otherwise all rows, as before.
+    if gex_rows is not None:
+        rowkeep = np.zeros(csr.shape[0], dtype=bool)
+        for r1 in gex_rows:
+            if 1 <= r1 <= csr.shape[0]:
+                rowkeep[r1 - 1] = True
+        base = csr[rowkeep]
+        if hasattr(base, "tocsr"):
+            base = base.tocsr()
+    else:
+        base = csr
+    colsum = np.asarray(base.sum(axis=0)).ravel()
     for i in np.flatnonzero(colsum).tolist():
         bc_total[barcodes[i]] = int(colsum[i])
 
@@ -537,7 +604,7 @@ def _scan_matrix_numpy(matrix_path, barcodes, tg_rows, endo_rows,
 
 
 def _scan_matrix_python(matrix_path, barcodes, tg_rows, endo_rows,
-                        threshold, stats, bc_total, bc_gene):
+                        threshold, stats, bc_total, bc_gene, gex_rows=None):
     """Line-by-line pure-stdlib scan (original algorithm).
 
     Kept as the fallback for environments without scipy/numpy, or for a
@@ -556,7 +623,10 @@ def _scan_matrix_python(matrix_path, barcodes, tg_rows, endo_rows,
     for r, c, v in iter_matrix_entries(matrix_path):
         bc = barcodes[c - 1] if 1 <= c <= ncells else None
         if bc is not None:
-            bc_total[bc] = bc_total.get(bc, 0) + v
+            # multi-modal runs: per-cell total UMI counts only 'Gene
+            # Expression' rows; gex_rows None -> all rows, as before
+            if gex_rows is None or r in gex_rows:
+                bc_total[bc] = bc_total.get(bc, 0) + v
             if r in tg_idx:
                 g = tg_idx[r]
                 bcd = bc_gene.setdefault(bc, {})
@@ -680,13 +750,14 @@ def read_umap_coords(path):
 
 import plotly.graph_objects as go
 # --------------------------------------------------------------------------- #
-# Design system (dark-first token CSS) + lightweight JS for theme toggle
+# Design system (light-theme token CSS) -- fixed day theme, no toggle
 # --------------------------------------------------------------------------- #
 CSS = """
 :root{
   --bg:#0a0f1c; --bg-2:#0c1322; --panel:#121b30; --panel-2:#0f1830; --inset:#0b1424;
   --line:#22314f; --line-2:#33476f; --text:#e8eefb; --text-2:#aab8d6; --mut:#7e8fb2;
   --acc:#6366f1; --acc-2:#8b5cf6; --teal:#2dd4bf; --green:#22c55e; --red:#fb7185;
+  --field:#0b1424;
   --amber:#f5b13d; --rose:#f472b6;
   --shadow:0 18px 42px -16px rgba(2,6,20,.75);
   --rad:16px; --rad-sm:11px;
@@ -696,6 +767,7 @@ CSS = """
 [data-theme="light"]{
   --bg:#eef2fa; --bg-2:#e7edf8; --panel:#ffffff; --panel-2:#f5f8ff; --inset:#eef3fc;
   --line:#dbe4f3; --line-2:#c3d1ea; --text:#131b30; --text-2:#3f4f74; --mut:#6c7ea8;
+  --field:#ffffff;
   --shadow:0 16px 38px -18px rgba(30,50,100,.28);
 }
 *{box-sizing:border-box}
@@ -713,22 +785,24 @@ h2,h3{margin:0}
 code,mono{font-family:var(--mono)}
 
 /* ---- hero ---- */
-.hero{position:relative;overflow:hidden;border:1px solid var(--line);
-  border-radius:20px;box-shadow:var(--shadow);
-  background:linear-gradient(135deg, rgba(99,102,241,.20), rgba(18,27,48,.15) 42%, rgba(45,212,191,.14));
-  padding:26px 28px;margin-bottom:20px}
-.hero-grid{display:flex;justify-content:space-between;gap:22px;align-items:flex-start;flex-wrap:wrap}
-.eyebrow{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);
-  font-weight:700;margin:0 0 9px;display:flex;align-items:center;gap:10px}
-.eyebrow .tag{font-size:10.5px;letter-spacing:.12em;padding:3px 8px;border-radius:6px;
-  border:1px solid var(--line-2);color:var(--text-2)}
-h1{font-size:clamp(27px,4.6vw,42px);line-height:1.04;margin:0;font-weight:800;letter-spacing:-.025em}
-h1 .sub{font-weight:500;color:var(--text-2);font-size:.58em;letter-spacing:0}
-.chips{display:flex;flex-wrap:wrap;gap:9px;margin-top:18px}
+.hero{margin:0 0 20px}
+h1{font-size:clamp(30px,5vw,46px);line-height:1.03;margin:0;font-weight:800;letter-spacing:-.025em}
+.hero-sub{margin:4px 0 0;font-size:14.5px;color:var(--mut);font-weight:500}
+.hero-meta{margin:15px 0 0;padding-top:14px;border-top:1px solid var(--line);
+  font-size:12.5px;color:var(--mut)}
+/* ---- detail-nav card (index links to plot files) — note: #detail-nav is an ID ---- */
+#detail-nav>p{margin:0;padding:13px 20px;border-bottom:1px solid var(--line);
+  font-size:12.5px;line-height:1.6;color:var(--mut)}
+.detail-list{list-style:none;margin:0;padding:6px 0 10px}
+.detail-list li{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+  padding:10px 20px;border-bottom:1px solid var(--line);font-size:13px}
+.detail-list li:last-child{border-bottom:none}
+.detail-list a{text-decoration:none;color:var(--text)}
+.detail-list a:hover{text-decoration:underline}
+.rn-sub{font-size:11.5px;color:var(--mut)}
 .chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border:1px solid var(--line);
   border-radius:999px;background:rgba(255,255,255,.03);font-size:12.5px;color:var(--text-2)}
 .chip b{color:var(--text);font-weight:700}
-.hero-summ{display:flex;gap:12px;flex-wrap:wrap}
 .bigstat{min-width:104px;border:1px solid var(--line);border-radius:var(--rad-sm);
   background:rgba(255,255,255,.03);padding:14px}
 .bigstat .n{font-size:30px;font-weight:800;letter-spacing:-.02em;line-height:1}
@@ -736,14 +810,6 @@ h1 .sub{font-weight:500;color:var(--text-2);font-size:.58em;letter-spacing:0}
 .bigstat .n .ok{color:var(--teal)}
 .bigstat .n .no{color:var(--red)}
 .bigstat .l{font-size:11.5px;color:var(--mut);margin-top:7px;letter-spacing:.01em}
-.ghost{appearance:none;border:1px solid var(--line-2);background:rgba(255,255,255,.04);
-  color:var(--text-2);border-radius:10px;padding:9px 15px;font-size:12.5px;font-weight:600;
-  cursor:pointer;font-family:var(--font);transition:.15s;letter-spacing:.01em;display:inline-flex;
-  align-items:center;gap:8px}
-.ghost:hover{background:rgba(255,255,255,.09);color:var(--text)}
-.ghost svg{width:16px;height:16px}
-[data-theme="light"] .ghost{background:#fff;color:#3f4f74}
-
 /* ---- sections + cards ---- */
 .sec-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:32px 2px 14px;flex-wrap:wrap}
 .sec-h h2{font-size:19px;font-weight:700;letter-spacing:-.01em;display:flex;align-items:center;gap:11px}
@@ -823,6 +889,19 @@ tr.tot td.pill{background:transparent}
 .legend-inline .lg{display:inline-flex;align-items:center;gap:7px}
 .legend-inline .dot{width:11px;height:11px;border-radius:3px}
 
+/* ---- interactive UMAP (gene dropdown + view) ---- */
+.umap-bar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:6px 16px 4px}
+.umap-bar label{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:600;
+  color:var(--text-2);text-transform:none}
+.umap-sel{appearance:none;-webkit-appearance:none;background:var(--field);color:var(--text);
+  border:1px solid var(--line-2);border-radius:9px;padding:7px 30px 7px 11px;font-size:12.5px;font-family:inherit;
+  cursor:pointer;background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);
+  background-position:calc(100% - 14px) 15px,calc(100% - 9px) 15px;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.umap-sel:focus{outline:2px solid color-mix(in srgb,var(--teal) 55%,transparent);border-color:var(--teal)}
+.umap-status{margin-left:auto;font-size:11.5px;color:var(--mut);font-family:var(--mono)}
+.umap-host{width:100%}
+.umap-host .js-plotly-plot{margin:2px 4px 0}
+
 /* ---- footer ---- */
 .foot{margin-top:42px;padding-top:18px;border-top:1px solid var(--line);color:var(--mut);
   font-size:12px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
@@ -830,44 +909,356 @@ tr.tot td.pill{background:transparent}
 """
 
 JS = """
-function gcrToggleTheme(){
-  var cur = document.documentElement.getAttribute('data-theme') || 'dark';
-  var next = cur === 'dark' ? 'light' : 'dark';
-  try { localStorage.setItem('gcr-theme', next); } catch (e) {}
-  document.documentElement.setAttribute('data-theme', next);
-  var font  = next === 'dark' ? '#e8eefb' : '#182338';
-  var ticks = next === 'dark' ? '#aab8d6' : '#4a5c82';
-  var grid  = next === 'dark' ? 'rgba(148,163,184,0.14)' : 'rgba(40,70,130,0.16)';
-  var line  = next === 'dark' ? '#2e4067' : '#c3d1ea';
-  if (window.Plotly) {
-    document.querySelectorAll('.js-plotly-plot').forEach(function (el) {
-      if (!el.data) return;
-      try {
-        Plotly.relayout(el, {
-          'font.color': font,
-          'xaxis.gridcolor': grid, 'yaxis.gridcolor': grid,
-          'xaxis.linecolor': line, 'yaxis.linecolor': line,
-          'xaxis.tickfont.color': ticks, 'yaxis.tickfont.color': ticks,
-          'xaxis.title.font.color': ticks, 'yaxis.title.font.color': ticks,
-          'legend.font.color': font, 'legend.title.font.color': font
-        });
-      } catch (e) {}
-    });
-  }
+/* ---- interactive UMAP: ONE canvas per sample, re-coloured client-side ---- */
+var GCR_UMAP_CFG = { displaylogo: false, scrollZoom: false, showTips: false,
+  modeBarButtonsToRemove: ['toImage', 'hoverCompareCartesian'] };
+/* box figures: also drop the "Autoscale" button. In this plotly build the
+   Autoscale action recomputes box-trace auto-range (broken: first point +/-
+   one order of magnitude), and its two-step relayout cannot be safely
+   intercepted. Double-click (redirected to the data-derived range) and the
+   "Reset axes" button cover the reset use case instead. */
+var GCR_BOXCFG = { displaylogo: false, scrollZoom: false, showTips: false,
+  modeBarButtonsToRemove: ['toImage', 'hoverCompareCartesian', 'autoScale2d'] };
+function gcrUmapText() { return '#182338'; }
+function gcrUmapAxis() { return '#4a5c82'; }
+function gcrUmapGrid() { return 'rgba(100,116,139,0.14)'; }
+function gcrUmapBaseLayout(legend) {
+  return {
+    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+    font: { color: gcrUmapText(), size: 11, family: "-apple-system,Inter,system-ui,sans-serif" },
+    margin: { l: 46, r: 20, t: 38, b: 34 }, height: 452, autosize: true,
+    showlegend: legend,
+    legend: (legend ? { orientation: 'h', yanchor: 'bottom', y: -0.32, xanchor: 'left', x: 0,
+      font: { size: 11 }, bgcolor: 'rgba(0,0,0,0)' } : {}),
+    hoverlabel: { bgcolor: '#0c1526', bordercolor: '#2e4067',
+      font: { color: '#e8eefb', size: 12, family: "-apple-system,Inter,system-ui,sans-serif" } },
+    xaxis: { gridcolor: gcrUmapGrid(), linecolor: '#2e4067', zeroline: false, showline: true,
+      ticks: 'outside', ticklen: 5, tickwidth: 1,
+      title: { text: 'UMAP-1', font: { color: gcrUmapAxis(), size: 11 } },
+      tickfont: { color: gcrUmapAxis(), size: 10 } },
+    yaxis: { gridcolor: gcrUmapGrid(), linecolor: '#2e4067', zeroline: false, showline: true,
+      ticks: 'outside', ticklen: 5, tickwidth: 1,
+      title: { text: 'UMAP-2', font: { color: gcrUmapAxis(), size: 11 } },
+      tickfont: { color: gcrUmapAxis(), size: 10 } }
+  };
 }
-(function gcrInitTheme() {
-  var m = 'dark';
-  try { m = localStorage.getItem('gcr-theme') || 'dark'; } catch (e) {}
-  document.documentElement.setAttribute('data-theme', m);
-})();
+function gcrUmapFigure(d) {
+  var gs = document.getElementById('umapgene-' + d.uid);
+  var gene = gs ? gs.value : (d.genes[0] || '');
+  var xs = d.xs, ys = d.ys, n = xs.length,
+      umi = (d.umap_umis && d.umap_umis[gene]) ? d.umap_umis[gene] : (d.umis[gene] || []);
+  var cols = new Float64Array(n), cmax = 0, j, v;
+  for (j = 0; j < n; j++) { v = Math.log10((umi[j] || 0) + 1); cols[j] = v; if (v > cmax) cmax = v; }
+  if (cmax <= 0) cmax = 1.0;
+  var exprData = [{ type: 'scatter', mode: 'markers', x: xs, y: ys, name: gene,
+    marker: { size: 5, opacity: 0.82, color: cols, colorscale: d.cscale, cmin: 0, cmax: cmax, showscale: true,
+      colorbar: { title: { text: gene + '  log10 UMI', side: 'right', font: { size: 10, color: gcrUmapAxis() } },
+        len: 0.9, thickness: 11, outlinewidth: 1, outlinecolor: '#22314f',
+        tickfont: { color: gcrUmapAxis(), size: 10 }, tickformat: '.1f' } },
+    customdata: umi,
+    hovertemplate: 'x %{x:.2f}<br>y %{y:.2f}<br><b>UMI %{customdata}</b><extra>single cell</extra>' }];
+  var exprLayout = gcrUmapBaseLayout(false);
+  exprLayout.title = { text: gene + ' \u00b7 expression on UMAP',
+    font: { color: gcrUmapText(), size: 14, family: "-apple-system,Inter,system-ui,sans-serif" } };
+  return { data: exprData, layout: exprLayout, meta: n + ' cells' };
+}
+/* ---- shared light-theme base layout for the histogram / box / bars / dots ---- */
+function gcrAxisBase() {
+  return { gridcolor: gcrUmapGrid(), linecolor: '#c3d1ea', showline: true, zeroline: false,
+    ticks: 'outside', ticklen: 5, tickwidth: 1,
+    tickfont: { color: gcrUmapAxis(), size: 10 },
+    title: { font: { color: gcrUmapAxis(), size: 11 } } };
+}
+function gcrCartBase(legend) {
+  var layout = {
+    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+    font: { color: gcrUmapText(), size: 11, family: '-apple-system,Inter,system-ui,sans-serif' },
+    margin: { l: 46, r: 20, t: 30, b: 34 }, autosize: true, showlegend: !!legend,
+    legend: { orientation: 'h', yanchor: 'bottom', y: -0.28, xanchor: 'left', x: 0,
+      font: { size: 11 }, bgcolor: 'rgba(0,0,0,0)' } };
+  /* xaxis and yaxis MUST be separate objects. A shared reference makes a
+     "layout.yaxis.type = ..." leak into xaxis and makes each axis-title
+     overwrite the other (all axes ended up with the last-set title and
+     the box plot got a log-scale x axis of 1e-30..1e30). */
+  layout.xaxis = gcrAxisBase(); layout.yaxis = gcrAxisBase();
+  return layout;
+}
+function gcrTitle(text) {
+  return { text: text, font: { color: gcrUmapText(), size: 14, family: '-apple-system,Inter,system-ui,sans-serif' } };
+}
+function gcrSetFig(host, fig) {
+  if (!host) return;
+  if (fig.none) {
+    host.innerHTML = '<div class="empty">' + (fig.msg || 'not available') + '</div>';
+    return;
+  }
+  /* remember the data-derived range so the "Autoscale" modebar button can
+     never fall back to plotly's auto-range (box traces compute a broken
+     auto-range in this plotly build: first data point +/- one order of
+     magnitude, which is what made the axes jump and stretch on reset) */
+  var rl = null;
+  if (fig.layout) {
+    if ((fig.layout.yaxis && fig.layout.yaxis.range) || (fig.layout.xaxis && fig.layout.xaxis.range)) {
+      rl = {};
+      if (fig.layout.yaxis && fig.layout.yaxis.range) {
+        rl['yaxis.range'] = fig.layout.yaxis.range.slice(); rl['yaxis.autorange'] = false;
+      }
+      if (fig.layout.xaxis && fig.layout.xaxis.range) {
+        rl['xaxis.range'] = fig.layout.xaxis.range.slice(); rl['xaxis.autorange'] = false;
+      }
+    }
+  }
+  host._gcrRestore = rl;
+  if (rl && !host._gcrBound) {
+    host._gcrBound = true;
+    try {
+      /* this plotly build has no plotly_autoscale event: the Autoscale
+         button (and dblclick) arrive as a relayout with autorange:true,
+         which for box traces recomputes the broken auto-range (first
+         point +/- one order of magnitude).  Redirect any such request
+         back to the data-derived range, so every reset lands on the
+         same correct range instead of stretching. */
+      host.on('plotly_relayout', function (data) {
+        if (!host._gcrRestore || !data) return;
+        var wantAutorange = (data['yaxis'] && data['yaxis'].autorange === true) ||
+                            (data['xaxis'] && data['xaxis'].autorange === true);
+        if (wantAutorange) window.Plotly.relayout(host, host._gcrRestore);
+      });
+    } catch (e2) {}
+  }
+  try { window.Plotly.react(host, fig.data, fig.layout, fig.cfg || GCR_UMAP_CFG); } catch (e) {}
+}
+/* UMI histogram of expressing cells, mirroring the old static figure:
+   log10(UMI+1) binned to 28 bars, bar labels = the UMI at each bin centre. */
+function gcrHistFig(d, gene) {
+  if (d.norow && d.norow[gene]) {
+    return { none: true, msg: 'this gene is not present in this sample\u2019s reference (NO-ROW), so there are no cells to show', meta: '' };
+  }
+  var umi = d.umis[gene] || [], t = [], tmin = Infinity, tmax = -Infinity, i, j;
+  for (i = 0; i < umi.length; i++) {
+    var v = umi[i] | 0;
+    if (v >= 1) {
+      var tv = Math.log10(v + 1);
+      t.push(tv);
+      if (tv < tmin) tmin = tv;
+      if (tv > tmax) tmax = tv;
+    }
+  }
+  var layout = gcrCartBase(false);
+  layout.title = gcrTitle(gene + ' \u00b7 UMI distribution of expressing cells');
+  layout.xaxis.title.text = 'UMI per cell';
+  layout.yaxis.title.text = 'cells';
+  layout.bargap = 0.05;
+  if (!t.length) return { none: true, msg: 'no expressing cells for ' + gene, meta: '0 expressing cells' };
+  if (tmax - tmin < 1e-9) tmax = tmin + 1e-9;
+  var nb = 28, span = tmax - tmin, counts = [];
+  for (j = 0; j < nb; j++) counts.push(0);
+  for (j = 0; j < t.length; j++) {
+    counts[Math.min(nb - 1, Math.max(0, Math.floor((t[j] - tmin) / span * nb)))] += 1;
+  }
+  var labels = [];
+  for (j = 0; j < nb; j++) {
+    labels.push(String(Math.max(0, Math.round(10 ** (tmin + (j + 0.5) / nb * span) - 1))));
+  }
+  layout.xaxis.type = 'category';
+  layout.xaxis.tickvals = labels.filter(function (_v, i2) { return i2 % Math.max(1, nb / 6 | 0) === 0; });
+  var cmax = 0;
+  for (j = 0; j < counts.length; j++) if (counts[j] > cmax) cmax = counts[j];
+  /* explicit range so a gene switch never inherits the previous gene's
+     auto-range (plotly caches it across Plotly.react) */
+  if (cmax > 0) { layout.yaxis.range = [0, cmax * 1.12]; layout.yaxis.autorange = false; }
+  return { data: [{ type: 'bar', x: labels, y: counts,
+    marker: { color: '#38bdf8', line: { width: 0 } },
+    hovertemplate: '\u2248 %{x} UMI<br>%{y} cells<extra>expressing</extra>' }],
+    layout: layout, meta: t.length + ' expressing cells' };
+}
+/* total UMI per cell, box split by the selected gene's detection status */
+function gcrBoxFig(d, gene) {
+  if (d.norow && d.norow[gene]) {
+    return { none: true, msg: 'this gene is not present in this sample\u2019s reference (NO-ROW), so there are no cells to show', meta: '' };
+  }
+  var umi = d.umis[gene] || [], th = d.threshold, tot = d.totals || [];
+  var pos = [], neg = [], npos0 = 0, nneg0 = 0, i, tv, vmin = Infinity, vmax = -Infinity;
+  for (i = 0; i < tot.length; i++) {
+    tv = tot[i];
+    if ((umi[i] | 0) >= th) {
+      if (tv > 0) { pos.push(tv); if (tv < vmin) vmin = tv; if (tv > vmax) vmax = tv; } else { npos0++; }
+    } else {
+      if (tv > 0) { neg.push(tv); if (tv < vmin) vmin = tv; if (tv > vmax) vmax = tv; } else { nneg0++; }
+    }
+  }
+  var negName = 'not detected', posName = gene + '  detected';
+  var layout = gcrCartBase(true);
+  layout.title = gcrTitle('Total UMI per cell  \u00b7  detected vs not detected');
+  layout.xaxis.type = 'category';
+  layout.xaxis.categoryorder = 'array';
+  layout.xaxis.categoryarray = [negName, posName];
+  layout.xaxis.title.text = 'sample group';
+  layout.yaxis.type = 'log';
+  layout.yaxis.title.text = 'total UMI per cell (log)';
+  /* Set an explicit range on every render. Plotly keeps the previous
+     auto-range across Plotly.react, so after switching genes the axis kept
+     the old gene's range and a double-click "reset" jumped to yet another
+     range (the "reset only gets longer" bug). With an explicit range and
+     autorange left true, zoom + double-click/modebar-reset returns to
+     exactly this range. */
+  if (vmin !== Infinity) {
+    var lmin = Math.log10(vmin), lmax = Math.log10(vmax), pad = Math.max(0.12, (lmax - lmin) * 0.06);
+    layout.yaxis.range = [lmin - pad, lmax + pad];
+    layout.yaxis.autorange = false;
+  }
+  /* This plotly build breaks a box trace's statistics when x is shorter than
+     y (a single category string makes plotly pair x[0] against y and the box
+     collapses to a flat line). Repeat the category once per y value instead. */
+  function fillX(nm, ary) { var x = new Array(ary.length), k; for (k = 0; k < ary.length; k++) x[k] = nm; return x; }
+  var data = [];
+  if (neg.length) data.push({ type: 'box', x: fillX(negName, neg), y: neg, name: negName,
+    marker: { color: '#3a4a66', size: 3, opacity: 0.5 }, line: { width: 1.1 },
+    fillcolor: 'rgba(58,74,102,0.18)' });
+  if (pos.length) data.push({ type: 'box', x: fillX(posName, pos), y: pos, name: posName,
+    marker: { color: '#2dd4bf', size: 3, opacity: 0.6 }, line: { width: 1.2 },
+    fillcolor: 'rgba(45,212,191,0.16)' });
+  /* Invisible 2-point anchor spanning the true data min/max. In this plotly
+     build a box trace's auto-range is computed from its first point only
+     (+/- one order of magnitude), so every dblclick / "Autoscale" reset
+     landed on a nonsense axis (the "reset only gets longer" bug). A proper
+     scatter anchor forces every auto-range pass to span the real data. */
+  if (vmin !== Infinity) data.push({ type: 'scatter', mode: 'markers',
+    x: [negName, negName], y: [vmin, vmax], marker: { size: 1, opacity: 0 },
+    line: { width: 0 }, hoverinfo: 'skip', showlegend: false });
+  /* keep a labelled slot for an empty group instead of silently dropping it,
+     so a 100%-detected (or 100%-undetected) gene still explains where its
+     "not detected" (or "detected") box went */
+  var ann = [];
+  if (!neg.length) ann.push({ x: negName, xref: 'x', yref: 'paper', y: 0.45,
+    text: '0 cells', showarrow: false, font: { color: gcrUmapAxis(), size: 12 } });
+  if (!pos.length) ann.push({ x: posName, xref: 'x', yref: 'paper', y: 0.45,
+    text: '0 cells', showarrow: false, font: { color: gcrUmapAxis(), size: 12 } });
+  if (ann.length) layout.annotations = ann;
+  if (!data.length) return { none: true, msg: 'no cells to plot', meta: '' };
+  var meta = pos.length + ' detected vs ' + neg.length + ' not detected cells';
+  var hidden = npos0 + nneg0;
+  if (hidden) meta += ' \u00b7 ' + hidden + ' cell(s) with 0 total UMI are not visible on a log axis';
+  return { data: data, layout: layout, meta: meta, cfg: GCR_BOXCFG };
+}
+/* across-samples: % cells detected bars + mean UMI dots for the picked gene */
+function gcrBarsFig(a, gene) {
+  var vals = (a.det[gene] || []).map(Number);
+  var layout = gcrCartBase(false);
+  layout.title = gcrTitle('% cells detected \u00b7 ' + gene);
+  layout.xaxis.type = 'category';
+  layout.xaxis.title.text = 'sample';
+  layout.yaxis.title.text = '% cells (\u2265 detection threshold)';
+  layout.bargap = 0.34;
+  var vmax = 0;
+  for (var i = 0; i < vals.length; i++) if (vals[i] > vmax) vmax = vals[i];
+  /* explicit range (25% headroom for the outside bar labels) so switching
+     genes never inherits the previous gene's cached auto-range */
+  if (vmax > 0) { layout.yaxis.range = [0, vmax * 1.25]; layout.yaxis.autorange = false; }
+  return { data: [{ type: 'bar', x: a.labels, y: vals,
+    marker: { color: '#2dd4bf', line: { width: 0 } },
+    text: vals.map(function (v) { return v.toFixed(1) + '%'; }),
+    textposition: 'outside', textfont: { color: '#4a5c82', size: 11 },
+    hovertemplate: '%{x}<br>%{y:.1f}% cells detected<extra></extra>' }],
+    layout: layout, meta: vals.length + ' samples' };
+}
+function gcrDotsFig(a, gene) {
+  var raw = a.mean[gene] || [];
+  /* null = a sample with no expressing cells for this gene: shows as a blank
+     label (no dot, no "0.00"); the axis range below ignores nulls */
+  var vals = raw.map(function (v) { return (v == null) ? null : Number(v); });
+  var layout = gcrCartBase(false);
+  layout.title = gcrTitle('Mean UMI per expressing cell \u00b7 ' + gene);
+  layout.xaxis.title.text = 'mean UMI per expressing cell';
+  layout.yaxis.type = 'category';
+  layout.yaxis.categoryorder = 'array';
+  layout.yaxis.categoryarray = a.labels.slice();
+  layout.yaxis.autorange = 'reversed';
+  var nv = vals.filter(function (v) { return v !== null; });
+  /* explicit range (headroom for the value labels) so a gene switch never
+     inherits the previous gene's cached auto-range */
+  if (nv.length) {
+    var xmin = Math.min.apply(null, nv), xmax = Math.max.apply(null, nv);
+    var pad = Math.max(1, (xmax - xmin) * 0.15);
+    layout.xaxis.range = [Math.max(0, xmin - pad), xmax + pad];
+    layout.xaxis.autorange = false;
+  }
+  return { data: [{ type: 'scatter', x: vals, y: a.labels.slice(), mode: 'markers+text',
+    marker: { size: 11, color: '#f472b6', line: { color: '#0c1526', width: 1.5 } },
+    text: vals.map(function (v) { return v ? Number(v).toFixed(2) : ''; }),
+    textposition: 'middle right',
+    textfont: { color: '#4a5c82', size: 11 },
+    hovertemplate: '%{y}<br>mean %{x:.2f} UMI<extra>expressing cells</extra>' }],
+    layout: layout, meta: 'expressing cells only (UMI \u2265 1)' };
+}
+function acrossRender() {
+  var a = window.__gcrAcross;
+  if (!a || !window.Plotly) return;
+  var sel = document.getElementById('gcracrosssel');
+  var gene = (sel && sel.value) || (a.genes[0] || '');
+  var bf = gcrBarsFig(a, gene);
+  var bm = document.getElementById('gcracrossdm');
+  if (bm) bm.textContent = bf.meta;
+  gcrSetFig(document.getElementById('gcracrossbars'), bf);
+  var df = gcrDotsFig(a, gene);
+  var dm = document.getElementById('gcracrossmm');
+  if (dm) dm.textContent = df.meta;
+  gcrSetFig(document.getElementById('gcracrossdots'), df);
+  /* stat cards follow the same gene selector (per-gene values in the payload) */
+  var ev = a.expr ? (a.expr[gene] != null ? a.expr[gene] : 0) : 0;
+  var e1 = document.getElementById('gcracrossexpr');
+  if (e1) e1.textContent = ev + '/' + a.labels.length;
+  var e1l = document.getElementById('gcracrossexpl');
+  if (e1l) e1l.textContent = 'samples where ' + gene + ' is expressed';
+  var dv = (a.det[gene] || []).map(Number);
+  var dvsum = 0;
+  for (var di = 0; di < dv.length; di++) dvsum += dv[di];
+  var e2 = document.getElementById('gcracrossavg');
+  if (e2) e2.textContent = ((dv.length ? dvsum / dv.length : 0).toFixed(1)) + '%';
+  var mvv = [];
+  var msrc = a.mean[gene] || [];
+  for (var mi = 0; mi < msrc.length; mi++) {
+    var mv = msrc[mi];
+    if (mv != null && !isNaN(Number(mv))) mvv.push(Number(mv));
+  }
+  var e3 = document.getElementById('gcracrossmx');
+  if (e3) e3.textContent = (mvv.length ? Math.max.apply(null, mvv).toFixed(2) : '0.00');
+}
+/* one UMAP + one histogram + one box plot per sample, all re-rendered in place
+   by the gene <select> (umapSwitch). One canvas per plot type, always. */
+function umapRender(uid) {
+  var d = window.__umap && window.__umap[uid];
+  if (!d || !window.Plotly) return;
+  d.uid = uid;
+  var sel = document.getElementById('umapgene-' + uid);
+  var gene = (sel && sel.value) || (d.genes[0] || '');
+  if (d.umap) {
+    var f = gcrUmapFigure(d);
+    var st = document.getElementById('umapstatus-' + uid);
+    if (st) st.textContent = f.meta;
+    gcrSetFig(document.getElementById('umaphost-' + uid), f);
+  }
+  var h = gcrHistFig(d, gene);
+  var hm = document.getElementById('umhistmeta-' + uid);
+  if (hm) hm.textContent = h.meta;
+  gcrSetFig(document.getElementById('umhist-' + uid), h);
+  var b = gcrBoxFig(d, gene);
+  var bm = document.getElementById('umboxmeta-' + uid);
+  if (bm) bm.textContent = b.meta;
+  gcrSetFig(document.getElementById('umbox-' + uid), b);
+}
+function umapSwitch(uid) { umapRender(uid); }
+/* the per-sample inline <script> tags in the body (parsed before this) put each
+   payload into window.__umap and its uid in window.__umapInit; now that
+   umapRender / umapSwitch / acrossRender are defined, render the registered ones. */
+if (window.__umapInit) {
+  for (var _i = 0; _i < window.__umapInit.length; _i++) { umapRender(window.__umapInit[_i]); }
+}
+if (window.__gcrAcross) { acrossRender(); }
 """
 
 # Palette for the charts
 _EXPR_SCALE = ["#14162e", "#3b2a76", "#7c3aed", "#c026d3", "#f07bb0", "#facc15"]
-_POS = "#2dd4bf"
-_NEG = "#3a4a66"
-_BAR = "#2dd4bf"
-_DOT = "#f472b6"
 
 
 def _p_icon(status):
@@ -885,13 +1276,13 @@ def _p_icon(status):
 
 
 # --------------------------------------------------------------------------- #
-# Plotly figure builders (dark-default layout, themeable via gcrToggleTheme)
+# Plotly figure builders (fixed light-theme layout)
 # --------------------------------------------------------------------------- #
 def _plotly_theme(fig, title, x_title="", y_title="", height=360, legend=False,
                   legend_title=""):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e8eefb", size=11, family="-apple-system,Inter,system-ui,sans-serif"),
+        font=dict(color="#182338", size=11, family="-apple-system,Inter,system-ui,sans-serif"),
         margin=dict(l=46, r=20, t=18, b=34), height=height, autosize=True,
         showlegend=legend,
         legend=dict(orientation="h", yanchor="bottom", y=-0.24, xanchor="left", x=0,
@@ -900,14 +1291,14 @@ def _plotly_theme(fig, title, x_title="", y_title="", height=360, legend=False,
                         font=dict(color="#e8eefb", size=12,
                                  family="-apple-system,Inter,sans-serif")),
     )
-    fig.update_xaxes(gridcolor="rgba(148,163,184,0.09)", linecolor="#2e4067",
+    fig.update_xaxes(gridcolor="rgba(40,70,130,0.16)", linecolor="#c3d1ea",
                      zeroline=False, ticks="outside", ticklen=5, tickwidth=1,
-                     title_text=x_title, title_font=dict(color="#8a99bd", size=11),
-                     tickfont=dict(color="#aab8d6", size=10))
-    fig.update_yaxes(gridcolor="rgba(148,163,184,0.09)", linecolor="#2e4067",
+                     title_text=x_title, title_font=dict(color="#4a5c82", size=11),
+                     tickfont=dict(color="#4a5c82", size=10))
+    fig.update_yaxes(gridcolor="rgba(40,70,130,0.16)", linecolor="#c3d1ea",
                      zeroline=False, ticks="outside", ticklen=5, tickwidth=1,
-                     title_text=y_title, title_font=dict(color="#8a99bd", size=11),
-                     tickfont=dict(color="#aab8d6", size=10))
+                     title_text=y_title, title_font=dict(color="#4a5c82", size=11),
+                     tickfont=dict(color="#4a5c82", size=10))
     return fig
 
 
@@ -931,91 +1322,136 @@ def _panel(title, fig, meta="", cap=""):
             + '</div>' + _f2html(fig) + note + '</div>')
 
 
-def _fig_umap_expr(xs, ys, umi, label):
-    if len(umi) < 2:
-        return None
-    t = [math.log10(v + 1) for v in umi]
-    cmax = max(t) if max(t) > 0 else 1.0
-    fig = go.Figure(go.Scattergl(
-        x=list(xs), y=list(ys), mode="markers",
-        marker=dict(size=5, opacity=0.82, color=t, colorscale=_EXPR_SCALE,
-                    cmin=0, cmax=cmax, showscale=True,
-                    colorbar=dict(
-                        title=dict(text=label + "  log\u00b9\u2070 UMI", side="right",
-                                  font=dict(size=10, color="#c9d3e6")),
-                        len=0.92, thickness=11, outlinewidth=1,
-                        outlinecolor="#22314f",
-                        tickfont=dict(color="#c9d3e6", size=10), tickformat=".1f")),
-        customdata=list(umi),
-        hovertemplate="x %{x:.2f}<br>y %{y:.2f}<br><b>UMI %{customdata}</b>"
-                      "<extra>single cell</extra>",
-    ))
-    return _plotly_theme(fig, label + "  \u00b7  expression on UMAP",
-                         x_title="UMAP-1", y_title="UMAP-2", height=440)
+# unique, ever-increasing id so each sample's UMAP controls get a distinct DOM id
+_UMAP_SEQ = [0]
 
 
-def _fig_umap_bin(dx, nx, dy, ny, label, threshold):
-    fig = go.Figure()
-    if nx:
-        fig.add_trace(go.Scattergl(x=list(nx), y=list(ny), mode="markers",
-                                   name="not detected",
-                                   marker=dict(size=3.5, color=_NEG, opacity=0.5),
-                                   hovertemplate="not detected \u00b7 x %{x:.2f}<br>y %{y:.2f}"
-                                                 "<extra></extra>"))
-    if dx:
-        fig.add_trace(go.Scattergl(x=list(dx), y=list(dy), mode="markers",
-                                   name=label + "  detected (\u2265 %g UMI)" % threshold,
-                                   marker=dict(size=4.6, color=_POS, opacity=0.92),
-                                   hovertemplate="detected \u00b7 x %{x:.2f}<br>y %{y:.2f}"
-                                                 "<extra></extra>"))
-    return _plotly_theme(fig, label + "  \u00b7  detected vs not detected on UMAP",
-                         x_title="UMAP-1", y_title="UMAP-2", height=440,
-                         legend=True)
+def render_sample_interactive(sample_name, coords, barcodes, bc_total, bc_gene,
+                              genes, threshold, norow=None):
+    """One interactive plot set per sample (UMAP + UMI histogram + total-UMI box).
 
+    In place of one static figure per gene per plot type: one shared payload per
+    sample (the UMAP coordinate frame, one UMI vector per gene, per-cell total
+    UMI) is embedded ONCE as JSON; the gene <select> drives the client-side JS
+    (umapRender / gcrHistFig / gcrBoxFig in the JS constant) which re-renders one
+    canvas per plot type in place. So the DOM holds exactly one figure of each
+    type no matter how many genes are inspected — what exhausts browser memory on
+    big multi-gene runs — and the report stays fully offline.
 
-def _fig_histogram(values, label):
-    if not values:
-        return None
-    t = [math.log10(v + 1) for v in values]
-    tmin, tmax = min(t), max(t)
-    if (tmax - tmin) < 1e-9:
-        tmax = tmin + 1e-9
-    nb = 28
-    counts = [0] * nb
-    for v in values:
-        tt = math.log10(v + 1)
-        counts[min(nb - 1, max(0, int((tt - tmin) / (tmax - tmin) * nb)))] += 1
-    labels = [str(max(0, int(round(10 ** (tmin + (i + 0.5) / nb * (tmax - tmin)) - 1))))
-              for i in range(nb)]
-    fig = go.Figure(go.Bar(
-        x=labels, y=counts,
-        marker=dict(color="#38bdf8", line=dict(width=0)),
-        hovertemplate="\u2248 %{x} UMI<br>%{y} cells<extra>expressing</extra>",
-    ))
-    fig.update_xaxes(type="category", tickvals=labels[::max(1, nb // 6)])
-    fig.update_layout(bargap=0.05)
-    return _plotly_theme(fig, "UMI distribution of expressing cells",
-                         x_title="UMI per cell", y_title="cells", height=300)
+    The histogram, box plot and the "· N detected" dropdown labels are computed
+    from ALL barcodes of the sample (the same population the stats table uses).
+    When the UMAP only covers a subset of cells, that coordinate subset is used
+    for the UMAP trace alone, and the panel says so (plus a stderr note).
+    """
+    have_umap = len(coords or {}) >= 2
+    order = [bc for bc in (barcodes or []) if bc]
+    if have_umap:
+        uorder = [bc for bc in order if bc in coords]
+        cx = [coords[bc][0] for bc in uorder]
+        cy = [coords[bc][1] for bc in uorder]
+        if len(uorder) != len(order):
+            sys.stderr.write(
+                "note: %s: UMAP covers %d of %d cells; histogram and box plot "
+                "use all %d cells\n" % (sample_name, len(uorder), len(order),
+                                       len(order)))
+    else:
+        uorder = []
+        cx, cy = [], []
+    # one aligned UMI vector per gene (ints), keyed by the (string) gene name,
+    # plus the per-cell total UMI in the same (full) barcode order — the box and
+    # the histogram are split from these two vectors on the client side
+    umis = {}
+    for g in genes:
+        key = str(g)
+        umis[key] = [int(bc_gene.get(bc, {}).get(g, 0)) for bc in order]
+    totals = [int(bc_total.get(bc, 0)) for bc in order]
+    # UMAP-trace UMI vectors, aligned to the (possibly smaller) UMAP subset
+    umap_umis = {}
+    if have_umap:
+        for g in genes:
+            umap_umis[str(g)] = [int(bc_gene.get(bc, {}).get(g, 0))
+                                 for bc in uorder]
 
+    _UMAP_SEQ[0] += 1
+    uid = _UMAP_SEQ[0]
 
-def _fig_boxplot(pos_vals, neg_vals, label):
-    fig = go.Figure()
-    if neg_vals:
-        fig.add_trace(go.Box(y=list(neg_vals), name="not detected",
-                             marker=dict(color=_NEG, size=3, opacity=0.5,
-                                         ),
-                             line=dict(width=1.1),
-                             fillcolor="rgba(58,74,102,0.18)"))
-    if pos_vals:
-        fig.add_trace(go.Box(y=list(pos_vals), name=label + "  detected",
-                             marker=dict(color=_POS, size=3, opacity=0.6,
-                                         ),
-                             line=dict(width=1.2),
-                             fillcolor="rgba(45,212,191,0.16)"))
-    fig.update_yaxes(type="log")
-    return _plotly_theme(fig, "Total UMI per cell  \u00b7  detected vs not detected",
-                         y_title="total UMI per cell (log)", height=320,
-                         legend=True)
+    umap_subset_note = ""
+    if have_umap and len(uorder) != len(order):
+        umap_subset_note = ('<div class="note">UMAP covers %d of %d cells; '
+                            'histogram and box plot use all %d cells.</div>'
+                            % (len(uorder), len(order), len(order)))
+
+    opts = []
+    for g in genes:
+        key = str(g)
+        det = sum(1 for v in umis[key] if v >= threshold)
+        opts.append('<option value="%s">%s · %d detected</option>'
+                    % (html.escape(key, quote=True), html.escape(key), det))
+
+    ncells = len(order)
+    # ensure_ascii keeps the embedded JSON plain-ASCII (gene names are
+    # identifiers), so it can never contain the '</script>' terminator.
+    pl = {"umap": have_umap, "genes": [str(g) for g in genes], "umis": umis,
+          "totals": totals, "threshold": int(threshold),
+          "norow": {str(g): 1 for g in (norow or {})}}
+    if have_umap:
+        pl["xs"], pl["ys"], pl["cscale"] = cx, cy, list(_EXPR_SCALE)
+        pl["n_umap"] = len(cx)
+        pl["umap_umis"] = umap_umis
+    payload = json.dumps(pl, separators=(",", ":"), ensure_ascii=True)
+
+    if have_umap:
+        umap_host = ('<div id="umaphost-' + str(uid) + '" class="umap-host"></div>'
+                     + umap_subset_note)
+    else:
+        umap_host = ('<div class="empty">No interactive UMAP for '
+                     + html.escape(sample_name)
+                     + ' (needs a UMAP_1 / UMAP_2 coordinate file next to the '
+                     'matrix — the UMI plots below still work).</div>')
+    return (
+        '<div class="panel umap-panel" style="margin-bottom:16px">'
+        '<div class="panel-h"><span class="t"><span class="sw"></span>'
+        'Per-gene plots · pick a gene</span>'
+        '<span class="m">' + format(ncells, ",") + ' cells</span></div>'
+        '<div class="umap-bar">'
+        '<label>Gene&nbsp;<select class="umap-sel" id="umapgene-' + str(uid) + '" '
+        'onchange="umapSwitch(' + str(uid) + ')">' + "".join(opts) + '</select></label>'
+        '<span class="umap-status" id="umapstatus-' + str(uid) + '"></span>'
+        '</div>'
+        + umap_host +
+        '<div class="note">The gene selector above re-renders all three plots in place (one of '
+        'each type, never one per gene): the UMAP (dark to bright = low to high UMI, '
+        'log10 scale), the histogram of expressing cells, and the total-UMI box '
+        'split by detection status. Drag to zoom, shift-drag to pan, double-click to '
+        'reset; hover a point for its UMI.</div>'
+        '<script type="application/json" id="umapdata-' + str(uid) + '">' + payload + '</script>'
+        '<script>(function(){'
+        'var el=document.getElementById("umapdata-' + str(uid) + '");if(!el)return;'
+        'var d=JSON.parse(el.textContent);'
+        '(window.__umap=window.__umap||{})[' + str(uid) + ']=d;'
+        '(window.__umapInit=window.__umapInit||[]).push(' + str(uid) + ');'
+        '})();</script>'
+        '</div>'
+        '<div class="grid2" style="margin-bottom:16px;align-items:start">'
+        '<div class="panel">'
+        '<div class="panel-h"><span class="t"><span class="sw"></span>'
+        'UMI distribution of expressing cells</span>'
+        '<span class="m" id="umhistmeta-' + str(uid) + '"></span></div>'
+        '<div id="umhist-' + str(uid) + '"></div>'
+        '<div class="note">Expressing cells = cells with at least 1 UMI of the selected '
+        'gene (bins are logarithmic). Follows the Gene selector above.</div>'
+        '</div>'
+        '<div class="panel">'
+        '<div class="panel-h"><span class="t"><span class="sw"></span>'
+        'Total UMI per cell · detected vs not detected</span>'
+        '<span class="m" id="umboxmeta-' + str(uid) + '"></span></div>'
+        '<div id="umbox-' + str(uid) + '"></div>'
+        '<div class="note">Total UMI of the whole transcriptome per cell. Left box: cells '
+        'where the selected gene is not detected; right box: cells where it is detected '
+        '(log scale). Follows the Gene selector above.</div>'
+        '</div>'
+        '</div>'
+    )
 
 
 def _fig_coverage(depth, label):
@@ -1029,50 +1465,22 @@ def _fig_coverage(depth, label):
         fillcolor="rgba(99,102,241,0.34)", line=dict(color="#818cf8", width=1.5),
         hovertemplate=hover,
     ))
-    return _plotly_theme(fig, "Read-start coverage on the transgene contig",
+    return _plotly_theme(fig, "Coverage on the transgene contig",
                          x_title="position on contig (bp)", y_title="coverage (\u00d7)",
                          height=320)
-
-
-def _fig_bars(labels, values, label):
-    fig = go.Figure(go.Bar(
-        x=labels, y=values,
-        marker=dict(color=_BAR, line=dict(width=0)),
-        text=["%.1f%%" % v for v in values], textposition="outside",
-        textfont=dict(color="#c9d3e6", size=11),
-        hovertemplate="%{x}<br>%{y:.1f}%% cells detected<extra></extra>",
-    ))
-    fig.update_layout(bargap=0.34)
-    return _plotly_theme(fig, "% cells detected" + (("\u00b7 " + label) if label else ""),
-                         x_title="sample", y_title="% cells (\u2265 threshold)", height=320)
-
-
-def _fig_dots(labels, means, label):
-    order = list(range(len(labels)))
-    fig = go.Figure(go.Scatter(
-        x=list(means), y=[labels[i] for i in order],
-        mode="markers + text",
-        marker=dict(size=11, color=_DOT, line=dict(color="#0c1526", width=1.5)),
-        text=["%g" % v for v in means], textfont=dict(color="#c9d3e6", size=11),
-        hovertemplate="%{y}<br>mean %{x:g} UMI<extra>expressing cells</extra>",
-    ))
-    fig.update_yaxes(categoryorder="array", categoryarray=labels, autorange="reversed")
-    return _plotly_theme(fig, "Mean UMI per expressing cell" + (("\u00b7 " + label) if label else ""),
-                         x_title="mean UMI per expressing cell", y_title="", height=320)
 
 
 def match_contig(genes, contigs):
     if not genes or not contigs:
         return None
+    # Exact (case-insensitive) match only — deliberately NO substring fallback:
+    # a gene like "Cre" must never be labelled with the "CreERT2" contig. A
+    # gene with no exactly-named contig is treated as "no contig".
     exact = {c.lower(): c for c in contigs}
     for g in genes:
         gl = str(g).lower()
         if gl in exact:
             return (g, exact[gl])
-        cands = [c for c in contigs if gl in c.lower()]
-        if cands:
-            cands = sorted(cands, key=lambda c: len(c))
-            return (g, cands[0])
     return None
 
 
@@ -1203,29 +1611,67 @@ def render_per_sample_table(results, genes):
         return ""
     labels = [sid for sid, _st, _ct in results]
     first = genes[0]
-    dets, means = [], []
-    expr_cnt = 0
+    # per-gene across-sample values (bars = % cells detected, dots = mean UMI) —
+    # small (samples x genes numbers), so every gene's panels can live in the DOM
+    # and the Gene selector below re-renders them client-side
+    det_all, mean_all = {}, {}
+    for g in genes:
+        det_all[str(g)] = []
+        mean_all[str(g)] = []
+    expr_all = {str(g): 0 for g in genes}
     for _sid, stats, _ct in results:
-        d = stats.get(first) or {}
-        cells = d.get("cells_total") or 0
-        det = d.get("det") or 0
-        dets.append((100.0 * det / cells) if cells else 0.0)
-        means.append(d.get("mean") or 0.0)
-        if d.get("status") == "EXPRESSED":
-            expr_cnt += 1
+        for g in genes:
+            d = stats.get(g) or {}
+            cells = d.get("cells_total") or 0
+            det_all[str(g)].append((100.0 * (d.get("det") or 0) / cells) if cells else 0.0)
+            # samples with no expressing cells for this gene send None; the JS
+            # shows a blank label, not a misleading "0.00"
+            mean_all[str(g)].append(float(d["mean"]) if d.get("n_pos") else None)
+            if d.get("status") == "EXPRESSED":
+                expr_all[str(g)] += 1
+    dets = det_all[str(first)]
+    means = [m for m in mean_all[str(first)] if m is not None]
     avg = sum(dets) / len(dets) if dets else 0.0
     mx = max(means) if means else 0.0
+    opts = []
+    for g in genes:
+        n_exp = sum(1 for _sid, st, _ct in results
+                    if (st.get(g) or {}).get("status") == "EXPRESSED")
+        opts.append('<option value="%s">%s · %d/%d expressed</option>'
+                    % (html.escape(str(g), quote=True), html.escape(str(g)),
+                       n_exp, len(labels)))
+    # ensure_ascii keeps the embedded JSON plain-ASCII (gene names are
+    # identifiers), so it can never contain the '</script>' terminator.
+    payload = json.dumps(
+        {"labels": labels, "genes": [str(g) for g in genes],
+         "expr": expr_all, "det": det_all, "mean": mean_all},
+        separators=(",", ":"), ensure_ascii=True)
     cards = ("<div class=grid3 style=margin-bottom:16px>"
-             f"<div class=bigstat><div class=n>{expr_cnt}/{len(results)}</div>"
-             f"<div class=l>samples where {html.escape(first)} is expressed</div></div>"
-             f"<div class=bigstat><div class=n>{avg:.1f}%</div>"
+             f"<div class=bigstat><div class=n id=gcracrossexpr>{expr_all[str(first)]}/{len(results)}</div>"
+             f"<div class=l id=gcracrossexpl>samples where {html.escape(str(first))} is expressed</div></div>"
+             f"<div class=bigstat><div class=n id=gcracrossavg>{avg:.1f}%</div>"
              "<div class=l>mean share of cells that are detected (transgene UMI &ge; threshold)</div></div>"
-             f"<div class=bigstat><div class=n>{mx:.2f}</div>"
+             f"<div class=bigstat><div class=n id=gcracrossmx>{mx:.2f}</div>"
              "<div class=l>max mean UMI per expressing cell</div></div></div>")
-    bar = _panel("% cells detected", _fig_bars(labels, dets, first), "per sample, at the detection threshold")
-    dot = _panel("Mean UMI per expressing cell", _fig_dots(labels, means, first), "expressing cells only (UMI \u2265 1)")
     return ('<div class=sec-h><h2><span class=ic>' + _p_icon("EXPRESSED") + "</span>Across samples</h2></div>"
-            + cards + "<div class=grid2>" + bar + dot + "</div>")
+            + cards
+            + '<div class=umap-bar style="margin:0 0 14px 6px">'
+            '<label>Gene&nbsp;<select class="umap-sel" id="gcracrosssel" onchange="acrossRender()">'
+            + "".join(opts)
+            + '</select></label>'
+            '<span class=umap-status>both panels below follow this selector</span>'
+            '</div>'
+            '<div class=grid2>'
+            '<div class=panel><div class=panel-h><span class=t><span class=sw></span>% cells detected</span>'
+            '<span class=m id=gcracrossdm></span></div><div id=gcracrossbars></div>'
+            '<div class=note>per sample, at the detection threshold</div></div>'
+            '<div class=panel><div class=panel-h><span class=t><span class=sw></span>Mean UMI per expressing cell</span>'
+            '<span class=m id=gcracrossmm></span></div><div id=gcracrossdots></div>'
+            '<div class=note>expressing cells only (UMI \u2265 1)</div></div>'
+            '</div>'
+            + '<script type="application/json" id="gcracrossdata">' + payload + '</script>'
+            + '<script>(function(){var el=document.getElementById("gcracrossdata");if(!el)return;'
+              'window.__gcrAcross=JSON.parse(el.textContent);})();</script>')
 
 
 def render_plots(plot_data, genes, threshold, coverage=True):
@@ -1246,68 +1692,15 @@ def render_plots(plot_data, genes, threshold, coverage=True):
                    + _chip("UMAP", ncoord)
                    + _chip("detection threshold", "\u2265 %g UMI per cell" % threshold) + "</div>")
 
-        # shared UMAP frame for this sample (barcode order is stable)
-        if coords:
-            order = list(coords.keys())
-            cx = [coords[bc][0] for bc in order]
-            cy = [coords[bc][1] for bc in order]
-        else:
-            order = []
-            cx = cy = []
-
-        for g in genes:
-            st = stats.get(g) or {}
-            pos_vals = st.get("pos_vals") or []
-            if coords:
-                cmi = [max(0.0, bc_gene.get(bc, {}).get(g, 0)) for bc in order]
-                d_x, n_x, d_y, n_y = [], [], [], []
-                for bc in order:
-                    u = bc_gene.get(bc, {}).get(g, 0)
-                    if u >= threshold:
-                        d_x.append(coords[bc][0]); d_y.append(coords[bc][1])
-                    else:
-                        n_x.append(coords[bc][0]); n_y.append(coords[bc][1])
-            else:
-                cmi, d_x, n_x, d_y, n_y = [], [], [], [], []
-            pv = [bc_total[bc] for bc in bc_total if bc_gene.get(bc, {}).get(g, 0) >= threshold]
-            nv = [bc_total[bc] for bc in bc_total if bc_gene.get(bc, {}).get(g, 0) < threshold]
-
-            if st.get("row_present") is False:
-                norow_msg = ("this gene is not present in this sample \u2019s reference "
-                             "(NO-ROW), so there are no cells to show")
-                out.append('<div class="grid2" style="margin-bottom:16px">')
-                out.append(_panel(g + " \u00b7 expression on UMAP", None, norow_msg))
-                out.append(_panel(g + " \u00b7 detected vs not detected", None, norow_msg))
-                out.append("</div>")
-                continue
-
-            out.append('<div class="grid2" style="margin-bottom:16px">')
-            out.append(_panel(
-                g + " \u00b7 expression on UMAP", _fig_umap_expr(cx, cy, cmi, g),
-                meta="{}, cells".format(len(cx)),
-                cap="Colour = transgene UMI per cell, on a log\u00b9\u2070 scale; dark = low, "
-                    "bright = high. Drag to zoom, shift-drag to pan, double-click to reset, "
-                    "hover a point for its UMI."))
-            out.append(_panel(
-                g + " \u00b7 detected vs not detected", _fig_umap_bin(d_x, n_x, d_y, n_y, g, threshold),
-                meta="{} detected / {} not detected".format(len(d_x), len(n_x)),
-                cap="A cell is shown as detected when its transgene UMI count for this gene "
-                    "is equal to or greater than %g \u00b7 all other cells are shown as not "
-                    "detected." % threshold))
-            out.append("</div>")
-            out.append('<div class="grid2" style="margin-bottom:16px">')
-            out.append(_panel(
-                "UMI distribution of expressing cells", _fig_histogram(pos_vals, g),
-                meta="{}, expressing cells".format(len(pos_vals)),
-                cap="Each bar is the number of expressing cells at that transgene UMI "
-                    "level (bins are logarithmic)."))
-            out.append(_panel(
-                "Total UMI per cell \u00b7 detected vs not detected", _fig_boxplot(pv, nv, g),
-                meta="{} detected vs {} not detected cells".format(len(pv), len(nv)),
-                cap="Total UMI of the whole transcriptome per cell. Left box: cells where "
-                    "the gene is not detected; right box: cells where it is detected "
-                    "(log scale)."))
-            out.append("</div>")
+        # one gene-driven plot set per sample (one UMAP, one hist of expressing
+        # cells, one total-UMI box): the client-side Gene selector re-renders all
+        # three in place, so the DOM keeps exactly one figure per plot type no
+        # matter how many genes are inspected (never one figure per gene again).
+        norow = {str(g) for g in genes
+                 if (stats.get(g) or {}).get("row_present") is False}
+        out.append(render_sample_interactive(sid, coords, p.get("barcodes") or [],
+                                             bc_total, bc_gene,
+                                             genes, threshold, norow))
 
     if coverage:
         out.extend(_cov_blocks(plot_data))
@@ -1333,12 +1726,13 @@ def _cov_blocks(plot_data):
         if cov.get("depth"):
             out.append(_panel(
                 "Coverage \u00b7 " + g, _fig_coverage(cov["depth"], g),
-                meta="contig {} \u00b7 {:,} bp \u00b7 sample {}".format(
+                'contig {} \u00b7 {:,} bp \u00b7 sample {}'.format(
                     html.escape(cov.get("contig") or ""), cov.get("length") or 0,
                     html.escape(p.get("id") or "")),
-                cap="Number of reads covering each position along the transgene; "
-                    "a flat, even plateau across the whole length indicates the "
-                    "transgene is transcribed as a full-length construct."))
+                cap="10x 3' data is expected to pile up toward the 3' end; "
+                    "coverage counts all barcodes and excludes duplicate-flagged "
+                    "reads, so it will not reconcile with the "
+                    "\u201creads (called cells)\u201d column."))
             cov_done = True
         else:
             out.append(_panel("Coverage \u00b7 " + g, None,
@@ -1396,27 +1790,47 @@ def render_html(title, meta, sections, plots):
     threshold = m.get("detection threshold", m.get("thresholddetected", m.get("threshold", "")))
     generated = m.get("generated", "")
     gene_main = gene.split(",")[0].strip() if gene else ""
-    # counts (reliable from pills in the stat tables)
-    body = "\n".join(sections)
-    expr = body.count("pill exp")
+    gene_list = [g.strip() for g in gene.split(",") if g.strip()]
+    multi = len(gene_list) > 1
 
-    def _meta_chip(key, label=None):
-        if key not in m:
-            return ""
-        lab = label or key
-        return _chip(lab, m[key])
+    # hero title block — one gene: the gene itself; many genes: a neutral
+    # heading with the count (and the part range when this is a batch file)
+    if multi:
+        head_text = "Gene Expression"
+        sub_parts = []
+        if "\u00b7" in title:
+            sub_parts.append(title.rsplit("\u00b7", 1)[1].strip())
+        sub_parts.append("{} genes".format(len(gene_list)))
+        hero_sub = " \u00b7 ".join(sub_parts)
+    else:
+        head_text = gene_main or title
+        hero_sub = "expression report"
 
-    chips = "".join([
-        _chip("genes", gene),
-        _chip("samples", gen_count),
-        _chip("detection threshold", threshold),
-        _chip("generated", generated),
-    ])
+    meta_bits = []
+    if gen_count:
+        meta_bits.append(html.escape(gen_count) +
+                         (" sample" if str(gen_count) == "1" else " samples"))
+    if threshold:
+        meta_bits.append("detection threshold " + html.escape(threshold))
+    if generated:
+        meta_bits.append("generated " + html.escape(generated))
+    hero_meta = ("<div class=\"hero-meta\">" + " &middot; ".join(meta_bits) + "</div>"
+                 if meta_bits else "")
+
+    title_tag = html.escape(title)
+    if gene_main and not multi:
+        title_tag += " \u00b7 " + html.escape(gene_main)
+    elif multi:
+        title_tag += " \u00b7 " + "{} genes".format(len(gene_list))
 
     # plotly JS once — only when THIS file actually has interactive figures (a
     # pure-table index stays small); fallback to CDN if import fails so the file
-    # still renders
-    if "Plotly.newPlot" not in plots:
+    # still renders. The token check must scan BOTH sections and plots: in
+    # split mode the "Across samples" charts live in sections while `plots`
+    # can be empty for the index file.
+    blob = "\n".join(sections) + plots
+    if not any(k in blob for k in ("Plotly.newPlot", "umhist-",
+                                   "umaphost-", "gcracrossbars")):
         js_block = ""
     else:
         try:
@@ -1431,46 +1845,21 @@ def render_html(title, meta, sections, plots):
         else:
             js_block = "<script>" + _plotly_js + "</script>\n"
 
-    hero_cards = (
-        "<div class=\"hero-summ\">"
-        "<div class=\"bigstat\"><div class=\"n\">"
-        + (f"{expr}<small class=\"ok\">/{gen_count}</small>" if gen_count else f"{expr}")
-        + "</div><div class=\"l\">expressed samples \u00b7 " +
-          (html.escape(gene_main) if gene_main else "") + "</div></div>"
-        "<div class=\"bigstat\"><div class=\"n\">" + (gen_count or "\u2013") +
-        "</div><div class=\"l\">samples analysed</div></div>"
-        "<div class=\"bigstat\"><div class=\"n\">" +
-        (html.escape(threshold.split()[0]) if threshold else "\u2013") +
-        "</div><div class=\"l\">detection threshold (UMI/cell)</div></div>"
-        "</div>"
-    )
-
     return (
-        "<!doctype html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n"
+        "<!doctype html>\n<html lang=\"en\" data-theme=\"light\">\n<head>\n"
         "<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-        "<meta name=\"color-scheme\" content=\"dark light\">\n"
-        "<title>" + html.escape(title) + " \u00b7 " + (html.escape(gene_main) if gene_main else "") + "</title>\n"
-        "<script>(function(){var m='dark';try{m=localStorage.getItem('gcr-theme')||'dark';catch(e){}document.documentElement.setAttribute('data-theme',m);})();</script>\n"
+        "<meta name=\"color-scheme\" content=\"light\">\n"
+        "<title>" + title_tag + "</title>\n"
         "<style>" + CSS + "</style>\n"
         + js_block + "\n"
         "</head>\n<body>\n<div class=\"wrap\">\n"
         # hero
-        "<header class=\"hero\">\n<div class=\"hero-grid\">\n"
-        "<div>\n"
-        "<p class=\"eyebrow\">Custom / transgene expression</p>"
-        "<h1>" + (html.escape(gene_main) if gene_main else html.escape(title)) +
-        " <span class=\"sub\">&#183; expression report</span></h1>\n"
-        "<div class=\"chips\">" + chips + "</div>\n"
-        "</div>\n"
-        + hero_cards +
-        "</div>\n"
-        "<div style=\"display:flex;justify-content:flex-end;margin-top:4px\">\n"
-        "<button class=\"ghost\" onclick=\"gcrToggleTheme()\">"
-        "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" "
-        "stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z\"/></svg>"
-        "Toggle theme</button>\n"
-        "</div>\n</header>\n"
+        "<header class=\"hero\">\n"
+        "<h1>" + html.escape(head_text) + "</h1>\n"
+        "<p class=\"hero-sub\">" + html.escape(hero_sub) + "</p>\n"
+        + hero_meta + "\n"
+        "</header>\n"
         # sections
         + "\n".join(sections) + "\n"
         # plots

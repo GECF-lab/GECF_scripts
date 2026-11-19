@@ -42,7 +42,7 @@
   <p>For each gene you name, it reports how that gene is expressed across the cells in one sample&#8217;s filtered feature matrix, and (in project mode) compares the samples. Per gene the report includes:</p>
   <ul>
     <li>A status row (&#8212; <code>EXPRESSED</code> / <code>SILENT</code> / <code>NO-ROW</code>) plus detected cells, % of all cells, cells at &#8805;1 and &#8805;3 UMI, total transgene UMIs, reads from called cells (needs a BAM), mean and median UMI in positive cells, and the endogenous cell/UMI context.</li>
-    <li>Plots: UMI histogram, per-sample % positive and mean-UMI dot plot, positive/negative depth, and a UMAP coloured by the gene.</li>
+    <li>Plots, one of each per sample — a UMAP, a UMI histogram and a total-UMI boxplot. A single Gene selector above them re-renders all three in place when you pick another gene. Project mode (2+ samples) adds one % cells-detected bar chart and one mean-UMI dot plot with their own Gene selector.</li>
     <li>A read-start coverage track along the transgene contig.</li>
   </ul>
   <p>The transgene row is the feature whose id equals the gene name (the appended-contig convention from the GECF custom genome). Any other feature rows carrying the same name are used as the endogenous reference.</p>
