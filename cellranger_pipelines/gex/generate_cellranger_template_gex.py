@@ -137,7 +137,7 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # Generator version == generated-script version; the kept .sh in the
 # archive tells you which one produced it.  Bump on any change to the
 # generator.
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.1.2"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -416,16 +416,95 @@ _PER_SAMPLE_PARAMS = (
 )
 
 
+def merge_sample_order(orders):
+    """Merge the sample orders of several datasheets into one order.
+
+    *orders* is a list of sample-name lists, one per input Excel file, in
+    the order the user listed the files on the command line (each list may
+    be raw row order — duplicates are collapsed to first-seen).
+
+    Result:
+      * if all files AGREE on the relative order of the samples they share
+        (no pair of samples is ordered oppositely in two files), the single
+        common order across all files — samples that only some files list
+        still land at their agreed position;
+      * otherwise the FIRST file's order wins, with samples that appear
+        only in later files appended after it (first-seen order in the
+        remaining files).
+
+    Every sample present in any input file appears exactly once in the
+    result — files may cover different sample subsets, nothing is dropped.
+    """
+    orders = [list(dict.fromkeys(o)) for o in orders]
+    orders = [o for o in orders if o]
+    if len(orders) <= 1:
+        return orders[0] if orders else []
+
+    union_list = list(dict.fromkeys(s for o in orders for s in o))
+
+    # Constraint graph: each file is a chain — consecutive samples a, b in
+    # the same file must keep that relative order in the merged result.
+    preds = {s: set() for s in union_list}
+    succs = {s: set() for s in union_list}
+    for o in orders:
+        for a, b in zip(o, o[1:]):
+            succs[a].add(b)
+            preds[b].add(a)
+
+    # Deterministic tie-break: prefer the sample that sits earliest in the
+    # file containing it (file #, then row) — keeps the first file's order
+    # at the front of the merged result.
+    rank = {}
+    for s in union_list:
+        for i, o in enumerate(orders):
+            if s in o:
+                rank[s] = (i, o.index(s))
+                break
+
+    # Topological sort.  A deadlock (ready set empty while samples remain)
+    # means two files order some pair of samples oppositely -> they
+    # DISAGREE -> fall through to the first-file fallback below.
+    live = set(union_list)
+    emitted = []
+    while live:
+        ready = [s for s in live if not preds[s]]
+        if not ready:
+            break
+        s = min(ready, key=lambda s: rank[s])
+        emitted.append(s)
+        live.discard(s)
+        for t in succs[s]:
+            preds[t].discard(s)
+
+    if len(emitted) == len(union_list):
+        return emitted  # all files agree -> common order
+
+    # Disagreement -> first file's order + first-seen order of the rest.
+    merged = list(orders[0])
+    seen = set(merged)
+    for o in orders[1:]:
+        for s in o:
+            if s not in seen:
+                merged.append(s)
+                seen.add(s)
+    return merged
+
+
 def build_script_full(reference_genome, pairs, user="", source_files=None,
                       chosen_sample_dirs=None, added_paths=None,
-                      sample_order=False, number_prefix=True):
+                      sample_order=False, ordered_samples=None,
+                      number_prefix=True):
     """Build the complete `cellranger count` bash script (GEX).
+
+    *ordered_samples* (default None): explicit sample order for the
+    output (see *merge_sample_order* for how it is built from the input
+    files).  When given, it takes precedence over *sample_order*; samples
+    it doesn't list (e.g. ones the user added off-prompt by path) are
+    appended afterwards in the order they are seen in *pairs*.
 
     *sample_order* (default False): order of samples as they appear in the
     datasheet(s) — first-seen order preserved, NOT alphabetical sorting.
-    Only pass True when the input is a SINGLE Excel file (with several
-    files the cross-file order is ambiguous, so the alphabetical sort is
-    kept as the unambiguous fallback).
+    Only meaningful when NO *ordered_samples* list is passed.
 
     *number_prefix* (default True): zero-pad the sample index (01_, 02_,
     …) onto each per-sample output folder, keeping the folders in sample
@@ -479,9 +558,19 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     samples_to_fastqs = defaultdict(list)
     for sn, fq, avt in pairs:
         samples_to_fastqs[sn].append((fq, avt))
-    # Order: datasheet order (first-seen, insertion-preserving) or the
-    # alphabetical sort fallback (multi-file input — see docstring).
-    if sample_order:
+    # Order: an explicit sample order (already merged across the input
+    # files — see merge_sample_order), else the datasheet first-seen
+    # order with the alphabetical sort as the last-resort fallback.
+    # Sample(s) missing from the explicit list (e.g. ones the user added
+    # off-prompt by path) are appended in the order they are seen in
+    # *pairs* — never dropped.
+    if ordered_samples is not None:
+        ordered_set = set(ordered_samples)
+        unique_samples = [s for s in ordered_samples
+                          if s in samples_to_fastqs]
+        unique_samples += [s for s in samples_to_fastqs
+                           if s not in ordered_set]
+    elif sample_order:
         unique_samples = list(samples_to_fastqs.keys())
     else:
         unique_samples = sorted(samples_to_fastqs.keys())
@@ -631,6 +720,19 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
             base = f'{suffix}_{idx}="{default}"'
             pad = max(1, 60 - len(base))
             lines.append(f"{base}   {' ' * pad}# {comment}")
+    lines.append("")
+
+    # Boundary marker: emitted below all editable blocks (RUN-WIDE / FASTQ /
+    # PER-SAMPLE) so the user/code boundary in the generated script is
+    # unambiguous.
+    lines.append("# " + "=" * 73)
+    lines.append("#   ***  END OF USER-EDITABLE SECTION  ***")
+    lines.append("#")
+    lines.append("#   Everything ABOVE is yours to edit: RUN-WIDE PARAMETERS, FASTQ PATHS,")
+    lines.append("#   PER-SAMPLE PARAMETERS.")
+    lines.append("#")
+    lines.append("#   Everything BELOW is pipeline machinery — pure code, DO NOT EDIT.")
+    lines.append("# " + "=" * 73)
     lines.append("")
 
     # ---- 4) validation (MUST run before any side effects) ----
@@ -1126,11 +1228,12 @@ def main():
     xlsx_files = args.xlsx_files
 
     all_pairs = []
+    per_file_orders = []   # per-file sample order, input-file order
     for xlsx_file in xlsx_files:
         if not os.path.isfile(xlsx_file):
             sys.exit(f"Error: file '{xlsx_file}' does not exist.")
         if not xlsx_file.lower().endswith(".xlsx"):
-            sys.exit(f"Error: '{xlsx_file}' does not look like an .xlsx file.")
+            sys.exit(f"Error: '{xlsx_file}' does not look like a .xlsx file.")
 
         print(f"Reading '{os.path.basename(xlsx_file)}' …", flush=True)
         pairs, detected_avt = parse_xlsx(xlsx_file)
@@ -1141,6 +1244,14 @@ def main():
             (s, f, a if a is not None else detected_avt)
             for s, f, a in pairs
         )
+        # Row order of the samples in this datasheet — feeds the cross-file
+        # order merge in merge_sample_order() below.
+        per_file_orders.append([s for s, _, _ in pairs])
+
+    # Cross-file sample order: the common order of all files when they
+    # agree, else the FIRST file's order (later files' new samples are
+    # appended after it).  See merge_sample_order.
+    merged_sample_order = merge_sample_order(per_file_orders)
 
     if not all_pairs:
         sys.exit("Error: no sample/fastq ID pairs could be parsed from the provided file(s).")
@@ -1276,12 +1387,15 @@ def main():
                                        source_files=xlsx_files,
                                        chosen_sample_dirs=chosen_for_build,
                                        added_paths=added_paths,
-                                       # Datasheet order for the 01_/02_/…
-                                       # numbering: only when a SINGLE Excel
-                                       # file drives the generation (with
-                                       # several files the cross-file order
-                                       # is ambiguous -> alphabetical).
-                                       sample_order=(len(xlsx_files) == 1),
+                                       # Keep datasheet order for the
+                                       # 01_/02_/… numbering: the common
+                                       # order of ALL input files when they
+                                       # agree, else the FIRST file's order
+                                       # (see merge_sample_order).  Samples
+                                       # added off-prompt by full path are
+                                       # not in this list and are appended
+                                       # in the order the user added them.
+                                       ordered_samples=merged_sample_order,
                                        # Per-sample folder numbering (01_,
                                        # 02_, …) is ON by default;
                                        # --no-number-prefix disables it.
