@@ -84,6 +84,7 @@ chmod +x *.sh
 | `mapping_bams.sh` | Aligns FASTQ/BAM reads to a reference genome with minimap2 |
 | `update_dorado.sh` | Downloads and installs the latest stable Dorado release |
 | `cellranger_pipelines/` | 10x Genomics CellRanger & SpaceRanger pipeline scripts (gex, atac, arc, multi, visium) |
+| `cellranger_pipelines/common/` | Custom-gene (transgene) expression report — per-gene status, UMI/read stats, plots |
 | `FLASHseq/` | FLASH-seq (single-cell) RNA-seq pipeline + RSeQC QC |
 | `fasta_to_gtf.py` | Converts custom multi-FASTA to cellranger-arc-compatible GTF |
 | `qpcr-template-validator.py` | Validates qPCR DNA/PRIMER Hamilton Excel templates before sending to robot |
@@ -413,7 +414,7 @@ Single-cell ATAC pipeline. Given an AVT Excel tracking file, generates a ready-t
 python3 cellranger_pipelines/atac/generate_cellranger_template_atac.py "AVT0571_Arianna_GECF Copy.xlsx"
 ```
 
-The prompt flow (AVT run, sample selection / add sheet-less samples, reference genome) and the run-wide + per-sample settings work the same as GEX and ARC — tweak them in the generated script's editable blocks, then run it. The Excel sheet needs a sample-name column plus a per-sample fastq ID (or full FASTQ path); the AVT run can come from the sheet, the file name, or the prompt.
+The prompt flow (AVT run, sample selection / add sheet-less samples, reference genome) and the run-wide + per-sample settings work the same as GEX and ARC — tweak them in the generated script's editable blocks, then run it. By default each sample's output folder is numbered in sample order — `01_<sample>`, `02_<sample>`, … — so the folders stay in order even when the names are not alphabetical; add `--no-number-prefix` to the generator command to keep bare sample names instead. Full step-by-step: see [ATAC_pipeline_howto.html](cellranger_pipelines/atac/ATAC_pipeline_howto.html). The Excel sheet needs a sample-name column plus a per-sample fastq ID (or full FASTQ path); the AVT run can come from the sheet, the file name, or the prompt.
 
 ### gex — generate_cellranger_template_gex.py
 
@@ -423,7 +424,7 @@ Single-cell RNA (GEX) pipeline. Given an AVT Excel tracking file, generates a re
 python3 cellranger_pipelines/gex/generate_cellranger_template_gex.py "AVT0571_Arianna_GECF Copy.xlsx"
 ```
 
-Tweak the run-wide and per-sample settings in the generated script, then run it. Full step-by-step: see [GEX_pipeline_howto.html](cellranger_pipelines/gex/GEX_pipeline_howto.html).
+Tweak the run-wide and per-sample settings in the generated script, then run it. By default each sample's output folder is numbered in sample order — `01_<sample>`, `02_<sample>`, … — so the folders stay in order even when the names are not alphabetical; add `--no-number-prefix` to the generator command to keep bare sample names instead. With several Excel inputs, the sample order is the common order of all files when they agree on it, otherwise the first file's order (samples appearing only in later files are appended). Full step-by-step: see [GEX_pipeline_howto.html](cellranger_pipelines/gex/GEX_pipeline_howto.html).
 
 ### arc — generate_cellranger_template_arc.py
 
@@ -433,13 +434,87 @@ Multiome (RNA + ATAC) pipeline. Given an AVT Excel tracking file, generates a re
 python3 cellranger_pipelines/arc/generate_cellranger_template_arc.py "AVT0571_Arianna_GECF Copy.xlsx"
 ```
 
-Tweak the run-wide and per-sample settings in the generated script, then run it. The prompt flow and settings work the same as GEX — full step-by-step: see [ARC_pipeline_howto.html](cellranger_pipelines/arc/ARC_pipeline_howto.html).
+Tweak the run-wide and per-sample settings in the generated script, then run it. At the end of the run the script writes a `<avt>_stats.xlsx` into the run folder — one sheet per modality (GEX, ATAC), one row per sample per modality (official sample name, GECF library label, seq. run, fastq code, cellranger-arc version, genome assembly, intron setting) — and ships it to the archive with the rest. Non-fatal fallbacks: without an Excel library it writes the same thing as two CSVs, and without python3 it warns and skips. Full step-by-step: see [ARC_pipeline_howto.html](cellranger_pipelines/arc/ARC_pipeline_howto.html).
 
 > The legacy bash driver `CRarc_patched_full (v1.4)` (still in `cellranger_pipelines/arc/`) remains available for the server-datasheet workflow: run it from `/home/gecf/NGS_pipelines/CR_pipeline/CRarc_Multiome`, and it reads every `CR_arc_datasheet*.txt` there, runs `cellranger-arc count` per sample, extracts the joint web summary + CSVs, and rsyncs to the arc archive.
 
 ### multi — CRmulti (v2.11)
 
 TotalSeq / VDJ driver. Must be run from `/home/gecf/NGS_pipelines/CR_pipeline/CRmulti_OCM_VDJ_TotalSeq_FB/`; reads `CR_multi_datasheet*.txt`, runs `cellranger multi` per sample, produces Summary + Summary_metrics_multi.csv, and rsyncs to the multi archive.
+
+### common — custom_gene_report.py
+
+Custom-gene (transgene) expression report (v1.1.0). Given a cellranger `count`
+output and a list of custom-gene names, it writes one **self-contained HTML report**
+(no CDN, fully offline) with one stats table per sample, per-gene plots (UMAP + UMI
+histogram + total-UMI box) and a read-start coverage track; `--project-dir` mode
+adds an "Across samples" comparison block.
+
+```bash
+python3 cellranger_pipelines/common/custom_gene_report.py --sample-dir <sample_dir> --genes genes.txt [-o OUT_FOLDER]
+python3 cellranger_pipelines/common/custom_gene_report.py --project-dir <project_dir> --genes genes.txt [--min-umi N] [--bam BAM] [--per-file N]
+python3 cellranger_pipelines/common/custom_gene_report.py --help
+```
+
+It is run under a plain `python`: if the interpreter you launched it with lacks
+`plotly`/`numpy`/`scipy`, the script transparently re-runs itself under the lab's
+conda `brbseq` env (then `basecaller`) — nothing to activate. Set
+`CGR_NO_ENV_SWITCH=1` to keep the current interpreter. A long gene list splits into
+an index + `…_part01.html`, `…_part02.html`, … (`--per-file`, default 50; `0` = one
+file). The main file is always `custom_genes_<input-dir-name>.html`.
+
+**Where every value comes from.** The cell-count and UMI columns are read entirely
+from `outs/filtered_feature_bc_matrix/`: `features.tsv` (the feature table),
+`barcodes.tsv` (the set of cells called in the sample), and `matrix.mtx` (the sparse
+gene×cell UMI matrix). Two **optional** inputs enrich the report; when absent the
+affected columns/panels degrade to `n/a` (the matrix columns always work):
+- **BAM** — `possorted_genome_bam.bam` / `possorted_bam.bam` /
+  `gex_possorted_bam.bam` in the sample dir, or `--bam`. Source of the
+  *reads (called cells)* column and the read-start coverage track (needs
+  `samtools`; resolved from PATH then the known lab envs).
+- **UMAP projection CSV** — a `barcode,UMAP-1,UMAP-2` file next to the analysis
+  output, auto-detected. Source of the UMAP panel.
+
+**Transgene row vs. endogenous row — the key rule.** For each gene you list, the
+script resolves its row(s) in `features.tsv`:
+- **Transgene row** = the feature whose **ID equals the gene name** (the custom
+  contig you appended; cellranger keeps the contig name as the feature ID).
+  *All* detection/UMI statistics below are read from this row.
+- **Endogenous row** = any *other* feature with the **same name but a different ID**
+  (e.g. an Ensembl ID carrying the gene's display name) — this is the
+  *endogenous cells / endogenous UMIs* context (expression of the same-named
+  endogenous gene).
+- **Status** (judged on the transgene row): `EXPRESSED` = row present and ≥1 cell
+  reaches the detection threshold; `SILENT` = row present but 0 cells reach it;
+  `NO-ROW` = no feature with an ID equal to the gene name exists (the gene was not
+  in the reference used for that run).
+
+**How each reported value is computed.** "Detected" always means a cell's UMI for
+that gene ≥ threshold (`--min-umi`, default 3). `cells_total` = the number of
+barcodes in `barcodes.tsv`.
+
+| Column | Computed as | Source |
+|---|---|---|
+| Detected cells (`cells ≥ N UMI`) | # cells whose transgene-row UMI ≥ threshold | matrix |
+| `% cells` (detected) | detected cells ÷ `cells_total` | matrix + barcodes.tsv |
+| `cells ≥ 1` / `cells ≥ 3` UMI | # cells at that fixed cutoff — a sensitivity check independent of the threshold; the column equal to `--min-umi` is dropped so a count is never shown twice | matrix |
+| `total UMIs` | sum of the transgene row across all cells | matrix |
+| `reads (called cells)` | # **primary** alignments on the gene's contig carrying the gene's `GN:` tag that come from cells in `barcodes.tsv` — **reads, not UMIs** | BAM (`samtools`); `n/a` if no BAM |
+| `mean UMI` | `total UMIs` ÷ # expressing cells (cells with ≥1 UMI — expressing only, not all cells) | matrix |
+| `median UMI` | median of per-cell UMI over expressing cells (≥1 UMI) | matrix |
+| `endogenous cells` | # cells with UMI > 0 in an endogenous (same-name) row | matrix |
+| `endogenous UMIs` | sum of UMI across the endogenous (same-name) rows | matrix |
+
+**Plots (per sample).** One gene selector re-renders the three figures in place
+(one figure of each type, never one per gene): the UMAP (colour = that cell's UMI
+for the selected gene, log10 scale, coordinates from the UMAP CSV); a histogram of
+per-cell UMI of expressing cells (≥1 UMI, log bins); and a box plot of **total
+transcriptome** UMI per cell, split into detected vs not-detected for the selected
+gene. The **read-start coverage** panel is `samtools depth` along the gene's
+transgene contig (one per sample).
+
+Full step-by-step: see
+[custom_gene_report_howto.html](cellranger_pipelines/common/custom_gene_report_howto.html).
 
 ---
 

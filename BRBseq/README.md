@@ -104,8 +104,17 @@ and skips that step rather than aborting.
     family that is a loud warning (the `--plate` file still wins); if the
     workbook has **no `Kit ref` row at all** it is only a quiet one-line
     record and the run continues (`--plate` is authoritative).
-- Sample IDs are used as-is (no sanitization), must not contain `/`, and
-  must not repeat within one manifest; a well may appear at most once.
+- Sample names are canonicalised to a column-safe id with the SAME rules in
+  both manifest modes (whitespace runs and `'/'`, `'\'`, `'-'`, `'.'` become
+  `_`; anything outside `[A-Za-z0-9_]` is dropped; `_`-runs collapsed;
+  capped at 64 chars) — so the same well list produces the same sample
+  names in `--barcode-tsv` and `--libprep-xlsx` mode (e.g.
+  `Astrocytes_TAM cytokines_3` → `Astrocytes_TAM_cytokines_3` in both).
+  The original name is kept in the provenance sidecar's
+  `Sample_raw`/`sample_raw` column.  A name must leave at least one letter
+  or number after cleaning, must not clean to the reserved `Unknown` or a
+  label starting `empty_well`, and two names must not clean to the same id;
+  a well may appear at most once.
 - `--species human|mouse|<custom>`; custom species require
   `--star-genome <genomeDir>` built with `build_star_index.sh`.
 

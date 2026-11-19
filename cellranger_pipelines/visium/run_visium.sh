@@ -150,10 +150,10 @@ PY="$(pick_python)" || {
 mkdir -p "$OUT"
 RUN_NAME="$(basename "${WORKBOOK%.*}")"
 # Compact timestamp slot, uniform with arc/multi/atac.
-TS="$(date +%Y%m%d-%H%M%S)"
+TS="$(date +%Y%m%d_%H%M%S)"
 
 # Leaf folder convention (shared across all four 10xG pipelines):
-#   <AVT>[_<user>]_<YYYYmmdd-HH%M%S>
+#   <AVT>[_<user>]_<YYYYmmdd_HH%M%S>
 # AVT is read from the workbook filename; user is the first word of the
 # "User:" field in the workbook ("" when blank — no placeholder).
 AVT_RUN="$(printf '%s' "$RUN_NAME" | grep -oE 'AVT0[0-9]{3,5}' | head -n 1)"

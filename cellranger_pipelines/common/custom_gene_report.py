@@ -20,8 +20,8 @@ of custom genes and writes a self-contained HTML report with:
       - positive-vs-negative total-UMIs-per-cell depth boxplot, per sample
       - one interactive UMAP per sample: one canvas re-coloured client-side
         as you pick a gene (dropdown; expression view, log10 UMI colour scale)
-      - coverage track along the transgene contig
-        (needs BAM + samtools + coordinate-bearing feature rows)
+      - coverage track on the transgene contig, one per gene: it follows the
+        Gene selector of the interactive plot set (needs BAM + samtools)
 
 Missing optional inputs (BAM, samtools, UMAP coordinates)
 degrade to "n/a" panels. Nothing is required beyond the filtered matrix; Plotly
@@ -386,18 +386,25 @@ def bam_gene_reads(bam, contig, genes, called):
 
 
 def sample_bam_summary(data, genes):
-    """Per-sample BAM summary: transgene contig, base coverage, and reads
-    per gene from called cells.
+    """Per-sample BAM summary: reads per gene (called cells) and a base
+    coverage track on EACH gene's own transgene contig.
 
     Every gene that matches a contig (BAM @SQ name) is scanned on its own
     contig: one `samtools view -r <contig>` pass each, counting primary
-    alignments tagged GN:<gene> from called cells. So ALL genes in the list
-    get their own count -- earlier versions returned after the first
-    matched gene, leaving every other gene's 'reads (called cells)' at 0.
-    The coverage track keeps the first matched contig (single plot per
-    sample, as the renderer expects).
+    alignments tagged GN:<gene> from called cells, and one
+    `samtools depth -a` pass for its coverage track. So ALL genes in the
+    list get their own count AND their own track -- earlier versions
+    stopped after the first matched gene, leaving every other gene's
+    'reads (called cells)' at 0 and only its contig ever plotted.
 
-    Returns a dict {gene, contig, length, depth, reads, contigs_n, no_contig}
+    Returns a dict
+      {reads: {gene: int|None},
+       contigs_n: int,
+       no_contig: bool,                # no listed gene matches any contig
+       genes: {gene: {contig: str, length: int, pos0: int,
+                      depth: [int, ...]}}}
+                      # dense depth from pos0 (empty list = contig present
+                      # but with no aligned reads at all)
     or None when no usable BAM/header is available for this sample.
     """
     bam = data.get("bam")
@@ -410,30 +417,40 @@ def sample_bam_summary(data, genes):
     for bc in data.get("barcodes") or []:      # called cells
         called.add(bc)
         called.add(bc.split("-", 1)[0])        # CB tag without a -N dedup suffix
-    reads = {g: None for g in genes}  # type: dict  # filled later: int | None
-    primary = None                            # first matched gene -> coverage track
+    reads = {g: None for g in genes}
+    tracks = {}
     for g in genes:
         m = match_contig([g], contigs)
         if m is None:
             continue
         gene, cname = m
-        if primary is None:
-            primary = {"gene": gene, "contig": cname,
-                       "length": contigs.get(cname) or 0,
-                       "depth": bam_gene_depth(bam, cname)}
-        gr = bam_gene_reads(bam, cname, [gene], called)
         # A failed BAM scan returns None: keep the gene at None ("n/a" in
         # the table) instead of a silent 0. Genes with no exactly-named
         # contig also stay None.
+        gr = bam_gene_reads(bam, cname, [gene], called)
         if gr is not None:
             reads[gene] = gr.get(gene, 0)
-    if primary is None:
-        return {"gene": genes[0], "contig": None, "length": 0, "depth": None,
-                "reads": None, "contigs_n": len(contigs),
-                "no_contig": True}
-    return {"gene": primary["gene"], "contig": primary["contig"],
-            "length": primary["length"], "depth": primary["depth"],
-            "reads": reads, "contigs_n": len(contigs), "no_contig": False}
+        d = bam_gene_depth(bam, cname)
+        if d:
+            lo, hi = min(d), max(d)
+            # -a makes positions contiguous first->last; encode the dense
+            # stretch as (pos0, [depth...]). Transgene contigs are short;
+            # the cap only guards against a same-named reference contig.
+            if hi - lo < 2_000_000:
+                tracks[gene] = {"contig": cname,
+                                "length": contigs.get(cname) or 0,
+                                "pos0": lo,
+                                "depth": [d.get(i, 0) for i in range(lo, hi + 1)]}
+        else:
+            # contig matched but zero coverage: keep an (empty) track so the
+            # panel can say "present in the BAM, no aligned reads"
+            tracks[gene] = {"contig": cname,
+                            "length": contigs.get(cname) or 0,
+                            "pos0": 1, "depth": []}
+    return {"reads": reads,
+            "contigs_n": len(contigs),
+            "no_contig": not tracks,
+            "genes": tracks}
 
 
 # --------------------------------------------------------------------------- #
@@ -1141,6 +1158,62 @@ function gcrBoxFig(d, gene) {
   if (hidden) meta += ' \u00b7 ' + hidden + ' cell(s) with 0 total UMI are not visible on a log axis';
   return { data: data, layout: layout, meta: meta, cfg: GCR_BOXCFG };
 }
+/* coverage track on the selected gene's own transgene contig: a dense depth
+   array per gene, served in the payload (one `samtools depth -a` pass on its
+   contig at report time). Follows the same Gene selector as the UMAP, the
+   histogram and the box plot. */
+function gcrCovFig(d, gene) {
+  var cov = d.cov;
+  if (!cov) {
+    return { none: true,
+      msg: 'no aligned read file (BAM) found next to this sample\u2019s outputs',
+      meta: '' };
+  }
+  if (cov.no_contig) {
+    return { none: true,
+      msg: 'no contig matching any of the listed genes was found among the ' +
+           (cov.contigs_n || 0) + ' contigs in the BAM',
+      meta: '' };
+  }
+  var t = cov.genes[gene];
+  if (!t) {
+    return { none: true,
+      msg: 'no contig named ' + gene + ' in this sample\u2019s BAM (of ' +
+           (cov.contigs_n || 0) + ' contigs)',
+      meta: '' };
+  }
+  if (!t.depth || !t.depth.length) {
+    return { none: true,
+      msg: 'contig ' + t.contig + ' is present in the BAM but has no aligned ' +
+           'reads (the whole contig is at zero coverage)',
+      meta: 'no reads on ' + t.contig };
+  }
+  var x = new Array(t.depth.length), i, dmax = 0;
+  for (i = 0; i < t.depth.length; i++) {
+    x[i] = t.pos0 + i;
+    if (t.depth[i] > dmax) dmax = t.depth[i];
+  }
+  var layout = gcrCartBase(false);
+  layout.title = gcrTitle(gene + ' \u00b7 coverage on contig ' + t.contig);
+  layout.xaxis.title.text = 'position on contig (bp)';
+  layout.yaxis.title.text = 'coverage (\u00d7)';
+  /* explicit ranges on every render: plotly keeps the previous gene's
+     cached auto-range across Plotly.react (same gene-switch bug the box
+     and histogram work around) */
+  if (t.depth.length) {
+    layout.xaxis.range = [t.pos0, t.pos0 + t.depth.length - 1];
+    layout.xaxis.autorange = false;
+  }
+  if (dmax > 0) { layout.yaxis.range = [0, dmax * 1.12]; layout.yaxis.autorange = false; }
+  var r = cov.reads ? cov.reads[gene] : null;
+  var meta = t.contig + ' \u00b7 ' + t.length + ' bp';
+  if (r != null) meta += ' \u00b7 ' + r + ' reads (called cells)';
+  return { data: [{ type: 'scatter', mode: 'lines', x: x, y: t.depth, name: gene,
+    line: { color: '#818cf8', width: 1.2 },
+    fill: 'tozeroy', fillcolor: 'rgba(99,102,241,0.34)',
+    hovertemplate: 'position %{x} bp \u00b7 coverage %{y}\u00d7<extra>' + gene + '</extra>' }],
+    layout: layout, meta: meta };
+}
 /* across-samples: % cells detected bars + mean UMI dots for the picked gene */
 function gcrBarsFig(a, gene) {
   var vals = (a.det[gene] || []).map(Number);
@@ -1246,6 +1319,10 @@ function umapRender(uid) {
   var bm = document.getElementById('umboxmeta-' + uid);
   if (bm) bm.textContent = b.meta;
   gcrSetFig(document.getElementById('umbox-' + uid), b);
+  var c = gcrCovFig(d, gene);
+  var cm = document.getElementById('umcovmeta-' + uid);
+  if (cm) cm.textContent = c.meta;
+  gcrSetFig(document.getElementById('umcov-' + uid), c);
 }
 function umapSwitch(uid) { umapRender(uid); }
 /* the per-sample inline <script> tags in the body (parsed before this) put each
@@ -1326,9 +1403,35 @@ def _panel(title, fig, meta="", cap=""):
 _UMAP_SEQ = [0]
 
 
+def _cov_seed_meta(games, cov):
+    """Server-rendered placeholder for the coverage meta line, using the first
+    gene (the initial dropdown value). The JS replaces it on load and on every
+    Gene-selector change (gcrCovFig keeps the same wording)."""
+    if cov is None:
+        return "no aligned read file (BAM)"
+    tracks = cov.get("genes") or {}
+    if cov.get("no_contig") or not tracks:
+        return "no matching contig ({} contigs in BAM)".format(
+            cov.get("contigs_n") or 0)
+    for g in games:
+        t = tracks.get(g)
+        if t is None:
+            continue
+        if not t.get("depth"):
+            return "no reads on " + t["contig"]
+        meta = g + " \u00b7 contig " + t["contig"] + " \u00b7 {} bp".format(t["length"])
+        n = (cov.get("reads") or {}).get(g)
+        if n is not None:
+            meta += " \u00b7 {:,} reads (called cells)".format(n)
+        return meta
+    return "no matching contig ({} contigs in BAM)".format(
+        cov.get("contigs_n") or 0)
+
+
 def render_sample_interactive(sample_name, coords, barcodes, bc_total, bc_gene,
-                              genes, threshold, norow=None):
-    """One interactive plot set per sample (UMAP + UMI histogram + total-UMI box).
+                              genes, threshold, norow=None, cov=None):
+    """One interactive plot set per sample (UMAP + UMI histogram + total-UMI box
+    + coverage track on the gene's transgene contig).
 
     In place of one static figure per gene per plot type: one shared payload per
     sample (the UMAP coordinate frame, one UMI vector per gene, per-cell total
@@ -1342,6 +1445,10 @@ def render_sample_interactive(sample_name, coords, barcodes, bc_total, bc_gene,
     from ALL barcodes of the sample (the same population the stats table uses).
     When the UMAP only covers a subset of cells, that coordinate subset is used
     for the UMAP trace alone, and the panel says so (plus a stderr note).
+
+    cov (the sample_bam_summary output, or None without a BAM): the per-gene
+    coverage tracks for this gene batch are embedded in the payload and the
+    coverage panel follows the same Gene selector (gcrCovFig on the JS side).
     """
     have_umap = len(coords or {}) >= 2
     order = [bc for bc in (barcodes or []) if bc]
@@ -1398,6 +1505,17 @@ def render_sample_interactive(sample_name, coords, barcodes, bc_total, bc_gene,
         pl["xs"], pl["ys"], pl["cscale"] = cx, cy, list(_EXPR_SCALE)
         pl["n_umap"] = len(cx)
         pl["umap_umis"] = umap_umis
+    if cov is not None:
+        tracks = cov.get("genes") or {}
+        pl["cov"] = {
+            "no_contig": bool(cov.get("no_contig")),
+            "contigs_n": cov.get("contigs_n") or 0,
+            "reads": {str(g): (cov.get("reads") or {}).get(str(g)) for g in genes},
+            "genes": {str(g): tracks[str(g)] for g in genes if str(g) in tracks},
+        }
+    # seed the coverage meta line server-side (same wording gcrCovFig uses);
+    # the JS overwrites it on load and on every gene switch
+    cov_seed = _cov_seed_meta(genes, cov)
     payload = json.dumps(pl, separators=(",", ":"), ensure_ascii=True)
 
     if have_umap:
@@ -1419,11 +1537,12 @@ def render_sample_interactive(sample_name, coords, barcodes, bc_total, bc_gene,
         '<span class="umap-status" id="umapstatus-' + str(uid) + '"></span>'
         '</div>'
         + umap_host +
-        '<div class="note">The gene selector above re-renders all three plots in place (one of '
+        '<div class="note">The gene selector above re-renders all four plots in place (one of '
         'each type, never one per gene): the UMAP (dark to bright = low to high UMI, '
-        'log10 scale), the histogram of expressing cells, and the total-UMI box '
-        'split by detection status. Drag to zoom, shift-drag to pan, double-click to '
-        'reset; hover a point for its UMI.</div>'
+        'log10 scale), the histogram of expressing cells, the total-UMI box split by '
+        'detection status, and the coverage track on the gene\u2019s transgene contig. '
+        'Drag to zoom, shift-drag to pan, double-click to reset; hover a point for '
+        'its UMI.</div>'
         '<script type="application/json" id="umapdata-' + str(uid) + '">' + payload + '</script>'
         '<script>(function(){'
         'var el=document.getElementById("umapdata-' + str(uid) + '");if(!el)return;'
@@ -1451,23 +1570,18 @@ def render_sample_interactive(sample_name, coords, barcodes, bc_total, bc_gene,
         '(log scale). Follows the Gene selector above.</div>'
         '</div>'
         '</div>'
+        '<div class="panel" style="margin-bottom:16px">'
+        '<div class="panel-h"><span class="t"><span class="sw"></span>'
+        'Coverage on the transgene contig</span>'
+        '<span class="m" id="umcovmeta-' + str(uid) + '">' + html.escape(cov_seed) + '</span></div>'
+        '<div id="umcov-' + str(uid) + '"></div>'
+        '<div class="note">Follows the Gene selector: aligned-read base coverage on the '
+        "selected gene's own transgene contig (from the BAM, not the matrix). "
+        "10x 3' data is expected to pile up toward the 3' end; coverage counts all "
+        'barcodes and excludes duplicate-flagged reads, so it will not reconcile '
+        'with the "reads (called cells)" column.</div>'
+        '</div>'
     )
-
-
-def _fig_coverage(depth, label):
-    if not depth:
-        return None
-    pos = sorted(depth)
-    vals = [depth[p] for p in pos]
-    hover = "position %%{x} bp \u00b7 coverage %%{y}\u00d7<extra>%s</extra>" % html.escape(label)
-    fig = go.Figure(go.Scatter(
-        x=pos, y=vals, mode="lines", fill="tozeroy",
-        fillcolor="rgba(99,102,241,0.34)", line=dict(color="#818cf8", width=1.5),
-        hovertemplate=hover,
-    ))
-    return _plotly_theme(fig, "Coverage on the transgene contig",
-                         x_title="position on contig (bp)", y_title="coverage (\u00d7)",
-                         height=320)
 
 
 def match_contig(genes, contigs):
@@ -1693,58 +1807,17 @@ def render_plots(plot_data, genes, threshold, coverage=True):
                    + _chip("detection threshold", "\u2265 %g UMI per cell" % threshold) + "</div>")
 
         # one gene-driven plot set per sample (one UMAP, one hist of expressing
-        # cells, one total-UMI box): the client-side Gene selector re-renders all
-        # three in place, so the DOM keeps exactly one figure per plot type no
-        # matter how many genes are inspected (never one figure per gene again).
+        # cells, one total-UMI box, one coverage track on the transgene
+        # contig): the client-side Gene selector re-renders all four in place,
+        # so the DOM keeps exactly one figure per plot type no matter how many
+        # genes are inspected (never one figure per gene again).
         norow = {str(g) for g in genes
                  if (stats.get(g) or {}).get("row_present") is False}
         out.append(render_sample_interactive(sid, coords, p.get("barcodes") or [],
                                              bc_total, bc_gene,
-                                             genes, threshold, norow))
-
-    if coverage:
-        out.extend(_cov_blocks(plot_data))
+                                             genes, threshold, norow,
+                                             cov=p.get("cov") if coverage else None))
     return "\n".join(out)
-
-
-def _cov_blocks(plot_data):
-    """Transgene-locus coverage panels (a short contig per sample; kept light
-    on purpose so it can also live in the index file without adding weight)."""
-    out = []
-    cov_done = False
-    for p in plot_data:
-        cov = p.get("cov")
-        if cov is None:
-            continue
-        g = cov.get("gene") or ""
-        if cov.get("no_contig"):
-            out.append(_panel("Coverage \u00b7 " + g, None,
-                              "no contig matching any of the listed genes "
-                              "was found among the {} contigs in the aligned "
-                              "read file (BAM)".format(cov.get("contigs_n") or 0)))
-            continue
-        if cov.get("depth"):
-            out.append(_panel(
-                "Coverage \u00b7 " + g, _fig_coverage(cov["depth"], g),
-                'contig {} \u00b7 {:,} bp \u00b7 sample {}'.format(
-                    html.escape(cov.get("contig") or ""), cov.get("length") or 0,
-                    html.escape(p.get("id") or "")),
-                cap="10x 3' data is expected to pile up toward the 3' end; "
-                    "coverage counts all barcodes and excludes duplicate-flagged "
-                    "reads, so it will not reconcile with the "
-                    "\u201creads (called cells)\u201d column."))
-            cov_done = True
-        else:
-            out.append(_panel("Coverage \u00b7 " + g, None,
-                              "no aligned reads were found on contig " + (cov.get("contig") or "")))
-    if not cov_done and not any(p.get("bam") for p in plot_data):
-        out.append('<p class="note">Coverage plot skipped: no aligned read file (BAM) '
-                   'was found next to the sample outputs.</p>')
-    return out
-
-
-def render_coverage(plot_data):
-    return "\n".join(_cov_blocks(plot_data))
 
 
 def render_detail_nav(parts, total_genes):
@@ -1916,9 +1989,10 @@ def main(argv=None):
     ap.add_argument("--per-file", type=int, default=50,
                     help="max transgenes per plot detail file. When the gene list is "
                          "longer than this, the report is split into an index (tables for "
-                         "all genes + coverage tracks) plus N detail files (each with the "
-                         "tables for its batch plus the plots, this many per file). "
-                         "0 = one combined file (never split)")
+                         "all genes + links) plus N detail files (each with the tables for "
+                         "its batch plus the interactive plots, incl. the per-gene "
+                         "coverage tracks, this many per file). 0 = one combined file "
+                         "(never split)")
     ap.add_argument("--version", action="version", version=VERSION)
     ap.add_argument("-h", "--help", action="help",
                     help="show this help message and exit")
@@ -1976,8 +2050,9 @@ def main(argv=None):
                   file=sys.stderr, flush=True)
         data = compute_sample(s["sample_dir"], s.get("bam"), genes, args.min_umi)
         data["id"] = sid
-        # per sample: `samtools depth` for the coverage track, plus one
-        # `samtools view -r` pass for the read count in called cells
+        # per matched gene (on its own contig): one `samtools view -r` pass for
+        # the read count in called cells, and one `samtools depth -a` pass for
+        # the coverage track shown under the Gene selector
         cov = sample_bam_summary(data, genes)
         data["cov"] = cov
         if cov and cov.get("reads"):
@@ -2045,12 +2120,12 @@ def main(argv=None):
                 "lo": b * per_file + 1,
                 "hi": b * per_file + len(genes_b),
             })
-        # index: full tables (all genes) + light coverage + links to the parts
+        # index: full tables (all genes) + links to the parts. The per-gene
+        # coverage tracks live in the detail files (inside the interactive plot
+        # set, driven by the Gene selector), so the index stays tables-only.
         sections_idx = list(sections)
         sections_idx.insert(1, render_detail_nav(parts, n_g))
-        texts.append((index_path,
-                      render_html(title, meta, sections_idx,
-                                  render_coverage(plot_data))))
+        texts.append((index_path, render_html(title, meta, sections_idx, "")))
         # detail files: the interactive plots, batched, each self-contained
         for p in parts:
             genes_b = p["genes"]
@@ -2062,7 +2137,7 @@ def main(argv=None):
                       else "genes: " + ", ".join(genes_b) for ln in meta]
             title_b = (f"Custom gene expression \u00b7 {p['label']} "
                        f"({p['lo']}\u2013{p['hi']} of {n_g})")
-            plots_b = render_plots(plot_data, genes_b, args.min_umi, coverage=False)
+            plots_b = render_plots(plot_data, genes_b, args.min_umi, coverage=True)
             texts.append((os.path.join(out_dir, p["fname"]),
                           render_html(title_b, meta_b, sections_b, plots_b)))
 
