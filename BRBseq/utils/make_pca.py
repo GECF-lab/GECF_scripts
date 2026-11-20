@@ -34,6 +34,14 @@ VERSION = "1.0.0"
 # (wells) is greater than this threshold.
 MIN_TOTAL_COUNTS = 5
 
+# Default number of highly-variable genes selected (Seurat flavour, on the
+# log-norm scale).
+N_HVG = 1500
+
+# Default number of principal components kept for the PC1/PC2 plots and
+# the elbow chart.
+N_PC = 15
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input_csv", help="genes x wells UMI count CSV")
@@ -42,8 +50,10 @@ def main():
                     help="output directory (default: <input_dir>/pca_<matrixname>/)")
     ap.add_argument("--min-total-counts", type=int, default=MIN_TOTAL_COUNTS,
                     help="keep genes whose TOTAL count across all wells > this (default 5)")
-    ap.add_argument("--n-hvg",        type=int,   default=1500)
-    ap.add_argument("--n-pc",         type=int,   default=15)
+    ap.add_argument("--n-hvg",        type=int,   default=N_HVG,
+                    help="number of highly variable genes to keep (default " + str(N_HVG) + ")")
+    ap.add_argument("--n-pc",         type=int,   default=N_PC,
+                    help="number of principal components to compute (default " + str(N_PC) + ")")
     a = ap.parse_args()
 
     if not os.path.exists(a.input_csv):

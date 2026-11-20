@@ -16,7 +16,7 @@ single alignment.
 
 | File | Purpose |
 |---|---|
-| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.4.0) |
+| `brbseq_pipeline.sh` | Core single-pool pipeline (this README documents v1.5.0) |
 | `build_star_index.sh` | One-time STAR genomeDir build (Mercurius guide 1.1; no Ensembl fetch) |
 | `brbseq-env.yaml` | Conda environment (`brbseq`) — STAR, samtools, fastqc, picard, fqtk, RSeQC tools, python/openpyxl |
 | `utils/prepare_barcodes.sh` | Builds `barcode_whitelist.txt` + demux maps from the manifest (TSV `Sample_ID` → `bar`) |
@@ -58,7 +58,7 @@ conda env create -f brbseq-env.yaml   # creates env 'brbseq'
 | `fastqc` | read-quality QC |
 | `samtools` | index/BAM manipulation |
 | `read_distribution.py` | RSeQC read-length distribution |
-| `picard` | `FilterSamReads` — per-sample BAM demux (writes `demux_bam/`) |
+| `picard` | `FilterSamReads` — per-sample BAM demux (writes `demux_bam/`; **off by default**, enable with `--demux-bam`) |
 | `fqtk` | per-sample FASTQ demux (writes `demux_fastq/`; on by default, disable with `--skip-dmux-fq`) |
 | `python` + `openpyxl` | workbook mode + UMI dedup (needs Python **3.7+**) |
 | `java` (OpenJDK, shipped with the `brbseq` Conda env) | runs **FastReadCounter** (the jar is outside Conda — a production-system file at `/home/gecf/softwares/FastReadCounter/`) |

@@ -11,7 +11,7 @@
 #   STARsolo alignment + counts     [MANDATORY ]  STAR
 #   Read distribution (RSeQC)       [ON by default]  off: --skip-rseqc
 #   Duplication statistics          [MANDATORY ]  get_duplication_statistics.py
-#   BAM demultiplex (picard)        [ON by default]  off: --skip-dmux-bam
+#   BAM demultiplex (picard)        [OFF by default]  on: --demux-bam
 #   FASTQ demultiplex (fqtk)        [ON by default]  off: --skip-dmux-fq
 #   PCA of the UMI matrix           [ON by default]  off: --skip-pca
 #   Merge multi-lane FASTQ          [note       ]  pre-merge or comma-list
@@ -48,9 +48,10 @@
 #     (helper scripts are resolved from ./utils, shipped with this directory).
 #   * Re-runnable: a step is skipped when its output already exists
 #     (re-run the same command to continue; finished steps are skipped).
-#   * The optional steps (FASTQ QC, RSeQC, BAM demux, FASTQ demux) are ON by
-#     default (disable each with its --skip-* flag); a missing tool causes
-#     that step to log a warning and skip rather than abort the run.
+#   * The optional steps (FASTQ QC, RSeQC, FASTQ demux) are ON by default
+#     (disable each with its --skip-* flag); BAM demux (picard) is the
+#     exception — OFF by default, enable with --demux-bam. A missing tool
+#     causes that step to log a warning and skip rather than abort the run.
 #
 #   Output layout (v1.2.0+)
 #     <out-dir>/BRBseq_<run-name>_<timestamp>/     <- project parent (timestamped)
@@ -62,7 +63,7 @@
 set -euo pipefail
 
 #--- constants ---------------------------------------------------------------
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTILS_DIR="${UTILS_DIR:-${SCRIPT_DIR}/utils}"
 PREPARE_BARCODES="${UTILS_DIR}/prepare_barcodes.sh"
@@ -99,18 +100,17 @@ REFS=(
 BED_FILE=""                      # RSeQC BED12
 OUT_DIR="${OUT_DIR:-/mnt/data/BRB-seq_output}"
 MANIFEST_HEADER=1                # resolved to 1 (header row) or 0 (none) from auto-detection
-# Optional analyses are ON by default: fastqc, read_distribution
-# (RSeQC), BAM demux (picard), FASTQ demux (fqtk).  Disable any of them
-# with --skip-fastq / --skip-rseqc / --skip-dmux-bam / --skip-dmux-fq.
-# Disable any of them with --skip-fastq / --skip-rseqc / --skip-dmux-bam /
-# --skip-dmux-fq.
+# Optional analyses are ON by default: fastqc, read_distribution (RSeQC),
+# FASTQ demux (fqtk).  Disable any of them with --skip-fastq / --skip-rseqc
+# / --skip-dmux-fq.  BAM demux (picard) is the exception: OFF by default —
+# enable it with --demux-bam.
 RUN_OPT_FASTQ="${RUN_OPT_FASTQ:-1}"
 RUN_OPT_RSEQC="${RUN_OPT_RSEQC:-1}"
-RUN_OPT_DEMUX_BAM="${RUN_OPT_DEMUX_BAM:-1}"
+RUN_OPT_DEMUX_BAM="${RUN_OPT_DEMUX_BAM:-0}"
 RUN_OPT_DEMUX_FQ="${RUN_OPT_DEMUX_FQ:-1}"
 RUN_OPT_PCA="${RUN_OPT_PCA:-1}"
-# did the user pass the --skip-* opt-out for each?
-S_FASTQ=0; S_RSEQC=0; S_DMBAM=0; S_DMFQ=0; S_PCA=0
+# did the user pass the --skip-* opt-out (or --demux-bam opt-in) for each?
+S_FASTQ=0; S_RSEQC=0; O_DMBAM=0; S_DMFQ=0; S_PCA=0
 # Alithea BRB-seq production SAM tag set (fixed, not user-configurable).
 SAM_ATTRS="NH HI nM AS CR UR CB UB GX GN sS sQ sM"
 RESUME_DIR="${RESUME_DIR:-}"     # --resume-dir: target an existing run dir in place
@@ -202,7 +202,7 @@ OPTIONAL FLAGS
                         folder also works.
   --skip-fastq          skip fastqc  (on by default)
   --skip-rseqc          skip read_distribution  (on by default)
-  --skip-dmux-bam       skip picard BAM demux  (on by default)
+  --demux-bam           run picard BAM demux  (OFF by default)
   --skip-dmux-fq        skip fqtk FASTQ demux  (on by default)
   --skip-pca            skip the per-run PCA plots of the UMI matrix (on by default)
   --dry-run             emit planned commands and exit (no side effects)
@@ -254,7 +254,7 @@ while [[ $# -gt 0 ]]; do
     --skip-dmux-fq) S_DMFQ=1;                                         shift;;
     --skip-fastq)   S_FASTQ=1;                                        shift;;
     --skip-rseqc)   S_RSEQC=1;                                        shift;;
-    --skip-dmux-bam)S_DMBAM=1;                                        shift;;
+    --demux-bam)    O_DMBAM=1;                                          shift;;
     --skip-pca)     S_PCA=1;                                          shift;;
     --resume-dir)   RESUME_DIR="${2:?missing --resume-dir value}";    shift 2;;
     --dry-run)      DRY_RUN=1;                                        shift;;
@@ -265,10 +265,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-#--- apply --skip-* opt-outs (steps run by default otherwise) ---------------
+#--- apply --skip-* opt-outs (BAM demux is an opt-IN via --demux-bam) --------
 [[ "$S_FASTQ"  -eq 1 ]] && RUN_OPT_FASTQ=0
 [[ "$S_RSEQC"  -eq 1 ]] && RUN_OPT_RSEQC=0
-[[ "$S_DMBAM"  -eq 1 ]] && RUN_OPT_DEMUX_BAM=0
+[[ "$O_DMBAM"  -eq 1 ]] && RUN_OPT_DEMUX_BAM=1
 [[ "$S_DMFQ"   -eq 1 ]] && RUN_OPT_DEMUX_FQ=0
 [[ "$S_PCA"    -eq 1 ]] && RUN_OPT_PCA=0
 
@@ -1635,7 +1635,7 @@ if [[ "$RUN_OPT_DEMUX_BAM" -eq 1 ]]; then
     fi
   fi
 else
-  log ""; log "BAM demux — skipped (--skip-dmux-bam)"
+  log ""; log "BAM demux — skipped (off by default; pass --demux-bam to run it)"
 fi
 
 #=== Sample demultiplex (FASTQ, fqtk)  [OPTIONAL] ==========================
