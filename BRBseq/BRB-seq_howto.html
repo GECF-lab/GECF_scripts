@@ -265,7 +265,7 @@ D09	W3_SH_DOX_2</code></pre>
   <tr><td><code>--plate</code></td><td><strong>required</strong> (both modes)</td><td>Well-matched barcode plate file (<code>A01</code>…<code>H12</code> + 14-nt barcode per line). The barcodes always come from this file; in workbook mode the workbook's <em>Kit ref</em> row is only cross-checked against it (a mismatch is a warning — the given plate wins)</td></tr>
   <tr><td><code>--skip-fastq</code></td><td class="opt">optional</td><td>Skip the FastQC step. The step runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-rseqc</code></td><td class="opt">optional</td><td>Skip the RSeQC read-distribution step. The step runs by default; add this flag to turn it off</td></tr>
-  <tr><td><code>--skip-dmux-bam</code></td><td class="opt">optional</td><td>Skip the per-sample BAM demux (picard) — the slowest step. It runs by default; add this flag to turn it off</td></tr>
+  <tr><td><code>--demux-bam</code></td><td class="opt">optional</td><td>Run the per-sample BAM demux (picard) — the slowest step. It is <strong>off by default</strong> (v1.5.0+); add this flag to turn it on</td></tr>
   <tr><td><code>--skip-dmux-fq</code></td><td class="opt">optional</td><td>Skip the per-sample FASTQ demux (fqtk). It runs by default; add this flag to turn it off</td></tr>
   <tr><td><code>--skip-pca</code></td><td class="opt">optional</td><td>Turn off the PCA-of-the-UMI-matrix step (v1.3.0). It runs by default; add this flag to turn it off. Needs <code>scanpy</code> in the <code>brbseq</code> env</td></tr>
   <tr><td><code>--dry-run</code></td><td class="opt">optional</td><td>Show what would happen without creating any files</td></tr>
@@ -343,9 +343,11 @@ read from that run's <code>pipeline.log</code>:
 </div>
 <p>
 Times scale with your data: double the reads → FastQC / STAR / RSeQC roughly double;
-double the samples → BAM demux roughly doubles. Plan on the picard step as the long pole —
-if you only need the expression matrices you can skip the demux steps entirely
-(<code>--skip-dmux-bam --skip-dmux-fq</code>) and cut the run to about <strong>1 hour</strong>.
+double the samples → BAM demux roughly doubles (only if you turn it on with
+<code>--demux-bam</code>). The picard step is the long pole when enabled —
+if you only need the expression matrices, simply don't pass <code>--demux-bam</code>
+(and add <code>--skip-dmux-fq</code> to drop the FASTQ demux too) and cut the run to about
+<strong>1 hour</strong>.
 </p>
 
 <h2 id="outputs">5. Reading the outputs</h2>

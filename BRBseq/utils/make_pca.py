@@ -19,6 +19,7 @@
 #
 #  USAGE:   python make_pca.py <umi_matrix.csv> --outdir DIR
 #          [--n-hvg 1500] [--n-pc 15] [--min-total-counts 5]
+#          [--samples S1,S2,S3 | --samples-file samples.txt]   # PCA on a sample subset
 # =============================================================================
 import argparse, os, sys
 import numpy as np
@@ -54,10 +55,29 @@ def main():
                     help="number of highly variable genes to keep (default " + str(N_HVG) + ")")
     ap.add_argument("--n-pc",         type=int,   default=N_PC,
                     help="number of principal components to compute (default " + str(N_PC) + ")")
+    ap.add_argument("--samples", default=None,
+                    help="comma-separated sample names to subset the PCA to, "
+                         "e.g. --samples 'CD11b 4_TR,ASCA2 5_Ctrl' (default: all samples)")
+    ap.add_argument("--samples-file", default=None,
+                    help="file with one sample name per line (blank lines and # comments ignored); "
+                         "alternative to --samples")
     a = ap.parse_args()
 
     if not os.path.exists(a.input_csv):
         sys.exit("Input not found: " + a.input_csv)
+    # ---- resolve optional sample subset ------------------------------------
+    sel = None
+    if a.samples:
+        sel = [s.strip() for s in a.samples.split(",") if s.strip()]
+        if not sel:
+            sys.exit("--samples given but empty (e.g. --samples '').")
+    elif a.samples_file:
+        if not os.path.exists(a.samples_file):
+            sys.exit("--samples-file not found: " + a.samples_file)
+        with open(a.samples_file) as fh:
+            sel = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
+        if not sel:
+            sys.exit("--samples-file has no sample names in it.")
     outdir = a.outdir or os.path.normpath(os.path.join(
         os.path.dirname(os.path.abspath(a.input_csv)),
         "pca_viz_" + os.path.basename(a.input_csv).replace(".csv", "")))
@@ -71,6 +91,8 @@ def main():
         if pool.endswith(_suffix):
             pool = pool[:-len(_suffix)]
             break
+    if sel is not None and a.outdir is None:
+        pool = pool + "_sub"    # keep default subset outputs out of the full-matrix dir
     print("INPUT ", a.input_csv); print("OUTPUT", outdir)
     print("make_pca.py v" + VERSION)
 
@@ -85,7 +107,17 @@ def main():
         key, symb = "Gene_name", "Gene_name"   # gene name used as both id and label
     else:
         sys.exit("Unknown layout. First cols: " + ",".join(list(raw.columns)[:4]))
-    wells = [c for c in raw.columns if c not in (key, symb)]
+    wells_all = [c for c in raw.columns if c not in (key, symb)]
+    if sel is None:
+        wells = wells_all
+    else:
+        missing = [w for w in sel if w not in set(wells_all)]
+        if missing:
+            sys.exit("subset sample name(s) NOT in matrix: " + ", ".join(missing) +
+                     "\nsamples in this matrix: " + ", ".join(wells_all))
+        selset = set(sel)
+        wells = [c for c in wells_all if c in selset]   # matrix order, so plots line up
+        print(f"SUBSET: keeping {len(wells)} of {len(wells_all)} samples: " + ", ".join(wells))
     gid   = list(raw[key])
     symb  = list(raw[symb])
     if len(set(gid)) != len(gid):
