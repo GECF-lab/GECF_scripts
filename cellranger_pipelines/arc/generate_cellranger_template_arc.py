@@ -99,7 +99,7 @@ from common.intake import (
 # ``-v``/``--version``.  Generator version == generated-script version;
 # the .sh kept in the archive tells you which one produced it.
 # Bump on any change to the generator.
-SCRIPT_VERSION = "1.2.4"
+SCRIPT_VERSION = "1.3.0"
 
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc"
 
@@ -868,16 +868,6 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     # conditional below simply omits the ``_user`` segment.
     L.append("user='" + folder_safe(user or "") + "'")
     L.append("")
-    # Absolute path of THIS script, captured at the very top — BEFORE the
-    # arc_sample_<i> functions `cd` into ${Server_folder}.  A relative
-    # BASH_SOURCE[0] is resolved against the CWD *at use time*, and by the
-    # KEEP-A-COPY step below (item 8b) the CWD is ${Server_folder}, not the
-    # folder the script lives in — so a same-time BASH_SOURCE lookup silently
-    # no-ops and the .sh never lands in the working/archive folders.
-    L.append('# Absolute path of this script (captured before any cd — used by the self-preserve step)')
-    L.append('_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"')
-    L.append('if [ ! -f "${_SELF_PATH}" ]; then _SELF_PATH="${BASH_SOURCE[0]:-$0}"; fi')
-    L.append("")
 
     # ---- 2) RUN-WIDE PARAMETERS (editable block) -----------------------------------------------
     L.append("# ============================================================")
@@ -1033,9 +1023,6 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
 
         L.append(f"# --- arc_sample_{idx}() — Sample {idx}: {base}  ({n_gex} GEX + {n_atac} ATAC) ---")
         L.append(f"arc_sample_{idx}() {{")
-        # cellranger-arc uses --id=<sample> and a relative --libraries=, so it
-        # MUST run from inside the Server_folder (its CWD becomes the run root).
-        L.append('    cd "${Server_folder}"')
 
         # Build the libraries CSV (one row per library)
         L.append(f'    csv_path="${{Server_folder}}/{csv_name}"')
@@ -1052,7 +1039,13 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             f'    --id={run_name}',
             f'    --description={desc}',
             '    --reference="${REFPATH}"',
-            f'    --libraries={csv_name}',
+            # absolute --libraries path (the CSV is written into Server_folder
+            # just above this command) — no cd needed
+            f'    --libraries="${{Server_folder}}/{csv_name}"',
+            # --output-dir pins the run folder to the exact layout a cd-based
+            # invocation used to produce (run root = Server_folder/<id>),
+            # without ever moving the main shell's CWD
+            f'    --output-dir="${{Server_folder}}/{run_name}"',
             # CPU/memory caps are run-wide (localcores / localmem), not per-sample
             '    ${localcores:+--localcores=$localcores}',
             '    ${localmem:+--localmem=$localmem}',
@@ -1389,9 +1382,17 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("#   (local working dir + central archive) so the exact pipeline is")
     L.append("#   preserved with the results.")
     L.append("# ============================================================")
-    # Use ${_SELF_PATH} (absolute, captured at script top before any `cd`) —
-    # a relative BASH_SOURCE[0] fails the -f test once the arc_sample_<i>
-    # functions have cd'd into ${Server_folder}, so the copy silently no-ops.
+    # Self-resolve THIS script to an absolute path right where it is used —
+    # this far down the script nothing has `cd`'d in the main shell (the
+    # arc_sample_<i> functions call cellranger-arc count with --output-dir
+    # and the md5sum step runs in a subshell), so a relative BASH_SOURCE[0]
+    # still means "launched from here".  Kept here (not at the top) because
+    # it is plumbing, not a user-editable parameter.  NOTE: if a bare `cd`
+    # is ever added to the main flow ABOVE this point, the relative name
+    # breaks — then move this capture above that `cd` instead.
+    L.append('# Path of this script as an absolute path, resolved against the launch directory')
+    L.append('_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"')
+    L.append('if [ ! -f "${_SELF_PATH}" ]; then _SELF_PATH="${BASH_SOURCE[0]:-$0}"; fi')
     L.append('if [ -n "${_SELF_PATH:-}" ] && [ -f "${_SELF_PATH}" ]; then')
     L.append('    cp "${_SELF_PATH}" "${Server_folder}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
     L.append('    cp "${_SELF_PATH}" "${archive_dir}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')

@@ -54,11 +54,14 @@ Reference genome:
 Generated script (cellranger-atac_<AVT>.sh), top to bottom:
     1.  Header / constants: requester, timestamp, reference, AVT run,
         scriptversion stamp, editable RUN-WIDE PARAMETERS (keepdata,
-        max_parallel, scratch_root, server_folder_name, NGSruns_archive).
+        max_parallel, localcores, localmem, scratch_root,
+        server_folder_name, NGSruns_archive).
     2.  FASTQ PATHS: one variable per sample FASTQ, resolved at generation
         time (empty + FIXME_LOCATE marker when unresolved).
-    3.  PER-SAMPLE PARAMETERS: localcores / localmem / custom_options,
-        one editable block per sample (blank a value to drop the flag).
+    3.  PER-SAMPLE PARAMETERS: custom_options, one editable block per
+        sample (blank a value to drop the flag). CPU/memory caps are
+        run-wide (localcores / localmem in RUN-WIDE PARAMETERS), matching
+        the GEX/ARC generators — they are NOT per-sample.
     4.  One ``atac_sample_<i>()`` function per sample: runs
         ``cellranger-atac count`` (flags from its parameter block), checks
         for leftover tmp folders, deletes the non-essential SC_ATAC_COUNTER_CS
@@ -161,7 +164,7 @@ DELETE_FALLBACK = (
 # (scriptversion=...) and into the script's own source as SCRIPT_VERSION.
 # Generator version == generated-script version; the kept .sh in the archive
 # tells you which one produced it.  Bump on any change to the generator.
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.3.2"
 
 # ---------------------------------------------------------------------------
 # Reference genomes (auto-detected from the live filesystem, GEX/ARC pattern)
@@ -253,11 +256,10 @@ def latest_avt(avt_names):
 # the ATAC-relevant ones; cellranger-atac has no --create-bam /
 # --cell-annotation-model (GEX/ARC-only). ATAC-specific tuning goes in
 # custom_options — only pass flags this cellranger-atac build accepts.
+# CPU/memory caps are NOT per-sample (GEX/ARC convention): localcores /
+# localmem are run-wide, emitted in the RUN-WIDE PARAMETERS block and baked
+# into the generated script from the shared imports below.
 _ATAC_PER_SAMPLE_PARAMS = (
-    ("localcores", LOCAL_CORES,
-     "number of cores, or blank (cellranger default)"),
-    ("localmem", LOCAL_MEM,
-     "memory in GB, or blank (cellranger default)"),
     ("custom_options", "",
      "extra flags as-is, e.g. --chemistry=ARC-v1  --peaks=/refs/peaks.bed"),
 )
@@ -291,40 +293,102 @@ def _run_details_name(name: str) -> bool:
     return name.lower().replace("-", "_").strip() == "user_x1x_copy"
 
 
-def parse_xlsx(path: str):
-    """Return (list_of_pairs, detected_avt).
+def _locate_header(ws, merged):
+    """Return ``(fastq_col, sample_col, header_row)`` or ``(None, None, None)``.
 
-    ``list_of_pairs`` items are ``(sample, fastq, per_row_avt)`` —
-    ``per_row_avt`` is the AVT named on that row (or None when the row
-    names no run).
-
-    Parsing rules:
-      * data sheet: first (per ranked_sheet_names) sheet that has a row where
-        the first cell is a sample name (not blank, not the word "name");
-        the sheet whose data rows look the most complete wins when multiple
-        sheets qualify (the one with most rows is preferred).
-      * fastq cell is OPTIONAL:
-          - fastq ID present  -> use it (path may still be given)
-          - fastq ID blank    -> use the FASTQ PATH cell as the leaf directory
-                                 (it must exist on the analysis server; the
-                                 generator resolves it under the AVT tree when
-                                 possible, otherwise the script keeps the path
-                                 and flags it for review)
-          - both blank        -> the row is skipped with a warning.
-      * AVT cell is OPTIONAL: when blank, the AVT run detected from the file
-        name / the run_details sheet is used.
+    The GECF submission layout marks the sample table with a header row that
+    names both the fastq-ID column (``GECF fastq ID (avidxxxx)``) and the
+    ``Sample name`` column.  Column positions therefore come from the header
+    cells (case/whitespace-insensitive via ``norm``), never from fixed
+    A/B/C/D assumptions — ARC-parity.
     """
-    # Note: NOT read_only — build_merged_cell_lookup() needs
-    # ws.merged_cells.ranges, which openpyxl only exposes on live worksheets
-    # (same load style as the GEX generator).
-    wb = openpyxl.load_workbook(path, data_only=True)
+    max_row = ws.max_row or 0
+    for row_idx in range(1, min(25, max_row) + 1):
+        fastq_col = sample_col = None
+        for col_idx in range(1, ws.max_column + 1):
+            v = norm(get_cell_value(ws, merged, row_idx, col_idx))
+            if fastq_col is None and "fastq id" in v and "avid" in v:
+                fastq_col = col_idx
+            if sample_col is None and "sample name" in v:
+                sample_col = col_idx
+        if fastq_col is not None and sample_col is not None:
+            return fastq_col, sample_col, row_idx
+    return None, None, None
+
+
+def _row_avt(ws, merged, row_idx, fastq_col, sample_col):
+    """Per-row AVT run name (parity item 11, shared with the ARC generator).
+
+    The run name may sit in any cell of the table row except the fastq-ID /
+    sample-name columns (which carry the avid id / the sample label, not
+    the run).  Returns the upper-cased run name (``AVT0XXX``) or ``None``
+    when this row does not name a run.
+    """
+    for col_idx in range(1, ws.max_column + 1):
+        if col_idx in (fastq_col, sample_col):
+            continue
+        val = get_cell_value(ws, merged, row_idx, col_idx)
+        if val is None:
+            continue
+        m = AVT_PATTERN.search(str(val))
+        if m:
+            return m.group(0).upper()
+    return None
+
+
+def _sheet_rows_header_driven(ws, merged):
+    """Extract (sample, fastq, avt) triples from one GECF sample table.
+
+    Returns ``[]`` when the sheet does not carry the header row (fastq-ID
+    column + Sample name).  Rows are collected below the header until the
+    table ends: a ``Run details`` row, or two consecutive non-data rows.
+    """
+    fastq_col, sample_col, header_row = _locate_header(ws, merged)
+    if fastq_col is None or sample_col is None:
+        return []
+
+    data_start = header_row + 1
+    for rng in ws.merged_cells.ranges:
+        if (rng.min_row <= header_row <= rng.max_row
+                and ((rng.min_col <= fastq_col <= rng.max_col)
+                     or (rng.min_col <= sample_col <= rng.max_col))):
+            data_start = max(data_start, rng.max_row + 1)
+
+    rows = []
+    blank_streak = 0
+    for row_idx in range(data_start, ws.max_row + 1):
+        sample_val = get_cell_value(ws, merged, row_idx, sample_col)
+        fastq_val = get_cell_value(ws, merged, row_idx, fastq_col)
+        sample_txt = str(sample_val).strip() if sample_val is not None else ""
+        fastq_txt = str(fastq_val).strip() if fastq_val is not None else ""
+
+        if "run details" in norm(sample_txt) or "run details" in norm(fastq_txt):
+            break
+
+        if sample_txt and fastq_txt and FASTQ_ID_PATTERN.match(fastq_txt):
+            rows.append((sample_txt, fastq_txt,
+                         _row_avt(ws, merged, row_idx, fastq_col, sample_col)))
+            blank_streak = 0
+        else:
+            if sample_txt and not fastq_txt:
+                print(f"  Warning: sample '{sample_txt}' has no valid fastq "
+                      f"ID — row skipped.")
+            blank_streak += 1
+            if rows and blank_streak >= 2:
+                break
+    return rows
+
+
+def _parse_positional(wb):
+    """Legacy positional fallback: col A sample, col B fastq, col C FASTQ
+    path, col D AVT — the pre-GECF-template layout.  Used only when no
+    sheet exposes the fastq-ID / Sample-name header row (keeps the old
+    behaviour byte-for-byte for such workbooks).
+    """
 
     def is_blank(v) -> bool:
         return v is None or (isinstance(v, str) and v.strip() == "")
 
-    # Header-row detection via the shared ``norm`` canonical form (the same
-    # role it plays in the gex/arc generators): ``Sample  Name`` /
-    # ``run_details`` / ``run details`` all match the way a human typed them.
     def _is_header_text(text: str) -> bool:
         n = norm(text)
         return ("sample" in n) or ("run details" in n)
@@ -337,7 +401,6 @@ def parse_xlsx(path: str):
 
     for sheet_name in ranked_sheet_names(wb):
         ws = wb[sheet_name]
-        merged = build_merged_cell_lookup(ws)
         rows = list(ws.iter_rows(values_only=True))
         score = 0
         for r in rows[:10]:
@@ -351,12 +414,11 @@ def parse_xlsx(path: str):
                     if m and not avt_from_sheet:
                         avt_from_sheet = m.group()
         # Count candidate data rows (sample cell non-blank, not the word
-        # "sample", and at least one of fastq/path/avt is present)
+        # "sample", and at least one of fastq/path is present)
         for r in rows:
             c_sample = r[0] if len(r) > 0 else None
             c_fastq = r[1] if len(r) > 1 else None
             c_path = r[2] if len(r) > 2 else None
-            c_avt = r[3] if len(r) > 3 else None
             if is_blank(c_sample):
                 continue
             if str(c_sample).strip().lower() in {"sample", "name", ""}:
@@ -367,14 +429,11 @@ def parse_xlsx(path: str):
         if score > best_score:
             best_sheet = ws
             best_score = score
-            best_name = sheet_name  # noqa: F841 (diagnostics)
 
     if best_sheet is None:
         return [], None
 
-    ws = best_sheet
-    merged = build_merged_cell_lookup(ws)
-    rows = list(ws.iter_rows(values_only=True))
+    rows = list(best_sheet.iter_rows(values_only=True))
     # find header row for column positions
     hidx = 0
     for i, r in enumerate(rows):
@@ -382,8 +441,7 @@ def parse_xlsx(path: str):
         if v0 is not None and _is_header_text(str(v0)):
             hidx = i
             break
-    data_start = hidx + 1
-    for r in rows[data_start:]:
+    for r in rows[hidx + 1:]:
         vals = list(r)
         c_sample = vals[0] if len(vals) > 0 else None
         c_fastq = vals[1] if len(vals) > 1 else None
@@ -404,16 +462,10 @@ def parse_xlsx(path: str):
             # Use the basename as the fastq id; the full path is kept for
             # resolution (it may already be the leaf directory).
             fastq = os.path.basename(str(c_path).strip())
-            # Keep the full path as the leaf if it exists — resolution will
-            # prefer the given path over the AVT-tree walk.
         else:
             print(f"  Warning: sample '{sample}' has no fastq ID and no "
                   f"FASTQ path — row skipped.")
             continue
-        if not FASTQ_ID_PATTERN.match(fastq):
-            # Not an avid-looking id (e.g. a full path or a custom leaf name) —
-            # the resolver handles both: os.path.isdir() at runtime decides.
-            pass
         # Per-row AVT (optional; blank -> inherit the sheet/file-detected run)
         row_avt = None
         if not is_blank(c_avt):
@@ -426,8 +478,79 @@ def parse_xlsx(path: str):
         seen_pairs.add(key)
         all_pairs.append((sample, fastq, row_avt))
 
-    wb.close()
     return all_pairs, avt_from_sheet
+
+
+def _sheet_avt(ws):
+    """AVT run name from a sheet's first rows (e.g. the
+    ``AVITI24 run AVT0565`` title row), or ``None``."""
+    for r in list(ws.iter_rows(values_only=True))[:12]:
+        for c in r:
+            if c is None:
+                continue
+            m = AVT_PATTERN.search(str(c))
+            if m:
+                return m.group(0).upper()
+    return None
+
+
+def parse_xlsx(path: str):
+    """Return (list_of_pairs, detected_avt).
+
+    ``list_of_pairs`` items are ``(sample, fastq, per_row_avt)`` —
+    ``per_row_avt`` is the AVT named on that row (or None when the row
+    names no run).
+
+    Parsing rules:
+      * GECF submission layout (preferred, ARC-parity): the sheet whose
+        header row names both a fastq-ID column (``GECF fastq ID
+        (avidxxxx)``) and a ``Sample name`` column.  Column positions come
+        from the header cells, data rows are collected below the header
+        until the ``Run details`` block (or two consecutive non-data rows).
+        When several sheets qualify, the one with the most valid rows wins;
+        ranked_sheet_names precedence breaks ties (User_x1x_copy first).
+      * Legacy layout fallback (no such header anywhere): positional col A
+        sample, col B fastq, col C FASTQ path, col D AVT — the old
+        behaviour, unchanged.
+      * detected_avt: the first per-row AVT, else the sheet title / early
+        rows, else the file name.
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+
+    best_rows, best_sheet = [], None
+    for sheet_name in ranked_sheet_names(wb):
+        ws = wb[sheet_name]
+        try:
+            rows = _sheet_rows_header_driven(ws, build_merged_cell_lookup(ws))
+        except Exception:
+            rows = []
+        if len(rows) > len(best_rows):
+            best_rows, best_sheet = rows, ws
+
+    if best_rows:
+        # De-duplicate, preserving first-seen order.
+        seen = set()
+        deduped = []
+        for sample, fastq, avt in best_rows:
+            key = (sample.lower(), fastq.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((sample, fastq, avt or None))
+        sheet_avt = next((a for (_s, _f, a) in deduped if a), None)
+        if sheet_avt is None and best_sheet is not None:
+            sheet_avt = _sheet_avt(best_sheet)
+        if sheet_avt is None:
+            m = AVT_PATTERN.search(os.path.basename(path))
+            if m:
+                sheet_avt = m.group(0).upper()
+        if sheet_avt:
+            return ([
+                (s, f, (a or sheet_avt)) for (s, f, a) in deduped
+            ], sheet_avt)
+        return deduped, None
+
+    return _parse_positional(wb)
 
 
 def print_pairs_table(pairs):
@@ -467,8 +590,83 @@ def find_fastq_path(avt_run: str, fastq_id: str):
 # Shell script emission
 # ---------------------------------------------------------------------------
 
+def merge_sample_order(orders):
+    """Merge the sample orders of several datasheets into one order.
+
+    *orders* is a list of sample-name lists, one per input Excel file, in
+    the order the user listed the files on the command line (each list may
+    be raw row order — duplicates are collapsed to first-seen).
+
+    Result:
+      * if all files AGREE on the relative order of the samples they share
+        (no pair of samples is ordered oppositely in two files), the single
+        common order across all files — samples that only some files list
+        still land at their agreed position;
+      * otherwise the FIRST file's order wins, with samples that appear
+        only in later files appended after it (first-seen order in the
+        remaining files).
+
+    Every sample present in any input file appears exactly once in the
+    result — files may cover different sample subsets, nothing is dropped.
+    """
+    orders = [list(dict.fromkeys(o)) for o in orders]
+    orders = [o for o in orders if o]
+    if len(orders) <= 1:
+        return orders[0] if orders else []
+
+    union_list = list(dict.fromkeys(s for o in orders for s in o))
+
+    # Constraint graph: each file is a chain — consecutive samples a, b in
+    # the same file must keep that relative order in the merged result.
+    preds = {s: set() for s in union_list}
+    succs = {s: set() for s in union_list}
+    for o in orders:
+        for a, b in zip(o, o[1:]):
+            succs[a].add(b)
+            preds[b].add(a)
+
+    # Deterministic tie-break: prefer the sample that sits earliest in the
+    # file containing it (file #, then row) — keeps the first file's order
+    # at the front of the merged result.
+    rank = {}
+    for s in union_list:
+        for i, o in enumerate(orders):
+            if s in o:
+                rank[s] = (i, o.index(s))
+                break
+
+    # Topological sort.  A deadlock (ready set empty while samples remain)
+    # means two files order some pair of samples oppositely -> they
+    # DISAGREE -> fall through to the first-file fallback below.
+    live = set(union_list)
+    emitted = []
+    while live:
+        ready = [s for s in live if not preds[s]]
+        if not ready:
+            break
+        s = min(ready, key=lambda s: rank[s])
+        emitted.append(s)
+        live.discard(s)
+        for t in succs[s]:
+            preds[t].discard(s)
+
+    if len(emitted) == len(union_list):
+        return emitted  # all files agree -> common order
+
+    # Disagreement -> first file's order + first-seen order of the rest.
+    merged = list(orders[0])
+    seen = set(merged)
+    for o in orders[1:]:
+        for s in o:
+            if s not in seen:
+                merged.append(s)
+                seen.add(s)
+    return merged
+
+
 def build_script_full(reference_genome, pairs, user="", main_avt=None,
-                      source_files=None, resolve=None, number_prefix=True):
+                      source_files=None, resolve=None, number_prefix=True,
+                      ordered_samples=None):
     """Emit the ``cellranger-atac_AVT0XXX.sh`` text.
 
     ``pairs`` is a list of ``(sample, fastq_id, per_row_avt)``; ``resolve``
@@ -482,17 +680,25 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     order even when the names are not alphabetical.  Pass False (CLI:
     --no-number-prefix) for bare sample names (the previous behaviour).
 
+    *ordered_samples* (optional): the merged cross-file sample order
+    (``merge_sample_order``).  When given, it renumbers the samples;
+    any sample it does not list (e.g. added by full path in the sample
+    prompt) keeps first-seen order and is appended at the end.
+
 
     Layout (top -> bottom) — the same section order as the GEX/ARC generated
     scripts, adapted to single-ATAC runs:
       1.  Header / constants (timestamp, reference, source files, requester,
           scriptversion stamp, avt_run, user).
       2.  RUN-WIDE PARAMETERS (editable at the top): keepdata, max_parallel,
-          scratch_root, server_folder_name, NGSruns_archive, then all FASTQ
-          path variables (resolved at generation time), then derived vars
-          (Server_folder, summaries folder, archive_dir), mkdir, ref check.
-      3.  PER-SAMPLE PARAMETERS: one block per sample — localcores, localmem,
-          custom_options; blank a value to drop that flag for that sample.
+          localcores, localmem, scratch_root, server_folder_name,
+          NGSruns_archive, then all FASTQ path variables (resolved at
+          generation time), then derived vars (Server_folder, summaries
+          folder, archive_dir), mkdir, ref check.
+      3.  PER-SAMPLE PARAMETERS: one block per sample — custom_options;
+          blank a value to drop that flag for that sample. CPU/memory caps
+          are run-wide (localcores / localmem in RUN-WIDE PARAMETERS), per
+          the GEX/ARC convention.
       4.  One ``atac_sample_<i>()`` function per sample: runs
           ``cellranger-atac count`` (flags from the ``*_<i>`` variables),
           checks for leftover tmp folders, deletes the SC_ATAC_COUNTER_CS
@@ -517,6 +723,12 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
         if not any(f == fastq for f in fqs):
             fqs.append(fastq)
     samples = list(groups)
+    if ordered_samples:
+        # Cross-file consensus order (merge_sample_order) renumbers the
+        # samples; anything it does not list is appended after, first-seen.
+        ordered_set = set(ordered_samples)
+        samples = [si for si in ordered_samples if si in groups] + \
+                  [si for si in samples if si not in ordered_set]
     N = len(samples)
     # Per-sample run folder name: 01_, 02_, … (ON by default) keeps the
     # folders in sample order even when the names are not alphabetical.
@@ -563,12 +775,16 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append('keepdata="no"')
     L.append('#   max_parallel : how many cellranger-atac counts to run at the same time.')
     L.append('#   1 = serial (one sample after another); N>1 = rolling pool of N jobs,')
-    L.append('#         the next sample starts as soon as a slot frees up.  Default is 3,')
-    L.append('#         i.e. 3 concurrent runs.  Each sample still caps its own CPU')
-    L.append('#         (--localcores_<#>) and RAM (--localmem_<#>) in PER-SAMPLE')
-    L.append('#         PARAMETERS below, so max_parallel x these must fit within the')
-    L.append('#         server\'s total resources — set max_parallel=1 to disable concurrency.')
+    L.append('#          the next sample starts as soon as a slot frees up.')
+    L.append('#   localcores : CPU cores per cellranger-atac count (applies to ALL samples);')
+    L.append('#                blank = cellranger default.')
+    L.append('#   localmem   : RAM in GB per cellranger-atac count (applies to ALL samples);')
+    L.append('#                blank = cellranger default.')
+    L.append('#   With max_parallel>1, total = max_parallel x (localcores cores, localmem GB),')
+    L.append("#   so all three must fit within the server's resources together.")
     L.append('max_parallel=3')
+    L.append(f'localcores="{LOCAL_CORES}"')
+    L.append(f'localmem="{LOCAL_MEM}"')
     L.append('#   scratch_root : root on the analysis server where cellranger-atac output is written')
     L.append('#                  (fixed convention — change only if the mount differs on your server).')
     L.append('scratch_root="' + SCRATCH_ROOT + '"')
@@ -628,9 +844,9 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append("# PER-SAMPLE PARAMETERS  (one block per sample — edit values in place)")
     L.append("# ----------------------------------------------------------------")
     L.append('#   * blank a value ( value="" )  -> that flag is DROPPED for that sample')
-    L.append("#   * localcores     : number of cores, or blank (cellranger default)")
-    L.append("#   * localmem       : memory in GB, or blank (cellranger default)")
     L.append("#   * custom_options : extra flags as-is, e.g. --peaks=/refs/peaks.bed")
+    L.append("#   * localcores / localmem are RUN-WIDE (see RUN-WIDE PARAMETERS);")
+    L.append("#     they are not per-sample — same convention as the GEX/ARC scripts.")
     L.append("# ============================================================")
     for idx, sample in enumerate(samples, start=1):
         L.append(f"# Sample {idx}: {sample}")
@@ -658,7 +874,9 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append("# ============================================================")
     L.append("# PER-SAMPLE FUNCTIONS  (one atac_sample_<i> per sample)")
     L.append("#   Each function:")
-    L.append("#     * runs cellranger-atac count (flags from the *_<i> variables above)")
+    L.append("#     * runs cellranger-atac count (per-sample flags from the *_<i> variables above;")
+    L.append("#       a blank value drops that flag for that sample only — CPU/memory caps")
+    L.append("#       localcores / localmem are run-wide)")
     L.append("#     * checks for leftover tmp folders -> <sample>_error_log.txt")
     L.append("#     * deletes the non-essential SC_ATAC_COUNTER_CS scratch tree")
     L.append("#     * harvests the web summary into <AVT>_Summaries/web_summaries/")
@@ -682,7 +900,14 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
             f'    --description={desc}',
             '    --reference="${reference_genome}"',
             f'    --fastqs={fq_arg}',
+            f'    --output-dir=${{Server_folder}}/{run_name}',
+            # CPU/memory caps are run-wide (localcores / localmem), not per-sample
+            '    ${localcores:+--localcores=$localcores}',
+            '    ${localmem:+--localmem=$localmem}',
         ]
+        # Per-sample conditional knobs. Blank value -> flag omitted for this
+        # sample only. custom_options is deliberately UNQUOTED on the last
+        # line so it word-splits into multiple --flags.
         for suffix, _default, _comment in _ATAC_PER_SAMPLE_PARAMS:
             v = f"{suffix}_{idx}"
             if suffix == "custom_options":
@@ -690,7 +915,6 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
             else:
                 flag = "--" + suffix.replace("_", "-")
                 flag_lines.append(f"    ${{{v}:+{flag}=${v}}}")
-        flag_lines.append(f'    --output-dir=${{Server_folder}}/{run_name}')
 
         # Write the exact command to <sample>_script_log.txt (one readable line)
         L.append(f'    _cmd_log="${{Server_folder}}/{run_name}_script_log.txt"')
@@ -892,11 +1116,20 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append("#   (local working dir + central archive) so the exact pipeline is")
     L.append("#   preserved with the results.")
     L.append("# ============================================================")
-    L.append('if [ -n "${BASH_SOURCE:-}" ]; then _self="${BASH_SOURCE[0]}"')
-    L.append('elif [ -n "${0:-}" ]; then _self="${0}"; fi')
-    L.append('if [ -f "${_self:-/nonexistent}" ]; then')
-    L.append('    cp "${_self}" "${Server_folder}/$(basename "${_self}")" 2>/dev/null || true')
-    L.append('    cp "${_self}" "${archive_dir}/$(basename "${_self}")" 2>/dev/null || true')
+    # Self-resolve THIS script to an absolute path right where it is used —
+    # this far down the script nothing has `cd`'d in the main shell (the
+    # per-sample functions call cellranger-atac with --output-dir and the
+    # md5sum step runs in a subshell), so a relative BASH_SOURCE[0] still
+    # means "launched from here".  Kept here (not at the top) because it is
+    # plumbing, not a user-editable parameter.  NOTE: if a bare `cd` is ever
+    # added to the main flow ABOVE this point, the relative name breaks —
+    # then move this capture above that `cd` instead.
+    L.append('# Path of this script as an absolute path, resolved against the launch directory')
+    L.append('_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"')
+    L.append('if [ ! -f "${_SELF_PATH}" ]; then _SELF_PATH="${BASH_SOURCE[0]:-$0}"; fi')
+    L.append('if [ -n "${_SELF_PATH:-}" ] && [ -f "${_SELF_PATH}" ]; then')
+    L.append('    cp "${_SELF_PATH}" "${Server_folder}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
+    L.append('    cp "${_SELF_PATH}" "${archive_dir}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
     L.append("fi")
     L.append("")
 
@@ -995,6 +1228,7 @@ def main():
     setup_readline_completer()
 
     all_pairs, detected_avts = [], []
+    per_file_orders = []  # per-file row order — feeds merge_sample_order
     any_user = ""
     source_files = []  # accepted Excel file(s) — parked in TO_DELETE by the generated .sh
     for path in args.xlsx_files:
@@ -1005,6 +1239,9 @@ def main():
         rows, avt = parse_xlsx(path)
         if rows:
             all_pairs.extend(rows)
+            # Row order of the samples in this datasheet — feeds the
+            # cross-file order merge in merge_sample_order() below.
+            per_file_orders.append([si for si, _, _ in rows])
         if avt:
             detected_avts.append(avt)
         if not any_user:
@@ -1012,6 +1249,11 @@ def main():
 
     if not all_pairs:
         sys.exit("Error: no sample rows could be parsed from the provided file(s).")
+
+    # Cross-file sample order: the common order of all files when they
+    # agree, else the FIRST file's order (later files' new samples are
+    # appended after it).  See merge_sample_order.
+    merged_sample_order = merge_sample_order(per_file_orders)
 
     print()
     print_pairs_table(all_pairs)
@@ -1126,14 +1368,19 @@ def main():
     script = build_script_full(
         reference_genome, all_pairs, user=user, main_avt=main_avt,
         source_files=source_files, resolve=resolve,
-        number_prefix=not args.no_number_prefix)
+        number_prefix=not args.no_number_prefix,
+        ordered_samples=merged_sample_order)
     out_script = f"cellranger-atac_{main_avt}.sh"
     with open(out_script, "w") as f:
         f.write(script)
     os.chmod(out_script, 0o755)
     print(f"Generated: {out_script}")
-    if "FIXME_LOCATE_" in script:
-        print("Note: some fastq leaves could not be resolved here — "
+    # NB: match only actual flagged variables (fastq_<i>_<j>="" # FIXME_LOCATE_),
+    # NOT the static FIXME_LOCATE_ mention in the FASTQ PATHS help comment.
+    n_unresolved = len(re.findall(
+        r'fastq_\d+_\d+=""\s*#\s*FIXME_LOCATE_', script))
+    if n_unresolved:
+        print(f"Note: {n_unresolved} fastq leaf(s) could not be resolved here — "
               "replace the empty fastq_<idx>_<j> variables flagged "
               "FIXME_LOCATE_ in the script before running.")
 

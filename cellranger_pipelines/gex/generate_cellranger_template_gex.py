@@ -137,7 +137,7 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # Generator version == generated-script version; the kept .sh in the
 # archive tells you which one produced it.  Bump on any change to the
 # generator.
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.1.3"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -1108,19 +1108,26 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
 
     # ---- 7b) copy the generating .sh into the project folders ----
-    # The user runs this script from their working directory (e.g.
-    # `./cellranger-count_AVT0571.sh`), so $0 points at it.  Save a copy in
-    # the local project folder AND the central archive, which both live
-    # under paths that outlive the caller's cwd.
+    # Save a copy in the local project folder AND the central archive,
+    # which both live under paths that outlive the caller's cwd.
     lines.append("# ------------------------------------ KEEP A COPY OF THIS SCRIPT ------------------------------------ #")
     lines.append("#   Copy the .sh used to generate this project into the project folders")
     lines.append("#   (local working dir + central archive) so the exact pipeline is")
     lines.append("#   preserved with the results.")
-    lines.append('if [ -n "${BASH_SOURCE:-}" ]; then _self="${BASH_SOURCE[0]}"')
-    lines.append('elif [ -n "${0:-}" ]; then _self="${0}"; fi')
-    lines.append('if [ -f "${_self:-/nonexistent}" ]; then')
-    lines.append('    cp "${_self}" "${Server_folder}/$(basename "${_self}")" 2>/dev/null || true')
-    lines.append('    cp "${_self}" "${NGSruns_folder}/$(basename "${_self}")" 2>/dev/null || true')
+    # Self-resolve THIS script to an absolute path right where it is used —
+    # this far down the script nothing has `cd`'d in the main shell (the
+    # per-sample functions call cellranger count with --output-dir and the
+    # md5sum step runs in a subshell), so a relative BASH_SOURCE[0] still
+    # means "launched from here".  Kept here (not at the top) because it is
+    # plumbing, not a user-editable parameter.  NOTE: if a bare `cd` is ever
+    # added to the main flow ABOVE this point, the relative name breaks —
+    # then move this capture above that `cd` instead.
+    lines.append('# Path of this script as an absolute path, resolved against the launch directory')
+    lines.append('_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"')
+    lines.append('if [ ! -f "${_SELF_PATH}" ]; then _SELF_PATH="${BASH_SOURCE[0]:-$0}"; fi')
+    lines.append('if [ -n "${_SELF_PATH:-}" ] && [ -f "${_SELF_PATH}" ]; then')
+    lines.append('    cp "${_SELF_PATH}" "${Server_folder}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
+    lines.append('    cp "${_SELF_PATH}" "${NGSruns_folder}/$(basename "${_SELF_PATH}")" 2>/dev/null || true')
     lines.append("fi")
     lines.append("")
     lines.append("")
