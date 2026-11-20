@@ -99,7 +99,11 @@ from common.intake import (
 # ``-v``/``--version``.  Generator version == generated-script version;
 # the .sh kept in the archive tells you which one produced it.
 # Bump on any change to the generator.
-SCRIPT_VERSION = "1.3.0"
+#
+# 1.3.1 = one TSO% section per GEX-leg run: every GEX fastq (Read-2) of a
+#         sample is measured, not just the first leg; report sections are
+#         labeled <NN_sample>__<avid>.
+SCRIPT_VERSION = "1.3.1"
 
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc"
 
@@ -1153,32 +1157,33 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
 
         # ---- TSO% library-quality metric (parity item 9) — GEX leg only ----
         # intact-TSO / intact-SMART / polyA+polyT fractions, measured on a
-        # downsampled Read-2 subset of the GEX-leg fastq.  The ATAC leg is
-        # chromatin and carries no meaningful TSO% reading, so it is never
-        # measured.  The report body is tee'd to a per-sample part under
-        # tso_report_parts/; the single centralized tso_report.txt is
-        # assembled AFTER DISPATCH (samples may run concurrently, so each
-        # part has exactly one writer).  See the "TSO% REPORT (SINGLE FILE)"
-        # section below.
-        gex_fid = next((fid for _, fid, m in libs if m == _GEX), None)
-        if gex_fid is not None:
-            _tso_var = f"fastq_{idx}_{gex_fid}"
-            _tso_tags = f"{idx:02d}_{base}"
-            L.append("")
-            L.append("    # TSO% library-quality metric (Read-2 only) — intact TSO/SMART + poly tails")
-            L.append(f'    _tso_fq="${{{_tso_var}}}"')
-            L.append(f'    _tso_tags="{_tso_tags}"')
-            L.append('    if [ ! -f "${_tso_fq}" ] && [ -d "${_tso_fq}" ]; then')
-            L.append('        for _c in "${_tso_fq}"/*_R2_*.fastq.gz "${_tso_fq}"/*_R2.fastq.gz; do')
-            L.append('            [ -f "${_c}" ] && { _tso_fq="${_c}"; break; }')
-            L.append("        done")
-            L.append("    fi")
-            L.append('    if [ -f "${_tso_fq}" ]; then')
-            L.append(f'        _tso_part="${{Server_folder}}/tso_report_parts/{_tso_tags}.txt"')
-            L.append('        tso_percent "${_tso_fq}" "${_tso_tags}" | tee "${_tso_part}"')
-            L.append("    else")
-            L.append(f'        echo "tso: no Read-2 fastq near {_tso_var}; TSO% step skipped." >&2')
-            L.append("    fi")
+        # downsampled Read-2 subset of EACH GEX-leg fastq — one section per
+        # avid run, not just the first leg.  The ATAC leg is chromatin and
+        # carries no meaningful TSO% reading, so it is never measured.
+        # Each section is tee'd to a part under tso_report_parts/; the
+        # single centralized tso_report.txt is assembled AFTER DISPATCH
+        # (samples may run concurrently, so each part has exactly one
+        # writer).  See the "TSO% REPORT (SINGLE FILE)" section below.
+        gex_fids = [fid for _, fid, m in libs if m == _GEX and fid]
+        if gex_fids:
+            for fid in gex_fids:
+                _tso_var = f"fastq_{idx}_{fid}"
+                _tso_tags = f"{idx:02d}_{base}__{fid}"
+                L.append("")
+                L.append(f"    # TSO% ({fid}) — intact TSO/SMART + poly tails on Read-2")
+                L.append(f'    _tso_fq="${{{_tso_var}}}"')
+                L.append(f'    _tso_tags="{_tso_tags}"')
+                L.append('    if [ ! -f "${_tso_fq}" ] && [ -d "${_tso_fq}" ]; then')
+                L.append('        for _c in "${_tso_fq}"/*_R2_*.fastq.gz "${_tso_fq}"/*_R2.fastq.gz; do')
+                L.append('            [ -f "${_c}" ] && { _tso_fq="${_c}"; break; }')
+                L.append("        done")
+                L.append("    fi")
+                L.append('    if [ -f "${_tso_fq}" ]; then')
+                L.append(f'        _tso_part="${{Server_folder}}/tso_report_parts/{_tso_tags}.txt"')
+                L.append('        tso_percent "${_tso_fq}" "${_tso_tags}" | tee "${_tso_part}"')
+                L.append("    else")
+                L.append(f'        echo "tso: no Read-2 fastq near {_tso_var}; TSO% step skipped ({fid})." >&2')
+                L.append("    fi")
         else:
             L.append("")
             L.append(f'    echo "[{idx:02d}_{base}] no GEX leg in this sample; TSO% step skipped (ATAC-only)" >&2')
@@ -1287,26 +1292,35 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     # ---- 6b) TSO% REPORT (single file) — parity item 9 -------------------------------------------
     L.append("# ============================================================")
     L.append("# TSO% REPORT  (SINGLE FILE)")
-    L.append("#   Assembles one tso_report.txt from the per-sample parts under")
-    L.append("#   tso_report_parts/ (each GEX-leg sample's intact-TSO / intact-SMART /")
-    L.append("#   polyA+polyT block), in sample order.  ATAC-only samples write")
-    L.append("#   no part (no Read-2 fastq to measure) and are simply absent.")
+    L.append("#   Assembles one tso_report.txt from the (sample, avid) parts under")
+    L.append("#   tso_report_parts/ (per GEX leg: intact-TSO / intact-SMART /")
+    L.append("#   polyA+polyT block), in sample order then avid order.  ATAC-only")
+    L.append("#   samples write no part (no Read-2 fastq to measure) and are")
+    L.append("#   simply absent.")
     L.append("# ============================================================")
     L.append('_tso_out="${Server_folder}/tso_report.txt"')
     L.append("{")
     L.append('    echo "# ============================================================"')
-    L.append('    echo "# TSO% REPORT — ' + str(len(groups)) + ' sample(s) — AVT run: ${avt_run}"')
+    L.append('    echo "# TSO% REPORT — one section per (sample, avid) — ' + str(len(groups)) + ' sample(s) — AVT run: ${avt_run}"')
     L.append('    echo "# Generated: $(date -u)  —  generator ' + SCRIPT_VERSION + '"')
-    L.append('    echo "# (per sample: intact TSO % / intact SMART % / polyA tail % / polyT tail %)"')
+    L.append('    echo "# (per GEX leg: intact TSO % / intact SMART % / polyA tail % / polyT tail %)"')
     L.append('    echo "# ============================================================"')
     L.append('    echo ""')
     for idx, (base, _libs) in enumerate(groups.items(), start=1):
-        _tag = "%02d_%s" % (idx, base)
-        L.append('    if [ -f "${Server_folder}/tso_report_parts/%s.txt" ]; then' % _tag)
-        L.append('        echo "### Sample %d: %s (TSO%%) ###"' % (idx, base))
-        L.append('        cat "${Server_folder}/tso_report_parts/%s.txt"' % _tag)
-        L.append('        echo ""')
-        L.append("    fi")
+        _gex_fids = [fid for _, fid, m in _libs if m == _GEX and fid]
+        if not _gex_fids:
+            continue      # ATAC-only sample — no part to list
+        for _fid in _gex_fids:
+            _tag = "%02d_%s__%s" % (idx, base, _fid)
+            L.append('    if [ -f "${Server_folder}/tso_report_parts/%s.txt" ]; then' % _tag)
+            L.append('        echo "### Sample %d: %s — %s (TSO%%) ###"' % (idx, base, _fid))
+            L.append('        cat "${Server_folder}/tso_report_parts/%s.txt"' % _tag)
+            L.append('        echo ""')
+            L.append("    else")
+            L.append('        echo "### Sample %d: %s — %s (TSO%%) ###"' % (idx, base, _fid))
+            L.append('        echo "[no TSO%% report — no Read-2 fastq found or tso_percent skipped]"')
+            L.append('        echo ""')
+            L.append("    fi")
     L.append('} > "${_tso_out}"')
     L.append('rm -rf "${Server_folder}/tso_report_parts"')
     L.append('echo "TSO%% report (single file): ${_tso_out}"')

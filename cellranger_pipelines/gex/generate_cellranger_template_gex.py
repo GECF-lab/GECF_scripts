@@ -137,7 +137,11 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # Generator version == generated-script version; the kept .sh in the
 # archive tells you which one produced it.  Bump on any change to the
 # generator.
-SCRIPT_VERSION = "1.1.3"
+#
+# 1.1.4 = one TSO% section per avid run: every fastq (Read-2) of a sample
+#         is measured, not just the first; report sections are labeled
+#         <NN_sample>__<avid>.
+SCRIPT_VERSION = "1.1.4"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -755,8 +759,8 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("# Working directory: cellranger count output + post-processing (from RUN-WIDE PARAMETERS block)")
     lines.append('Server_folder="${scratch_root}/${server_folder_name}"')
     lines.append('mkdir -vp "${Server_folder}"')
-    lines.append("# Parts dir: each sample (possibly running in parallel) writes its")
-    lines.append("# TSO% report body here; the single centralized tso_report.txt is")
+    lines.append("# Parts dir: each (sample, avid) run (possibly running in parallel) writes its")
+    lines.append("# TSO% section here; the single centralized tso_report.txt is")
     lines.append("# assembled from them after DISPATCH (see TSO% REPORT section).")
     lines.append('mkdir -p "${Server_folder}/tso_report_parts"')
     lines.append("")
@@ -874,36 +878,36 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
 
         # ---- TSO% library-quality metric ------------------------------------
         # Compute intact-TSO / intact-SMART / polyA / polyT fractions on a
-        # DOWNSAMPLING-sized sample of Read-2 sequences.  The R2 fastq is
-        # auto-discovered from the resolved fastq path:
-        #   * if it is already a file ending in *_R2_* — use it directly
+        # DOWNSAMPLING-sized sample of Read-2 sequences — ONE SECTION PER
+        # AVID RUN: every fastq of the sample is measured, not just the
+        # first (a repeated avid id maps to one path_<idx>_<fid> variable,
+        # so it is measured once, at its first position).  For each fastq
+        # the R2 is auto-discovered from the resolved path variable:
+        #   * if it is already a file — use it directly
         #   * otherwise take the first *_R2_* file in the dir (one avid
         #     folder holds exactly one R1 + one R2, so first == only)
-        # The report body is echoed to the console AND written to a
-        # PER-SAMPLE PART file under
-        # ${Server_folder}/tso_report_parts/<NN_sample>.txt.  One centralized
-        # tso_report.txt is assembled from all parts AFTER DISPATCH (samples
-        # may run in parallel, so each part has exactly one writer);
-        # see the "TSO% REPORT (SINGLE FILE)" section.
-        if fastqs:
-            _fq0_var = "path_%d_%s" % (idx, fastqs[0][0])
-            # Part name stays 01_sn (matches the assembler below) regardless
-            # of the per-sample folder naming.
-            tags = f"{idx:02d}_{sn}"
+        # Each section is written to a PART file under
+        # ${Server_folder}/tso_report_parts/<NN_sample>__<fid>.txt.
+        # One centralized tso_report.txt is assembled from all parts AFTER
+        # DISPATCH (samples may run in parallel, so each part has exactly
+        # one writer); see the "TSO% REPORT (SINGLE FILE)" section.
+        for _tso_fq in list(dict.fromkeys(fq for fq, avt in fastqs)):
+            _fq_var = "path_%d_%s" % (idx, _tso_fq)
+            tag = f"{idx:02d}_{sn}__{_tso_fq}"
             lines.append("")
-            lines.append("# TSO% library-quality metric (Read-2 only) — intact TSO/SMART + poly tails")
-            lines.append(f'_fq="${{{_fq0_var}}}"')
-            lines.append('_TAGS="%s"' % tags)
-            lines.append('if [ ! -f "${_fq}" ]; then')
+            lines.append(f"# TSO% ({_tso_fq}) — intact TSO/SMART + poly tails on Read-2")
+            lines.append(f'_fq="${{{_fq_var}}}"')
+            lines.append('_TAGS="%s"' % tag)
+            lines.append('if [ ! -f "${_fq}" ] && [ -d "${_fq}" ]; then')
             lines.append('    for _c in "${_fq}"/*_R2_*.fastq.gz "${_fq}"/*_R2.fastq.gz; do')
             lines.append('        [ -f "${_c}" ] && { _fq="${_c}"; break; }')
             lines.append("    done")
             lines.append("fi")
             lines.append('if [ -f "${_fq}" ]; then')
-            lines.append('    _tso_part="' + SFR + '/tso_report_parts/' + tags + '.txt"')
+            lines.append('    _tso_part="' + SFR + '/tso_report_parts/' + tag + '.txt"')
             lines.append('    tso_percent "${_fq}" "${_TAGS}" | tee "${_tso_part}"')
             lines.append("else")
-            lines.append(f'    echo "tso: no Read-2 fastq found near ${{{_fq0_var}}}; TSO% step skipped." >&2')
+            lines.append(f'    echo "tso: no Read-2 fastq found near ${{{_fq_var}}}; TSO% step skipped ({_tso_fq})." >&2')
             lines.append("fi")
         lines.append("}")
         lines.append("")
@@ -1009,30 +1013,31 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append("")
 
     # ---- 6c) TSO% — assemble the ONE centralized report -------------------
-    # Samples (serially or in a parallel pool) each wrote their part under
-    # tso_report_parts/; now concatenate them, in sample order, into a single
+    # Each (sample, avid) run wrote its part under tso_report_parts/; now
+    # concatenate them, in sample order then avid order, into a single
     # tso_report.txt and rsync that one file to the archive.  The working
     # copy is removed (the archive copy is the deliverable; with
     # keepdata=no the whole working dir is deleted below anyway).
     lines.append("# ------------------------------------ TSO% REPORT (SINGLE FILE) ------------------------------------ #")
-    lines.append("#   Centralized TSO% report: one tso_report.txt gathering every sample's")
-    lines.append("#   per-sample section (from tso_report_parts/), in sample order.")
+    lines.append("#   Centralized TSO% report: one tso_report.txt gathering every")
+    lines.append("#   (sample, avid) section (from tso_report_parts/), in sample order then avid order.")
     lines.append('_tso_out="' + SFR + '/tso_report.txt"')
     lines.append("{")
-    lines.append('    echo "TSO% library-quality report — one section per sample"')
+    lines.append('    echo "TSO% library-quality report — one section per (sample, avid)"')
     lines.append('    echo "Generated: $(date)"')
     lines.append('    echo "Server folder: ' + SFR + '"')
     lines.append('    echo "Samples: ' + str(n) + '"')
     lines.append('    echo ""')
     for idx_t, sn_t in enumerate(unique_samples, start=1):
-        part = f"{idx_t:02d}_{sn_t}"
-        lines.append(f'    if [ -f "{SFR}/tso_report_parts/{part}.txt" ]; then')
-        lines.append(f'        cat "{SFR}/tso_report_parts/{part}.txt"')
-        lines.append("    else")
-        lines.append(f'        echo "[{part}] (no TSO% report — no Read-2 fastq found or tso_percent skipped)" >&2')
-        lines.append(f'        echo "[{part}] (no report: Read-2 fastq not found or step skipped)"')
-        lines.append("    fi")
-        lines.append('    echo ""')
+        for _tso_fq in list(dict.fromkeys(fq for fq, avt in samples_to_fastqs[sn_t])):
+            part = f"{idx_t:02d}_{sn_t}__{_tso_fq}"
+            lines.append(f'    if [ -f "{SFR}/tso_report_parts/{part}.txt" ]; then')
+            lines.append(f'        cat "{SFR}/tso_report_parts/{part}.txt"')
+            lines.append("    else")
+            lines.append(f'        echo "[{part}] (no TSO% report — no Read-2 fastq found or tso_percent skipped)" >&2')
+            lines.append(f'        echo "[{part}] (no report: Read-2 fastq not found or step skipped)"')
+            lines.append("    fi")
+            lines.append('    echo ""')
     lines.append('} > "${_tso_out}"')
     lines.append('rm -rf "' + SFR + '/tso_report_parts"')
     lines.append('echo "TSO% report (single file): ${_tso_out}"')

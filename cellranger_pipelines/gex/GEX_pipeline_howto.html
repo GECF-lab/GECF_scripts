@@ -101,7 +101,7 @@
   <p>The <code>./</code> prefix is required to run a script from the current directory. To run it in the background and capture output to a log:</p>
   <pre><code>nohup bash cellranger-count_AVT0571.sh &gt; AVT0571.log</code></pre>
 
-  <p>It validates the settings, then counts each sample in groups of <code>max_parallel</code> (default 3). Finally it merges each sample's results table into one and copies the results to the shared archive; with <code>keepdata="no"</code> the local working folder is then removed, which is normal.</p>
+  <p>It validates the settings, then counts each sample in groups of <code>max_parallel</code> (default 3). It measures the TSO% library-quality metric on the Read 2 of every avid run in the workbook — one section per avid run in the central <code>tso_report.txt</code>. Finally it merges each sample's results table into one and copies the results, including <code>tso_report.txt</code>, to the shared archive; with <code>keepdata="no"</code> the local working folder is then removed, which is normal.</p>
   <p>Follow progress directly in the terminal, or via <code>AVT0571.log</code> if it is running in the background.</p>
 </main>
 </body>
