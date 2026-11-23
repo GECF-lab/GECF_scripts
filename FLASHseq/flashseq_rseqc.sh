@@ -93,7 +93,7 @@ MERGED=1              # gbcov default: COMBINED output (one combined table +
                       # --per-sample (MERGED=0): one call per sample, with
                       # its own per-sample plots.
                       # read_distribution is ALWAYS per-sample.
-GBCOV_FORMAT="pdf"    # MERGED combined-plot format (gbcov_redraw.py --format)
+GBCOV_FORMAT="html"   # MERGED combined-plot format (gbcov_redraw.py --format)
                       # = pdf|png|jpeg|html. html = self-contained interactive
                       # pages via plotly (no Rscript; the 300+-sample legend
                       # stays readable: hover + clickable legend). Per-sample
