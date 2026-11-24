@@ -7,13 +7,14 @@ and Visium) shares the same low-level workbook plumbing:
 * cell value reading with graceful fallback
 * header normalisation
 * the ``User:`` requester field
-* the shared interactive prompts (confirm AVT run name, choose
-  reference genome, select / add samples) and the readline
+* the shared interactive prompts (confirm the run name — AVT/MSH/MSQ/NVQ…,
+  choose reference genome, select / add samples) and the readline
   path-completion setup
 
 The per-assay generators (``cellranger_pipelines/{atac,arc}/generate_cellranger_template_*.py``)
 import *these* helpers from here and layer their own sheet-selection, row-gate,
-AVT-extraction, and data-model logic on top.
+run-name-extraction (AVT/MSH/MSQ/NVQ… — any code in KNOWN_RUN_CODES), and
+data-model logic on top.
 
 This module is the single source of truth for the atoms.  If any of the helpers
 have a bug or need a format change, the fix lives in one place and propagates
@@ -28,20 +29,24 @@ Import convention (from a generator file at ``cellranger_pipelines/<assay>/...py
         sys.path.insert(0, _CELLRANGER_PIPELINES)
 
     from common.intake import (
-        NGS_BASE_DIR_TEMPLATE,     # template literal w/ {avt_run} placeholder
-        AVT_PATTERN,               # compiled re for 'AVT0519'-style names
-        norm,                      # lowercased/stripped cell value
+        run_base_dir,            # run name → base folder (all sequencers)
+        AVT_PATTERN,             # compiled re for run names (AVT/MSH/MSQ/NVQ + digits)
+        NGS_BASE_DIR_TEMPLATE,   # legacy AVT-only template literal
+        avt_run_tag,             # multi-run tag: AVT0001_AVT0002 for names
+        norm,                    # lowercased/stripped cell value
         build_merged_cell_lookup,  # (row,col)->value dict for merged ranges
-        get_cell_value,            # merged-aware cell read
-        read_user_field,           # 'User:' label -> first word
-        set_non_interactive,       # flag prompt helpers
-        is_non_interactive,        # read prompt-flag state
-        ask_avt_run,               # confirm / ask the AVT run name
-        ask_reference_genome,      # choose a reference genome path
-        ask_sample_selection,      # keep a subset of samples / add more
-        list_sample_dirs,          # every sample dir under an AVT (disambig)
-        choose_sample_dir,         # pick ONE of those when >1 exists
-        find_fastq_path_with_pref, # resolve an avid id honouring the pick
+        get_cell_value,          # merged-aware cell read
+        read_user_field,         # 'User:' label -> first word
+        set_non_interactive,     # flag prompt helpers
+        is_non_interactive,      # read prompt-flag state
+        ask_avt_run,             # confirm / ask the run name (ANY sequencer)
+        inherit_file_avt,        # stamp rows with their own file's run
+        resolve_unassigned_avt,  # GEX-style prompt for run-less rows
+        ask_reference_genome,    # choose a reference genome path
+        ask_sample_selection,    # keep a subset of samples / add more
+        list_sample_dirs,        # every sample dir under a run (disambig)
+        choose_sample_dir,       # pick ONE of those when >1 exists
+        find_fastq_path_with_pref, # resolve a fastq id honouring the pick
         setup_readline_completer,  # tab-completion for input() prompts
     )
 
@@ -59,20 +64,113 @@ import sys
 
 # ── shared path constants ─────────────────────────────────────────────────
 
-#: Base directory under which per-AVT FASTQ trees live on the GECF server.
-#: The generator interpolates the AVT run name in at use-time.
+#: Root of the GECF FASTQ trees on the server.  Every sequencer keeps its
+#: run folders under its own code folder here (see RUN_BASE_SUBPATH).
+NGS_RUNS_ROOT = "/mnt/PTEGraw/AA/NGSruns"
+
+#: Known GECF sequencer codes — the prefixes a run name carries
+#: (``AVT0519``, ``MSH0024``, ``MSQ016``, ``NVQ0312`` …).
+KNOWN_RUN_CODES = ("AVT", "MSH", "MSQ", "NVQ")
+
+#: Per-code subpath below NGS_RUNS_ROOT where the run folders live.  The
+#: AVT tree keeps one extra machine level (AV240401); MSH/MSQ (MiSeq) and
+#: NVQ (NovaSeq) hang their runs directly under the code folder.  Onboard a
+#: new sequencer by adding its code here AND to KNOWN_RUN_CODES — the
+#: pattern below picks the run names up automatically.
+RUN_BASE_SUBPATH = {
+    "AVT": "AVT/AV240401",
+    "MSH": "MSH",
+    "MSQ": "MSQ",
+    "NVQ": "NVQ",
+}
+
+#: Legacy AVT-only template literal — kept so existing scripts and notes that
+#: interpolate the run name themselves keep working.  New code should call
+#: :func:`run_base_dir`, which honours RUN_BASE_SUBPATH per sequencer.
 NGS_BASE_DIR_TEMPLATE = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/{avt_run}"
 
-#: Anchored match for a bare AVT run name (e.g. ``AVT0519``).
-AVT_PATTERN = re.compile(r"AVT0?\d{3,5}")
+#: A bare run name on any known GECF sequencer: the code + 2-6 digits
+#: (optional leading zero), case-insensitive — ``AVT0519``, ``MSH0024``,
+#: ``MSQ016`` (MSQ runs are 3 digits), ``NVQ0312``.
+RUN_PATTERN = re.compile(
+    "(" + "|".join(KNOWN_RUN_CODES) + r")0?\d{2,6}", re.IGNORECASE
+)
 
-#: A real GECF library id is ``avid`` followed by 4-6 digits (e.g. ``avid12499``).
+#: Legacy name for RUN_PATTERN — imported by the generators and the smoke
+#: test.  Same object; run names are now recognised on every sequencer,
+#: not only AVT.
+AVT_PATTERN = RUN_PATTERN
+
+#: A real GECF library id is a leaf named ``<prefix>id<4-6 digits>`` where
+#: ``<prefix>`` is the letters of the instrument's namespace only (``avid``
+#: AVT, ``mhid``/``msid`` MSQ/MSH, ``nvid`` NVQ, and whatever a future sequencer uses)
+#: — never digits.  Requiring only the ``id<digits>`` tail keeps the row gate
+#: and the add-sample folder-basename validation portable across platforms,
+#: and keeps the id shell-safe (ARC embeds it in ``fastq_<idx>_<fid>``
+#: variable names in the generated script).
 #: Label / legend / placeholder rows in the same columns carry strings like
 #: ``"0"``, ``"GECF libr. ID (avidxxxx)"`` or ``"Loaded molarity (pM)"`` — this
-#: pattern distinguishes genuine sample rows from those.  Both the ARC and ATAC
-#: generators use this as their row gate, so the single source of truth lives
-#: here rather than in each generator.
-FASTQ_ID_PATTERN = re.compile(r"^avid\d{4,6}$", re.IGNORECASE)
+#: pattern distinguishes genuine sample rows from those (they contain spaces,
+#: punctuation, or no ``id<digits>`` tail).  All generators use this as their
+#: row gate, so the single source of truth lives here rather than in each
+#: generator.
+FASTQ_ID_PATTERN = re.compile(r"^[a-z]*id\d{4,6}$", re.IGNORECASE)
+
+
+def run_base_dir(run_name, runs_root=NGS_RUNS_ROOT):
+    """Resolve a GECF run name to its on-disk base folder (any sequencer).
+
+    ``run_base_dir('AVT0519')``  -> ``<root>/AVT/AV240401/AVT0519``
+    ``run_base_dir('MSH0024')``  -> ``<root>/MSH/MSH0024``
+    ``run_base_dir('MSQ016')``   -> ``<root>/MSQ/MSQ016`` (earlier MSQ runs
+                                    sit in ``…/MSQ016metr`` on disk and are
+                                    found by the prefix match below)
+    ``run_base_dir('NVQ0312')``  -> ``<root>/NVQ/NVQ0312``
+    (see RUN_BASE_SUBPATH)
+
+    Resolution order:
+      1. the literal path, when it exists on this machine;
+      2. a prefix match among the run folders of that code — so ``MSQ016``
+         finds the on-disk ``MSQ016metr``;
+      3. the literal path anyway, so the caller can report "not found" at
+         the expected location (e.g. the ``AVT0000`` placeholder draft).
+
+    A value that is not a known run code is treated as a path: absolute
+    paths pass through untouched, anything else is taken relative to
+    ``runs_root``.  With several prefix matches the first (alphabetical)
+    wins with a warning — never a crash, never a silent wrong tree.
+    """
+    name = str(run_name or "").strip()
+    if not name:
+        name = "UNKNOWN_RUN"
+    m = RUN_PATTERN.match(name)
+    if not m:
+        if os.path.isabs(name):
+            return name
+        return os.path.join(runs_root, name)
+    code = name[:3].upper()
+    parent = os.path.join(runs_root, *RUN_BASE_SUBPATH.get(code, code).split("/"))
+    literal = os.path.join(parent, name)
+    if os.path.isdir(literal):
+        return literal
+    try:
+        cands = sorted(
+            e for e in os.listdir(parent)
+            if e.upper().startswith(name.upper())
+            and os.path.isdir(os.path.join(parent, e))
+        )
+    except OSError:
+        cands = []
+    if cands:
+        if len(cands) > 1:
+            shown = ", ".join(cands[:5]) + ("…" if len(cands) > 5 else "")
+            print(
+                f"  Warning: run '{name}' matches {len(cands)} folders under "
+                f"{parent} ({shown}) — using first: '{cands[0]}'.",
+                file=sys.stderr,
+            )
+        return os.path.join(parent, cands[0])
+    return literal
 
 #: Default ``--localcores`` / ``--localmem`` for cellranger invocations emitted
 #: by the generators.  Shared so the numbers stay in lockstep across assays;
@@ -211,13 +309,29 @@ def setup_readline_completer() -> None:
 
 
 def ask_avt_run(detected_avt) -> str:
-    """Confirm the detected AVT run name, or ask for one.
+    """Confirm a detected run name (any GECF sequencer), or ask for one.
 
-    In non-interactive mode returns ``detected_avt`` (or ``"AVT0000"``)
-    upper-cased, without prompting.
+    In non-interactive mode a detected name is returned uppercased
+    unchanged.  When *no* run name could be detected, a loud WARNING is
+    printed and the placeholder ``"AVT0000"`` is returned — matching the
+    existing FIXME_LOCATE_ pattern (generate a draft, edit the unknowns
+    before running) — instead of failing hard, which would leave the
+    ``-n`` workflow with no way to draft a script for a not-yet-named run.
     """
     if is_non_interactive():
-        return (detected_avt or "AVT0000").upper()
+        if detected_avt:
+            return detected_avt.upper()
+        print(
+            "\nWARNING: no run name detected in the workbook or\n"
+            "         filename (no AVT/MSH/MSQ/NVQ code found) —\n"
+            "         generated script uses placeholder run 'AVT0000'.\n"
+            "         Edit 'avt_run=' (and any dependent paths) in the\n"
+            "         script before running.\n"
+            "         To avoid: name the workbook file with the run\n"
+            "         (e.g. 'AVT0123_...xlsx' or 'MSH0024_...xlsx'),\n"
+            "         or run interactively.\n"
+        )
+        return "AVT0000"
     if detected_avt:
         while True:
             print(f"Detected run name: {detected_avt}")
@@ -228,10 +342,109 @@ def ask_avt_run(detected_avt) -> str:
                 break
             print("Answer can only be Y or n. Please try again.")
     while True:
-        value = input("Enter AVT run name (e.g. AVT0519): ").strip()
+        value = input(
+            "Enter run name (e.g. AVT0519, MSH0024, MSQ016, NVQ0312): "
+        ).strip()
         if value:
             return value.upper()
         print("Run name cannot be empty. Please try again.\n")
+
+
+def inherit_file_avt(rows, file_avt):
+    """Normalise parse rows to 3-tuples and stamp in the run name the FILE
+    itself carries (per-file parity for the ATAC/ARC generators).
+
+    GEX resolves each pair under its own file's run while parsing; ATAC/ARC
+    return the per-file ``avt`` separately and historically stamped ONE
+    representative run onto every row.  This gives each row the run named in
+    its own sheet (row-level names win), so a workbook mixing e.g. an AVT
+    run and an MSH run is not silently mislabelled.
+
+    ``rows``:      list of (sample, fastq_id[, per-row avt or None]) tuples
+    ``file_avt``:  run detected for the file (sheet/filename chain), or None
+    Returns a new list of 3-element lists.
+    """
+    out = []
+    for r in rows:
+        r = list(r)
+        while len(r) < 3:
+            r.append(None)
+        if not r[2] and file_avt:
+            r[2] = file_avt
+        out.append(r)
+    return out
+
+
+def resolve_unassigned_avt(rows, require_known=True):
+    """Give every row whose run name could not be detected an explicit run —
+    the shared GEX 'needs_avt' prompt (parity across all three generators).
+
+    * rows that name a run are left untouched;
+    * rows without a run get ONE user decision for all of them:
+      interactive mode asks once (the first detected run is the default
+      hint — 'Y' confirms, typing replaces);  non-interactive (``-n``)
+      keeps the ``ask_avt_run()`` contract (returned 'AVT0000' placeholder
+      / loud WARNING when no run name is detected anywhere).
+
+    ``require_known=True`` (ATAC/ARC): when NO run is detected in any file,
+    the caller's own run-name answer (main_avt / any_avt) already covers
+    these rows via its existing fallback — no second prompt (matches the
+    GEX single-prompt result in that case).
+    ``require_known=False`` (GEX): always prompt (GEX has no separate
+    run-name confirmation, and the prompt also fills main_avt).
+
+    ``rows``: list of (sample, fastq_id, avt_or_None); mutated in place.
+    Returns the number of rows backfilled.
+    """
+    unassigned = [i for i, r in enumerate(rows)
+                  if not (len(r) > 2 and r[2])]
+    if not unassigned:
+        return 0
+    known = [r[2] for r in rows if len(r) > 2 and r[2]]
+    if require_known and not known:
+        return 0
+    hint = known[0] if known else None
+    print(f"{len(unassigned)} sample(s) have no run name assigned.")
+    run = ask_avt_run(hint)
+    if not run:
+        raise SystemExit("Error: run name cannot be empty.")
+    for i in unassigned:
+        r = list(rows[i])
+        while len(r) < 3:
+            r.append(None)
+        r[2] = run
+        rows[i] = r
+    return len(unassigned)
+
+
+def avt_run_tag(avt_names) -> str:
+    """Join a set of AVT run names into one filename-safe tag.
+
+    ``avt_run_tag(['AVT0002', 'AVT0001'])`` -> ``'AVT0001_AVT0002'``:
+    deduplicated, normalised to uppercase, sorted by numeric suffix, so the
+    tag is deterministic regardless of input or CLI argument order.  A
+    single run returns that run name alone, so single-AVT inputs keep
+    exactly the same script/folder names as before this helper existed.
+
+    All three generators (GEX/ATAC/ARC) use it as the name suffix of the
+    generated script AND of the working/archive folder whenever the inputs
+    span several AVT runs (e.g. two .xlsx files, or a sheet whose rows
+    name different runs) — so the provenance is readable from the name
+    alone: ``cellranger-count_AVT0001_AVT0002.sh`` /
+    ``AVT0001_AVT0002_user_$TIMESTAMP``.  Returns ``''`` for empty/None
+    input so the caller keeps its own fallback.
+    """
+    def _num(name: str) -> int:
+        m = re.search(r"(\d+)$", name)
+        return int(m.group(1)) if m else -1
+    if not avt_names:
+        return ""
+
+    uniq = sorted(
+        {str(a).upper() for a in avt_names if a},
+        key=lambda name: (_num(name), name),
+    )
+    return "_".join(uniq)
 
 
 def ask_reference_genome(human_path, mouse_path, default_path=None,
@@ -344,17 +557,21 @@ def ask_sample_selection(sample_fastqs: dict,
 
       * ``kept_names`` is a list of sample names from *sample_fastqs*, in the
         order the user confirmed them;
-      * ``added`` is ``{name: [<full avid folder path>, ...]}`` for sample
-        names NOT found in the workbook.  Each entry is the FULL path to
-        one avid folder (the directory that holds R1/R2 FASTQs, whose
-        basename matches ``avid + 4-6 digits``); a bare ``avidNNNNN`` is
-        rejected at the prompt.  These paths are self-referential — the
-        generator uses them as-is, no AVT-tree walk involved.
+      * ``added`` is ``{name: [<full fastq folder path>, ...]}`` for sample
+        names NOT found in the workbook.  Each entry is a FULL path to one
+        sample FASTQ folder (the directory holding R1/R2 FASTQs, whose
+        basename matches ``FASTQ_ID_PATTERN`` — ``avid13144``,
+        ``mhid00491``, ``nvid06797``, …); a bare id is rejected at the
+        prompt.  These paths are self-referential — the generator uses
+        them as-is, no run-tree walk involved.
 
-    *default_root* is shown as a hint above the "full path to the avid
-    folder" prompt, so the user can see the common AVT base for the main
-    run without having to type it from memory.  Blank input simply stops
-    the per-sample prompt (no sample is added for that name).
+    *default_root* is prefilled into the "full path to the sample FASTQ
+    folder" prompt (bash ``read -e -i`` style).  Generators pass
+    ``NGS_RUNS_ROOT`` (``/mnt/PTEGraw/AA/NGSruns``): an added sample can
+    come from ANY sequencer tree, so the prefill stops at the level all of
+    them share (``…/AVT/…``, ``…/MSH/…``, ``…/NVQ/…`` live below it) —
+    never the archive/rsync destination.  Blank input simply stops the
+    per-sample prompt (no sample is added for that name).
 
     Non-interactive mode (``set_non_interactive(True)`` or a non-tty stdin)
     returns everything and skips all prompts, so ``-n`` runs stay CI-safe
@@ -441,26 +658,43 @@ def ask_sample_selection(sample_fastqs: dict,
                     print(f"Sample '{sname}' is already in the selection.\n")
                     continue
                 break
-            # ── Full path to each avid folder (hint: common AVT base) ──
-            # A bare ``avidNNNNN`` is NEVER accepted here — it is not a
-            # location, and tree-walking to find it fails for samples whose
-            # demux does not sit under the standard
-            # ``<AVT base>/<…>/Samples/<name>/avidNNNNN`` layout.  The user
-            # must point at the folder itself (e.g.
-            # ``/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/AVT0548/…/avid13144``).
-            base_hint = default_root or "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401"
+            # ── Full path to each sample's FASTQ folder ──────────────────
+            # Samples from ANY sequencer work here: the folder just has to
+            # be the one holding R1/R2 FASTQs (basename ``avidNNNNN`` or
+            # ``mhidNNNNN`` / ``nvidNNNNN`` / …, i.e. FASTQ_ID_PATTERN).
+            # A bare id is NEVER accepted — it is not a location, and
+            # tree-walking to find it fails for samples whose demux does
+            # not follow the standard layout — the user points at the
+            # folder itself (e.g. ``…/AVT0548/…/avid13144`` or
+            # ``…/MSH0024/fastq_BCL-Convert/<attempt>/mhid00491``).
+            # ``default_root`` is the prefill (generators pass NGS_RUNS_ROOT
+            # — the added sample may come from ANY sequencer tree, so we
+            # never guess deeper); relative tails are completed against it,
+            # so a full path from any other location is accepted verbatim.
+            base_hint = (default_root or "").rstrip(os.path.sep)
             paths = []
             while True:
                 # Field comes pre-filled (bash read -e -i style) so the user
                 # types only the tail: ``…/AVT0548/Samples/name/avidNNNNN``.
-                # A bare Enter (or Enter on the untouched base) ends this
+                # A bare Enter (or Enter on the untouched prefill) ends this
                 # sample's folder list — same as the old blank stop.
-                p = _prompt_prefilled("Full path to the avid folder",
-                                     base_hint).strip()
-                if not p or p == base_hint:
+                if base_hint:
+                    p = _prompt_prefilled(
+                        "Full path to the sample's FASTQ folder",
+                        base_hint).strip()
+                    if p == base_hint:
+                        p = ""
+                else:
+                    p = input(
+                        "Full path to the sample's FASTQ folder "
+                        "(a dir like avid13144 / mhid00491 that holds the "
+                        "R1/R2 fastqs; blank ends this sample): "
+                    ).strip()
+                if not p:
                     break
                 p = os.path.expanduser(p)
-                if os.path.sep in p and not p.startswith(os.path.sep):
+                if (base_hint and os.path.sep in p
+                        and not p.startswith(os.path.sep)):
                     # Relative tail — complete it against the run base.
                     p = os.path.normpath(os.path.join(base_hint, p))
                 else:
@@ -472,8 +706,9 @@ def ask_sample_selection(sample_fastqs: dict,
                     paths.append(p)
                     print(f"  added: {p}")
                 else:
-                    print(f"  The folder name '{os.path.basename(p)}' does not "
-                          "look like an avid ID (avid + 4-6 digits) — try "
+                    print(f"  The folder name '{os.path.basename(p)}' does "
+                          "not look like a fastq ID (letters + 'id' + "
+                          "4-6 digits, e.g. avid13144, mhid00491) — try "
                           "again.\n")
             if not paths:
                 print("No FASTQ folder given — sample not added.\n")
@@ -491,27 +726,33 @@ def ask_sample_selection(sample_fastqs: dict,
 
 # ── FASTQ path resolution (sample-level disambiguation) ─────────────────────────
 #
-# AVT runs frequently land the same sample name in *multiple* sibling run
-# sub-folders under ``fastq_bases2fastq/`` — e.g. AVT0551 carries the same
-# 384 ``avidNNNNN`` folder names under BOTH ``1_wrong_index_fromAlithea_...``
-# AND ``2_corrected_indexes_...``.  A bare ``avidNNNNN`` alone does not pin
-# down a physical location.  The helpers below let the caller:
+# Run folders on every GECF sequencer frequently land the same sample name
+# in *multiple* sibling sub-folders (the AVT tree under fastq_bases2fastq/
+# holds one sub-folder per demux attempt — corrected indexes, wrong indexes,
+# …; MiSeq/NovaSeq trees use their own per-run layouts).  A bare
+# fastq id alone does not pin down a physical location.  The helpers below
+# let the caller:
 #
 #   * ``list_sample_dirs``         — return every sample dir that exists under
-#                                    the AVT run for a given sample name (ALL
+#                                    the run for a given sample name (ALL
 #                                    of them, never "first walk hit");
 #   * ``choose_sample_dir``        — collapse that candidate list to ONE dir
 #                                    (no-op when exactly one candidate;
 #                                    interactive lettered menu when more than
 #                                    one; first candidate + warning in
 #                                    non-interactive mode);
-#   * ``find_fastq_path_with_pref``— resolve one ``avidNNNNN`` to a full
-#                                    path, honouring the chosen sample dir
-#                                    first, falling back to a full walk.
+#   * ``find_fastq_path_with_pref``— resolve one fastq id to a full
+#                                    path under the run base (see
+#                                    ``run_base_dir``), honouring the chosen
+#                                    sample dir first, falling back to a walk.
 
 
 def list_sample_dirs(avt_run, sample_name):
-    """Return every sample dir that exists under the AVT tree.
+    """Return every sample dir that exists under the run tree (any sequencer).
+
+    *``avt_run``* is any GECF run name (AVT/MSH/MSQ/NVQ…); its base folder
+    is resolved via :func:`run_base_dir`, which knows each sequencer's
+    tree layout (including the ``MSQ016`` → ``MSQ016metr`` on-disk form).
 
     The layout can be either of two depths:
 
@@ -521,12 +762,12 @@ def list_sample_dirs(avt_run, sample_name):
       demux attempt — corrected indexes, wrong indexes, …)
 
     Returns a sorted list of absolute paths (deterministic order across
-    runs / machines).  Empty list if the AVT base does not exist on this
+    runs / machines).  Empty list if the run base does not exist on this
     machine or the sample name is not present.  A sample whose name recurs
     under several ``<run>`` sub-folders — the wrong-index /
     corrected-index case — gets one path per occurrence.
     """
-    base = NGS_BASE_DIR_TEMPLATE.format(avt_run=avt_run)
+    base = run_base_dir(avt_run)
     if not os.path.isdir(base):
         return []
 
@@ -628,17 +869,48 @@ def choose_sample_dir(sample_name, candidates):
         print(f"  No candidate matches '{answer}'. Try again.\n")
 
 
+#: Directory names that never hold demux'd fastq leaves — skipped during
+#: full-tree walks so we do not descend into raw BCL / raw basecall / QC
+#: trees (huge, network-mounted, no demux'd samples inside).  The dated
+#: raw-flowcell folders (``20260630_AV240401_AVT0551``-style, AVT/NextSeq
+#: layout) are pruned by pattern instead.
+_WALK_PRUNE_NAMES = frozenset({
+    "bcl", "basecalls", "filter", "stats", "alignment", "location",
+    "samplemetrics_and_jsonfiles", "script_logfiles", "multiqc_data",
+    "info",
+})
+_RAW_FLOWCELL_DIR = re.compile(r"^\d{8}")
+
+
 def find_fastq_path_with_pref(avt_run, fastq_id, preferred_sample_dir=None):
     """Resolve ``fastq_id`` to a real directory path.
 
+    *``avt_run``* is any GECF run name (AVT/MSH/MSQ/NVQ…) resolved to its
+    base folder via :func:`run_base_dir`.
+
     Search order:
       1. ``<preferred>/<fastq_id>`` (direct hit — the 99% case).
-      2. ``os.walk`` under *preferred* (handles ``<root>/<sub>/<fastq_id>``
-         and any layout the user pointed at by hand, including roots that
-         live OUTSIDE the AVT run tree).
-      3. ``os.walk`` under the AVT run base
-         (``NGS_BASE_DIR_TEMPLATE.format(avt_run=avt_run)``) — the historical
-         fallback that finds samples which sit in non-Samples layouts.
+      2. Walk under *preferred* (handles ``<root>/<sub>/<fastq_id>`` and
+         any layout the user pointed at by hand, including roots that live
+         OUTSIDE the run tree).
+      3. Walk under the run base (``run_base_dir(avt_run)``) — covers all
+         known layouts:
+         * AVT/NextSeq:  ``<run>/fastq_bases2fastq/<attempt>/Samples/<sample>``
+         * MiSeq/NovaSeq: ``<run>/fastq_BCL-Convert/<attempt>/<project>/<mid>``
+         * anything else that keeps the fastq-id leaf under the run folder.
+
+    If the fastq id occurs in MORE THAN ONE place (the AVT0551
+    ``1_wrong_index…``/``2_corrected_indexes…`` pair, or a MiSeq run with
+    ``1_original_wrong_index``/``2_corrected_index_given``), the first two
+    candidates are disambiguated with :func:`choose_sample_dir` (lettered
+    menu when interactive; auto-pick of the first + warning otherwise)
+    instead of silently taking the first walk hit.
+
+    Walks early-exit as soon as two hits are found (a third copy of the
+    same id is a pathological case), so single-hit runs cost only the walk
+    up to the first match, and skip raw BCL / basecall / QC trees
+    (see ``_WALK_PRUNE_NAMES``) to stay fast on the network-mounted run
+    folders.
 
     Returns the resolved path or ``None`` (caller emits a FIXME_LOCATE_
     marker in the generated script).
@@ -649,22 +921,44 @@ def find_fastq_path_with_pref(avt_run, fastq_id, preferred_sample_dir=None):
         t = os.path.join(d, fastq_id)
         return t if os.path.isdir(t) else None
 
-    def _walk_under(root):
+    def _find_hits(root, limit=2):
+        """Collect up to *limit* dirs named ``fastq_id`` under *root*."""
+        found = []
         for r, dirnames, _ in os.walk(root):
+            kept = []
             for d in dirnames:
+                if d in _WALK_PRUNE_NAMES:
+                    continue
+                if _RAW_FLOWCELL_DIR.match(d):
+                    continue
                 if d == fastq_id:
-                    return os.path.join(r, d)
-        return None
+                    found.append(os.path.join(r, d))
+                    if len(found) >= limit:
+                        return found
+                    continue  # leaf: do not descend into it
+                kept.append(d)
+            dirnames[:] = kept
+        return found
 
     if preferred and os.path.isdir(preferred):
-        hit = _direct(preferred) or _walk_under(preferred)
+        hit = _direct(preferred)
         if hit:
             return hit
+        hits = _find_hits(preferred)
+        if hits:
+            if len(hits) == 1:
+                return hits[0]
+            return choose_sample_dir(fastq_id, hits)
 
-    base = NGS_BASE_DIR_TEMPLATE.format(avt_run=avt_run)
+    base = run_base_dir(avt_run)
     if not os.path.isdir(base):
         return None
     if preferred and os.path.realpath(preferred) == os.path.realpath(base):
         # already searched; skip
         return None
-    return _walk_under(base)
+    hits = _find_hits(base)
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    return choose_sample_dir(fastq_id, hits)

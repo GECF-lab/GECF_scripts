@@ -141,8 +141,8 @@ def main():
     check("TSO helper inlined (tso_percent)", "tso_percent" in out and "tso_percent()" in out)
     check("tso_report_parts mkdir", 'mkdir -p "${Server_folder}/tso_report_parts"' in out)
     check("GEX-leg TSO% tee (sol001)", 'tso_percent "${_tso_fq}"' in out
-          and "tso_report_parts/01_sol001.txt" in out,
-          "01_sol001.txt part name")
+          and "tso_report_parts/01_sol001__avid0001.txt" in out,
+          "01_sol001__avid0001.txt per-avid part name")
     check("ATAC-only TSO% skip (sol002)", "no GEX leg in this sample; TSO% step skipped (ATAC-only)" in out)
     check("single tso_report.txt assembly", '} > "${_tso_out}"' in out and "tso_report.txt" in out)
     check("tso_report rsync to archive", 'rsync -avh "${_tso_out}" "${archive_dir}/"' in out)

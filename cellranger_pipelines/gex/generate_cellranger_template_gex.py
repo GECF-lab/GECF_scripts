@@ -8,9 +8,14 @@ Usage:
 
 GEX-only pipeline. Reads one or more Excel datasheets (the
 `CR_count_datasheet_XXX_template.xlsx` layout) and emits a single
-self-contained bash script (`cellranger-count_AVT0XXX.sh`) with one
+self-contained bash script (`cellranger-count_<AVT>.sh`) with one
 `count_sample_<i>()` function per unique sample, plus the run-wide
-dispatch / post-processing / archive block.
+dispatch / post-processing / archive block.  When the inputs span several
+AVT runs (several files, or a sheet whose rows name different runs), every
+run is listed in the name: `cellranger-count_AVT0001_AVT0002.sh`, and the
+working/archive folder `AVT0001_AVT0002_user_$TIMESTAMP` carries the same
+tag, so the provenance is readable from the name alone.  A single-run
+input keeps the plain `cellranger-count_AVT0001.sh` name.
 """
 
 import argparse
@@ -43,8 +48,10 @@ if _CELLRANGER_PIPELINES_ROOT not in sys.path:
     sys.path.insert(0, _CELLRANGER_PIPELINES_ROOT)
 
 from common.intake import (
-    NGS_BASE_DIR_TEMPLATE,
+    run_base_dir,        # run name -> base folder (all sequencers: AVT/MSH/MSQ/NVQ…)
     AVT_PATTERN,
+    avt_run_tag,         # multi-run tag (AVT0001_AVT0002) for script/folder names
+    resolve_unassigned_avt,  # GEX 'needs_avt' prompt (shared) for run-less rows
     FASTQ_ID_PATTERN,
     LOCAL_CORES,        # cellranger --localcores (shared default "32")
     LOCAL_MEM,          # cellranger --localmem   (shared default "126")
@@ -57,6 +64,7 @@ from common.intake import (
     ask_avt_run,
     ask_reference_genome,
     ask_sample_selection,
+    NGS_RUNS_ROOT,          # prefill root for the add-sample prompt
     choose_sample_dir,      # sample-level run-folder disambiguation (AVT0551)
     list_sample_dirs,       # ... list every candidate sample dir for an AVT
 )
@@ -112,7 +120,7 @@ MOUSE_GENOME_PATH = _resolve_reference_genome(_MOUSE_CURRENT_DIR, "Mouse")
 # choosing a custom path that does not exist yet).
 HUMAN_MOUSE_GENOME_PATH = _resolve_reference_genome(
     _HUMAN_MOUSE_CURRENT_DIR, "Human+Mouse")
-NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/count"
+NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/ZZ_10XG/count"
 
 # "TO delete" folder where processed datasheets are parked for later
 # cleanup. Two destinations, tried in order: Daniel's CR_pipelines tree
@@ -141,7 +149,9 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 # 1.1.4 = one TSO% section per avid run: every fastq (Read-2) of a sample
 #         is measured, not just the first; report sections are labeled
 #         <NN_sample>__<avid>.
-SCRIPT_VERSION = "1.1.4"
+# 1.1.7 = archive root moved off the sequencer folder: results now deploy
+#         to the shared, sequencer-agnostic /mnt/PTEGraw/AA/NGSruns/ZZ_10XG/.
+SCRIPT_VERSION = "1.1.7"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -200,12 +210,17 @@ setup_readline_completer()  # tab-complete paths in the input() prompts
 
 def ranked_sheet_names(wb):
     """Sheet order for parsing: User_x1x_copy first, then workbook order.
-    The first sheet that exposes the required header row wins."""
+    The first sheet that exposes the required header row wins.
+    Sheets whose names contain 'guideline' or 'index table' are never
+    considered — they carry GECF facility legend/reference text (e.g. the
+    'Index table MM.YY' control-library legend: PhiX_i7, i5_backbone,
+    Ad1noMX), not sample data."""
     ranked = []
     if "User_x1x_copy" in wb.sheetnames:
         ranked.insert(0, "User_x1x_copy")
     for name in wb.sheetnames:
-        if name not in ranked:
+        lo = name.lower()
+        if name not in ranked and "guideline" not in lo and "index table" not in lo:
             ranked.append(name)
     return ranked
 
@@ -245,9 +260,9 @@ def parse_xlsx(path):
             f_idx = None
             s_idx = None
             for i, v in enumerate(combined):
-                if "fastq id" in v and "avid" in v:
+                if f_idx is None and "fastq id" in v:
                     f_idx = i
-                if "sample name" in v:
+                if s_idx is None and "sample name" in v:
                     s_idx = i
             if f_idx is not None and s_idx is not None:
                 return f_idx + 1, s_idx + 1, row_idx
@@ -274,8 +289,8 @@ def parse_xlsx(path):
 
     if ws is None:
         sys.exit(
-            "Error: could not find both 'GECF fastq ID (avidxxxx)' and "
-            "'Sample name' columns in the first 15 rows of any sheet."
+            "Error: could not find both a 'GECF fastq ID' header cell and a "
+            "'Sample name' header cell in the first 15 rows of any sheet."
         )
 
     data_start_row = header_row_idx + 1
@@ -494,9 +509,9 @@ def merge_sample_order(orders):
     return merged
 
 
-def build_script_full(reference_genome, pairs, user="", source_files=None,
-                      chosen_sample_dirs=None, added_paths=None,
-                      sample_order=False, ordered_samples=None,
+def build_script_full(reference_genome, pairs, user="", avt_tag=None,
+                      source_files=None, chosen_sample_dirs=None,
+                      added_paths=None, sample_order=False, ordered_samples=None,
                       number_prefix=True):
     """Build the complete `cellranger count` bash script (GEX).
 
@@ -558,6 +573,12 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
 
     avt_counts = Counter(avt for _, _, avt in pairs if avt is not None)
     main_avt = avt_counts.most_common(1)[0][0] if avt_counts else "MIXED_runs"
+    # Identity of the script name + working/archive folder: the combined
+    # multi-run tag (AVT0001_AVT0002, common.intake.avt_run_tag) when the
+    # inputs span several runs, else the representative AVT.  Per-FASTQ
+    # path resolution below still uses each row's own AVT (main_avt only
+    # as fallback) — one run tree per FASTQ.
+    folder_avt = avt_tag or main_avt
 
     samples_to_fastqs = defaultdict(list)
     for sn, fq, avt in pairs:
@@ -588,7 +609,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     # ---- 1) header / constants ----
     gen_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     lines.append("#!/bin/bash")
-    lines.append(f"# cellranger count — GEX-only ({main_avt})")
+    lines.append(f"# cellranger count — GEX-only ({folder_avt})")
     lines.append("# Generated by generate_cellranger_template_gex.py "
                  f"({n} sample(s)).")
     lines.append(f"# Generated at: {gen_stamp}")
@@ -642,7 +663,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
     lines.append(f'scratch_root="{SCRATCH_ROOT}"')
     lines.append("#   server_folder_name : working + archive leaf folder name.")
     lines.append("#                  default is <AVT>[_user]_<timestamp>; change only if needed.")
-    lines.append(f'server_folder_name="{main_avt}{user_tag}_$TIMESTAMP"')
+    lines.append(f'server_folder_name="{folder_avt}{user_tag}_$TIMESTAMP"')
     lines.append("#   NGSruns_archive  : central archive destination (fixed target).")
     lines.append(f'NGSruns_archive="{NGSruns_ARCHIVE_DIR}"')
     lines.append("#   FASTQ paths : one per (sample, FASTQ) pair, resolved by the generator")
@@ -663,7 +684,7 @@ def build_script_full(reference_genome, pairs, user="", source_files=None,
         lines.append(f"# --- FASTQ paths — Sample {idx}: {sn} ({len(fastqs)} FASTQ(s)) ---")
         for fq, avt in fastqs:
             run_part = avt or main_avt
-            base_dir = NGS_BASE_DIR_TEMPLATE.format(avt_run=run_part)
+            base_dir = run_base_dir(run_part)
             # Per-sample chosen folder pins the run sub-folder (AVT0551's
             # corrected-vs-other case).  The helper below re-checks that the
             # chosen dir actually lives under this run's base before using
@@ -1198,11 +1219,16 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Parses one or more GEX-only Excel datasheets and generates a "
-            "cellranger-count_AVT0XXX.sh script with one "
+            "cellranger-count_<AVT>.sh script (multi-run inputs: "
+            "cellranger-count_AVT0001_AVT0002.sh) with one "
             "`count_sample_<i>()` function per sample, plus the run-wide "
             "dispatch / post-processing / archive block."
         ),
-        epilog="Example:\n  python3 %(prog)s samples.xlsx\n  python3 %(prog)s run1.xlsx run2.xlsx",
+        epilog=("Example:\n"
+                "  python3 %(prog)s samples.xlsx\n"
+                "  python3 %(prog)s run1.xlsx run2.xlsx\n"
+                "#   -> one merged script, named after every run it contains:"
+                "\n#   cellranger-count_AVT0001_AVT0002.sh"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -1217,7 +1243,7 @@ def main():
         help=(
             "One or more Excel files with the 'GECF fastq ID (avidxxxx)' and "
             "'Sample name' columns (CR_count_datasheet_*_template.xlsx layout). "
-            "AVT run name (AVT0XXX) is also auto-detected."
+            "Run name (an AVT/MSH/MSQ/NVQ code) is also auto-detected."
         ),
     )
     parser.add_argument(
@@ -1276,16 +1302,12 @@ def main():
     print_pairs_table(all_pairs)
     print()
 
-    needs_avt = [i for i, (_, _, avt) in enumerate(all_pairs) if avt is None]
-    if needs_avt:
-        known_avts = list(dict.fromkeys(avt for _, _, avt in all_pairs if avt is not None))
-        detected_hint = known_avts[0] if known_avts else None
-        print(f"{len(needs_avt)} sample(s) have no AVT run assigned.")
-        avt_run = ask_avt_run(detected_hint)
-        if not avt_run:
-            sys.exit("Error: AVT run name cannot be empty.")
-        for i in needs_avt:
-            all_pairs[i] = (all_pairs[i][0], all_pairs[i][1], avt_run)
+    # GEX-parity prompt for run-less rows (shared helper): one question for
+    # ALL unassigned rows (hint = first detected run); 'Y' confirms, typing
+    # replaces; -n keeps the AVT0000-placeholder contract.
+    # require_known=False: GEX has no separate run-name confirmation, and
+    # the answer also feeds the main_avt pick below.
+    resolve_unassigned_avt(all_pairs, require_known=False)
 
     main_avt = (Counter(avt for _, _, avt in all_pairs if avt is not None)
                 .most_common(1)[0][0] if any(a for _, _, a in all_pairs) else "MIXED_runs")
@@ -1303,13 +1325,15 @@ def main():
     # kept and none are added (identical to the old behaviour).  Dropped
     # samples are removed from the generated script entirely — no per-sample
     # block, no cellranger invocation.  Added samples are each specified by
-    # the user as a FULL path to an avid folder (whose basename matches
-    # ``avid\d{4,6}``); these paths are used verbatim in the generated
+    # the user as a FULL path to the sample's FASTQ folder (any
+    # ``*idNNNNN`` directory holding R1/R2 fastqs); these paths are used
+    # verbatim in the generated
     # script and their AVT run is left ``None`` (unused, the path is
-    # self-referential).
+    # self-referential).  Basename must match ``FASTQ_ID_PATTERN``
+    # (``^[a-z]*id\d{4,6}$`` — avid/msid/nvid/…).
     kept_names, added_raw = ask_sample_selection(
         _prefilter_s2f,
-        default_root="/mnt/PTEGraw/AA/NGSruns/AVT/AV240401",
+        default_root=NGS_RUNS_ROOT,
     )
     if dropped_names := [sn for sn in _prefilter_s2f if sn not in kept_names]:
         print(f"  Dropped from script: {', '.join(dropped_names)}")
@@ -1341,7 +1365,9 @@ def main():
     # same avt.
     #
     # Samples the user ADDED on the command prompt (not from the Excel
-    # sheet) carry a user-supplied FULL path to each avid folder — that
+    # sheet) carry a user-supplied FULL path to each sample FASTQ folder
+    # (any ``*idNNNNN`` directory: avid13144, mhid00491, nvid06797, …) —
+    # that
     # is the location and no disambiguation prompt is needed.
     selected_dirs = {}
     for sn in dict.fromkeys(sn for sn, _, _ in all_pairs):
@@ -1398,24 +1424,33 @@ def main():
     print("Reading the requester (User) field and generating the script …", flush=True)
     user = read_user_field(xlsx_files[0])
 
-    script_content = build_script_full(reference_genome, all_pairs, user,
-                                       source_files=xlsx_files,
-                                       chosen_sample_dirs=chosen_for_build,
-                                       added_paths=added_paths,
-                                       # Keep datasheet order for the
-                                       # 01_/02_/… numbering: the common
-                                       # order of ALL input files when they
-                                       # agree, else the FIRST file's order
-                                       # (see merge_sample_order).  Samples
-                                       # added off-prompt by full path are
-                                       # not in this list and are appended
-                                       # in the order the user added them.
-                                       ordered_samples=merged_sample_order,
-                                       # Per-sample folder numbering (01_,
-                                       # 02_, …) is ON by default;
-                                       # --no-number-prefix disables it.
-                                       number_prefix=not args.no_number_prefix)
-    out_script = f"cellranger-count_{main_avt}.sh"
+    # Multi-run inputs: the script name and the working/archive folder
+    # enumerate every AVT run the kept samples resolve under (sorted
+    # numerically), e.g. cellranger-count_AVT0001_AVT0002.sh and
+    # AVT0001_AVT0002_user_$TIMESTAMP; a single-run input keeps the plain
+    # name.  (Samples added off-prompt carry no AVT — their path is
+    # self-referential.)
+    avt_tag = avt_run_tag(avt for _, _, avt in all_pairs if avt) or main_avt
+    script_content = build_script_full(
+        reference_genome, all_pairs, user,
+        avt_tag=avt_tag,
+        source_files=xlsx_files,
+        chosen_sample_dirs=chosen_for_build,
+        added_paths=added_paths,
+        # Keep datasheet order for the
+        # 01_/02_/… numbering: the common
+        # order of ALL input files when they
+        # agree, else the FIRST file's order
+        # (see merge_sample_order).  Samples
+        # added off-prompt by full path are
+        # not in this list and are appended
+        # in the order the user added them.
+        ordered_samples=merged_sample_order,
+        # Per-sample folder numbering (01_,
+        # 02_, …) is ON by default;
+        # --no-number-prefix disables it.
+        number_prefix=not args.no_number_prefix)
+    out_script = f"cellranger-count_{avt_tag}.sh"
     with open(out_script, "w") as f:
         f.write(script_content)
     os.chmod(out_script, 0o755)

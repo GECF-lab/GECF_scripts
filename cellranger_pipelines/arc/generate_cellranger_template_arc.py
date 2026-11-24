@@ -8,8 +8,13 @@ Usage:
 
 Reads one or more AVT submission Excel files. From each workbook it
 extracts the ``Sample name`` and ``GECF fastq ID (avidxxxx)`` columns,
-a run name matching ``AVT0XXX`` (any cell or the file name), and the
-requester (first word of the ``User:`` cell, if present).
+a run name with a GECF sequencer code (``AVT``/``MSH``/``MSQ``/``NVQ``;
+any cell or the file name), and the
+requester (first word of the ``User:`` cell, if present).  When the inputs
+span several AVT runs, every run is listed in the generated script's name
+(``cellranger-arc_AVT0001_AVT0002.sh``; the working/archive folder
+``AVT0001_AVT0002_user_$TIMESTAMP`` carries the same tag) — a single-run
+input keeps the plain ``cellranger-arc_<AVT>.sh`` name.
 
 Libraries are grouped by biologic sample: the base name is the sample
 name with a trailing ``_GEX`` / ``_ATAC`` suffix removed, and each
@@ -72,9 +77,12 @@ if _CELLRANGER_PIPELINES_ROOT not in sys.path:
 # scan) are imported from there and used by both this generator and the
 # ATAC generator on an identical code path.
 from common.intake import (
-    NGS_BASE_DIR_TEMPLATE,
+    run_base_dir,        # run name -> base folder (all sequencers: AVT/MSH/MSQ/NVQ…)
     AVT_PATTERN,
-    FASTQ_ID_PATTERN,   # row gate: ^avid\d{4,6}$ — single source of truth
+    avt_run_tag,         # multi-run tag (AVT0001_AVT0002) for script/folder names
+    inherit_file_avt,    # rows inherit the run named in their OWN file
+    resolve_unassigned_avt,  # GEX 'needs_avt' prompt (shared) for run-less rows
+    FASTQ_ID_PATTERN,   # row gate: ^[a-z]*id\d{4,6}$ (case-insens.) — single source of truth
     LOCAL_CORES,        # cellranger --localcores (shared default "32")
     LOCAL_MEM,          # cellranger --localmem   (shared default "126")
     norm,
@@ -88,7 +96,8 @@ from common.intake import (
     # Same shared helpers the GEX generator uses for its sample-selection
     # prompt and run-folder disambiguation (single source of truth in
     # common.intake).
-    ask_sample_selection,        # keep/drop + add sheet-less samples
+    ask_sample_selection,
+    NGS_RUNS_ROOT,          # prefill root for the add-sample prompt
     list_sample_dirs,            # candidate dirs for one (AVT, sample)
     choose_sample_dir,           # pick ONE when >1 candidate
     find_fastq_path_with_pref,   # resolve an avid id honouring the pick
@@ -103,9 +112,11 @@ from common.intake import (
 # 1.3.1 = one TSO% section per GEX-leg run: every GEX fastq (Read-2) of a
 #         sample is measured, not just the first leg; report sections are
 #         labeled <NN_sample>__<avid>.
-SCRIPT_VERSION = "1.3.1"
+# 1.3.4 = archive root moved off the sequencer folder: results now deploy
+#         to the shared, sequencer-agnostic /mnt/PTEGraw/AA/NGSruns/ZZ_10XG/.
+SCRIPT_VERSION = "1.3.4"
 
-NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/AVT/AV240401/ZZ_10XG/arc"
+NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/ZZ_10XG/arc"
 
 # Reference-genome root.  The genome folder inside each ``current_*``
 # directory is never hard-coded here: each of them holds exactly one
@@ -278,7 +289,7 @@ def _locate_header(ws, merged_lookup):
     for row_idx in range(1, min(25, ws.max_row) + 1):
         for col_idx in range(1, ws.max_column + 1):
             v = norm(get_cell_value(ws, merged_lookup, row_idx, col_idx))
-            if "fastq id" in v and "avid" in v and fastq_col is None:
+            if "fastq id" in v and fastq_col is None:
                 fastq_col = col_idx
             if "sample name" in v and sample_col is None:
                 sample_col = col_idx
@@ -368,10 +379,16 @@ def best_data_sheet(wb):
          multi-user ``whole_severaluser`` summary) yields the most valid
          rows. ``Spike_*`` sheets are listed for context only and ranked
          last, since spike controls belong to a different pipeline input.
+         ``GUIDELINES`` legend sheets and ``Index table MM.YY`` reference
+         sheets are never considered (they carry GECF facility text, not
+         sample data).
     """
     parsed = []
     for name in wb.sheetnames:
         ws = wb[name]
+        lo = name.lower()
+        if "guideline" in lo or "index table" in lo:
+            continue  # legend/ref sheets (GUIDELINES, 'Index table MM.YY') — never data
         if ws.max_row is None or ws.max_row < 2:
             continue
         try:
@@ -430,9 +447,9 @@ def parse_xlsx(path):
             deduped.append((sample, fastq, avt))
         rows = deduped
 
-    # Sheet-wide fallback: rows that do not name a run inherit the AVT run
-    # found in any data cell of the table (a run name written once in the
-    # sheet), so per-sample resolution still has a value to hang on.
+    # Per-file fallback: rows that do not name a run inherit the AVT run
+    # found in any data cell of their own table (a run name written once in
+    # that sheet), so per-sample resolution still has a value to hang on.
     sheet_avt = None
     for sample, fastq, avt in rows:
         m = (AVT_PATTERN.search(avt) if avt else None) \
@@ -791,7 +808,8 @@ def build_stats_block(groups, fid_avt, avt_run, reference_genome):
 def build_script(reference_genome, groups, avt_run, user, run_dir,
                  source_files=None, resolve=None, fid_avt=None,
                  number_prefix=True):
-    """Emit the ``cellranger-arc_AVT0XXX.sh`` text.
+    """Emit the ``cellranger-arc_<AVT>.sh`` text (multi-run inputs:
+    ``cellranger-arc_AVT0001_AVT0002.sh``).
 
     ``resolve`` maps ``(sample_base, fastq_id)`` to a leaf directory (or
     None); resolved at generation time and baked into the .sh as literal
@@ -1459,14 +1477,17 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Parses one or more AVT submission Excel files and generates a "
-            "cellranger-arc_AVT0XXX.sh script with one `cellranger-arc count` "
+            "cellranger-arc_<AVT>.sh script (multi-run inputs: "
+            "cellranger-arc_AVT0001_AVT0002.sh) with one `cellranger-arc count` "
             "per biologic sample (GEX + ATAC libraries grouped under the "
             "base sample name)."
         ),
         epilog=(
             "Example:\n"
             "  python3 %(prog)s samples.xlsx\n"
-            "  python3 %(prog)s -n run1.xlsx run2.xlsx run3.xlsx"
+            "  python3 %(prog)s -n run1.xlsx run2.xlsx run3.xlsx\n"
+            "#   -> one merged script, named after every run it contains:\n"
+            "#   cellranger-arc_AVT0001_AVT0002.sh"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1482,7 +1503,7 @@ def main():
     )
     parser.add_argument(
         "--non-interactive", "-n", action="store_true", default=False,
-        help="Skip prompts; use the detected AVT run name.",
+        help="Skip prompts; use the detected run name (AVT/MSH/MSQ/NVQ code).",
     )
     parser.add_argument(
         "--genome", choices=["human", "mouse"], default="human",
@@ -1519,7 +1540,9 @@ def main():
         print(f"Reading '{os.path.basename(path)}' …", flush=True)
         rows, avt = parse_xlsx(path)
         if rows:
-            all_rows.extend(rows)
+            # Per-file run inheritance (GEX parity): rows that name no run
+            # take the run THIS FILE names (row-level names win).
+            all_rows.extend(inherit_file_avt(rows, avt))
         if avt:
             detected_avts.append(avt)
         if not any_user:
@@ -1540,7 +1563,16 @@ def main():
     else:
         any_avt = ask_avt_run(any_avt)
     if not any_avt:
-        sys.exit("Error: AVT run name cannot be empty.")
+        sys.exit("Error: run name cannot be empty.")
+
+    # GEX parity (shared helper): rows whose file named no run get ONE
+    # explicit prompt (hint = first detected run) instead of silently
+    # inheriting the representative run.  Rows that already carry a run —
+    # stamped per-file by inherit_file_avt() or named on the row — are
+    # left untouched.  Skipped when NO run is detected anywhere: any_avt
+    # above already holds the answer and the 'or any_avt' fallbacks cover
+    # these rows (single prompt, like GEX in that case).
+    resolve_unassigned_avt(all_rows)
 
     # ── Parity item 3: sample selection (keep/drop + add sheet-less) ───
     # Same shared helper + prompt as the GEX generator.  ``ask_sample_selection``
@@ -1560,7 +1592,7 @@ def main():
         sample_fastqs[base_sample_name(_sample)].append((
             (_fid or ""), (_ravt or any_avt)))
     kept_names, added_raw = ask_sample_selection(
-        sample_fastqs, default_root=NGSruns_ARCHIVE_DIR)
+        sample_fastqs, default_root=NGS_RUNS_ROOT)
     if dropped := [sn for sn in sample_fastqs if sn not in kept_names]:
         print(f"  Dropped from script: {', '.join(dropped)}")
     all_rows = [r for r in all_rows
@@ -1583,7 +1615,8 @@ def main():
     # Each sample's FASTQ is resolved under the AVT run named on its own sheet
     # row (the run may sit in the fastq-ID cell or an adjacent cell), so a
     # worksheet mixing two runs resolves correctly.  A row that names no run
-    # inherits the sheet-wide / file-name-detected run; a sample added by full
+    # inherits the run named by its own file (rows whose file names no run
+    # were explicitly prompted for one first — GEX parity); a sample added by full
     # path keeps the run implied by the folder that was typed.  When every
     # FASTQ names one run, the outcome is identical to the pre-item-11
     # generator (single-run workspace).
@@ -1609,7 +1642,7 @@ def main():
         HUMAN_GENOME_PATH, MOUSE_GENOME_PATH, default_path=default_genome,
         human_label="Human", mouse_label="Mouse")
     user = any_user
-    run_dir = NGS_BASE_DIR_TEMPLATE.format(avt_run=any_avt)
+    run_dir = run_base_dir(any_avt)
 
     # ── Parity item 4: run-folder disambiguation (AVT0551 case) ─────────
     # Before: resolve_fastq_leaf() blind-walked the run tree and took the
@@ -1645,14 +1678,21 @@ def main():
                                             preferred_sample_dir=pref)
             if hit:
                 return hit
-        _run = NGS_BASE_DIR_TEMPLATE.format(avt_run=_f_avt)
+        _run = run_base_dir(_f_avt)
         return resolve_fastq_leaf(_run, _fid)     # full-tree walk (parity item 11)
 
-    script = build_script(reference_genome, groups, any_avt, user, run_dir,
+    # Multi-run inputs: the script name and the working/archive folder
+    # enumerate every AVT run the kept FASTQs resolve under (sorted
+    # numerically), e.g. cellranger-arc_AVT0001_AVT0002.sh and
+    # AVT0001_AVT0002_user_$TIMESTAMP; a single-run input keeps the plain
+    # name.  (run_dir above stays per-row: it is only the fallback for
+    # rows that name no AVT.)
+    avt_tag = avt_run_tag(set(fid_avt.values()) | set(base_avt.values())) or any_avt
+    script = build_script(reference_genome, groups, avt_tag, user, run_dir,
                           resolve=resolve, source_files=source_files,
                           fid_avt=fid_avt,
                           number_prefix=not args.no_number_prefix)
-    out_script = f"cellranger-arc_{any_avt}.sh"
+    out_script = f"cellranger-arc_{avt_tag}.sh"
     with open(out_script, "w") as f:
         f.write(script)
     os.chmod(out_script, 0o755)

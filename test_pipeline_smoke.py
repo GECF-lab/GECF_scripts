@@ -13,9 +13,9 @@ Scope:
   * assert each generator exposes its expected public entry points.
 
 Out of scope (intentionally):
-  * No workbook I/O. This test runs on the drafting box and does not
-    require mounted server data. A/A fixture diffing of emitted scripts is
-    a separate (server-side) concern.
+  * No mounted server data. The TSO% rendering checks (section 5b) run the
+    generators non-interactively against a synthetic fixture built in a
+    temp dir — unresolved fastq paths are expected and tolerated there.
 
 Exit code: 0 on all-pass, 1 on any failure.
 Run:  python3 test_pipeline_smoke.py
@@ -39,9 +39,13 @@ FILES = [
 ]
 
 SHARED_ATOMS = [
-    "NGS_BASE_DIR_TEMPLATE",
-    "AVT_PATTERN",
-    "FASTQ_ID_PATTERN",
+    "run_base_dir",           # run name (AVT/MSH/MSQ/NVQ…) -> base folder
+    "AVT_PATTERN",            # run-name regex (all GECF sequencer codes)
+    "FASTQ_ID_PATTERN",       # fastq-id leaf regex (avid/mhid/msid/nvid…)
+    "avt_run_tag",            # multi-run tag for script/folder names
+    "resolve_unassigned_avt", # run-name prompt for run-less rows
+    "choose_sample_dir",      # run-folder / index-attempt disambiguation
+    "list_sample_dirs",       # list candidate sample dirs for a run
     "norm",
     "build_merged_cell_lookup",
     "get_cell_value",
@@ -50,6 +54,7 @@ SHARED_ATOMS = [
     "setup_readline_completer",
     "ask_avt_run",
     "ask_reference_genome",
+    "ask_sample_selection",
 ]
 
 # Emitted by the arc AND gex generators (cellranger(-arc) count uses
@@ -131,6 +136,11 @@ def main() -> int:
     check("arc.SCRIPT_VERSION defined",
           bool(re.fullmatch(r"\d+\.\d+\.\d+", getattr(arc, "SCRIPT_VERSION", ""))),
           "expected a semver string")
+    # Archive root must be the shared, sequencer-agnostic ZZ_10XG tree
+    # (moved off AVT/AV240401/ZZ_10XG on 2026-11-24).
+    check("arc.NGSruns_ARCHIVE_DIR under shared ZZ_10XG root",
+          getattr(arc, "NGSruns_ARCHIVE_DIR", "").startswith("/mnt/PTEGraw/AA/NGSruns/ZZ_10XG/"),
+          f"got {getattr(arc, 'NGSruns_ARCHIVE_DIR', None)!r}")
     rc, out, err = sh_out([sys.executable, os.path.join(
         REPO, "cellranger_pipelines/arc/generate_cellranger_template_arc.py"), "-v"])
     check("arc generator -v exits 0 and prints the version",
@@ -152,6 +162,10 @@ def main() -> int:
     check("atac.find_fastq_path callable",
           callable(getattr(atac, "find_fastq_path", None)))
     check("atac.main callable", callable(getattr(atac, "main", None)))
+    # Archive root must be the shared, sequencer-agnostic ZZ_10XG tree.
+    check("atac.NGSruns_ARCHIVE_DIR under shared ZZ_10XG root",
+          getattr(atac, "NGSruns_ARCHIVE_DIR", "").startswith("/mnt/PTEGraw/AA/NGSruns/ZZ_10XG/"),
+          f"got {getattr(atac, 'NGSruns_ARCHIVE_DIR', None)!r}")
     check("atac dead 'build_script' removed",
           "build_script" not in dir(atac),
           "the old 2-arg build_script that appended to a module-global 'lines'")
@@ -171,6 +185,10 @@ def main() -> int:
     check("gex.find_fastq_path callable",
           callable(getattr(gex, "find_fastq_path", None)))
     check("gex.main callable", callable(getattr(gex, "main", None)))
+    # Archive root must be the shared, sequencer-agnostic ZZ_10XG tree.
+    check("gex.NGSruns_ARCHIVE_DIR under shared ZZ_10XG root",
+          getattr(gex, "NGSruns_ARCHIVE_DIR", "").startswith("/mnt/PTEGraw/AA/NGSruns/ZZ_10XG/"),
+          f"got {getattr(gex, 'NGSruns_ARCHIVE_DIR', None)!r}")
     # Sample-selection helper (keep a subset / add sheet-less samples) is a
     # shared intake atom adopted by gex; it must be the SAME object as the
     # common.intake one (single source of truth).
@@ -192,6 +210,225 @@ def main() -> int:
               hasattr(gex, name) or name in open(os.path.join(
                   REPO, "cellranger_pipelines", "gex",
                   "generate_cellranger_template_gex.py")).read())
+
+    # ------------------------------------------------------ TSO% (multi-avid)
+    print("\n== 5b. TSO% report: one section per (sample, avid) ==")
+    # Synthetic fixture (no mounted server data): one sample with TWO avid
+    # runs + one single-run sample.  Non-interactive generation tolerates
+    # the unresolved fastq paths (FIXME_LOCATE_ markers) — the TSO plumbing
+    # text is what is under test here.
+    import shutil, subprocess, tempfile
+    tso_dir = tempfile.mkdtemp(prefix="tso_fixture_")
+    try:
+        import openpyxl
+        for fname, sample_a, sample_b in [
+            ("gex_tso.xlsx", "TSOTST01", "TSOTST02"),
+            ("arc_tso.xlsx", "TSOTST01_GEX", "TSOTST02_ATAC"),
+        ]:
+            wb = openpyxl.Workbook()
+            ws = wb.worksheets[0]
+            ws.title = "User_x1x_copy"
+            ws.append(["Sample name", "GECF fastq ID (avidxxxx)", "AVT run"])
+            ws.append([sample_a, "avid13798", "AVT0600"])
+            ws.append([sample_a, "avid14110", "AVT0600"])
+            ws.append([sample_b, "avid13799", "AVT0600"])
+            wb.save(os.path.join(tso_dir, fname))
+
+        gex_gen = os.path.join(
+            REPO, "cellranger_pipelines/gex/generate_cellranger_template_gex.py")
+        arc_gen = os.path.join(
+            REPO, "cellranger_pipelines/arc/generate_cellranger_template_arc.py")
+
+        p = subprocess.run([sys.executable, gex_gen, "gex_tso.xlsx", "-n"],
+                           capture_output=True, text=True, timeout=60, cwd=tso_dir)
+        gex_sh = None
+        if p.returncode == 0:
+            cand = os.path.join(tso_dir, "cellranger-count_AVT0600.sh")
+            if os.path.isfile(cand):
+                gex_sh = open(cand).read()
+        check("gex: 2-avid sample emits one TSO block per avid",
+              gex_sh is not None
+              and "tso_report_parts/01_TSOTST01__avid13798.txt" in gex_sh
+              and "tso_report_parts/01_TSOTST01__avid14110.txt" in gex_sh,
+              f"rc={p.returncode} err={(p.stderr or '')[-200:]!r}")
+        check("gex: 1-avid sample emits its own TSO block",
+              gex_sh is not None
+              and "tso_report_parts/02_TSOTST02__avid13799.txt" in gex_sh)
+        i1 = gex_sh.find("cat \"${Server_folder}/tso_report_parts/01_TSOTST01__avid13798.txt\"") if gex_sh else -1
+        i2 = gex_sh.find("cat \"${Server_folder}/tso_report_parts/01_TSOTST01__avid14110.txt\"") if gex_sh else -1
+        i3 = gex_sh.find("cat \"${Server_folder}/tso_report_parts/02_TSOTST02__avid13799.txt\"") if gex_sh else -1
+        check("gex: assembler cats every (sample, avid) part in order",
+              -1 < i1 < i2 < i3,
+              f"indices: {i1}, {i2}, {i3}")
+
+        p2 = subprocess.run([sys.executable, arc_gen, "arc_tso.xlsx", "-n"],
+                            capture_output=True, text=True, timeout=60, cwd=tso_dir)
+        arc_sh = None
+        if p2.returncode == 0:
+            cand = os.path.join(tso_dir, "cellranger-arc_AVT0600.sh")
+            if os.path.isfile(cand):
+                arc_sh = open(cand).read()
+        check("arc: 2-GEX-leg sample emits one TSO block per GEX leg",
+              arc_sh is not None
+              and "tso_report_parts/01_TSOTST01__avid13798.txt" in arc_sh
+              and "tso_report_parts/01_TSOTST01__avid14110.txt" in arc_sh,
+              f"rc={p2.returncode} err={(p2.stderr or '')[-200:]!r}")
+        check("arc: ATAC-only sample skips TSO (no part for it)",
+              arc_sh is not None
+              and "TSO% step skipped (ATAC-only)" in arc_sh
+              and "02_TSOTST02__" not in arc_sh)
+    finally:
+        shutil.rmtree(tso_dir, ignore_errors=True)
+
+    # ------------------------------------------------ MSH workbook (mhid IDs)
+    print("\n== 5c. MSH workbook: mhid IDs + GECF legend sheets ==")
+    # Non-AVT (MSH shared-MiSeq) workbook: fastq IDs are named ``mhid####``,
+    # plus GECF facility sheets — a GUIDELINES legend, a Design sample table,
+    # a User_copy mirror with a QC "0" grid, an Option Index (index-
+    # assignment view, real rows) and an 'Index table MM.YY' legend
+    # (PhiX_i7/i5_backbone/Ad1noMX).  Expected: the mhid rows parse in all
+    # three generators; the legend sheets are never a data source; the "0"
+    # grid adds no rows and no per-row warnings.
+    msh_dir = tempfile.mkdtemp(prefix="msh_fixture_")
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.worksheets[0]
+        ws.title = "GUIDELINES"
+        for a, b in [("PhiX_i7", "-"), ("PhiX_i5", "-"),
+                     ("i5_backbone", "truseqLT_fake_i5, NEBNext_pseudo_i5"),
+                     ("Ad1noMX", "-"), ("General design", "yes")]:
+            ws.append([a, b])
+        ws = wb.create_sheet("Design")
+        ws.cell(row=7, column=1, value="Basic table for MSH0099")
+        for c, v in enumerate(
+                ["GECF fastq ID (MHIDxxxx)", "GECF experiment code",
+                 "tube label", "Sample name"], 1):
+            ws.cell(row=8, column=c, value=v)
+        for i, (fid, name) in enumerate(
+                [("mhid00491", "c9_1H"), ("mhid00492", "c9_2V"),
+                 ("mhid00493", "c9_3H")]):
+            ws.cell(row=9 + i, column=1, value=fid)
+            ws.cell(row=9 + i, column=2, value="ULX9999")
+            ws.cell(row=9 + i, column=3, value=name)
+            ws.cell(row=9 + i, column=4, value=name)
+        ws.cell(row=12, column=1, value="Run details")
+        ws.cell(row=12, column=2, value="Loaded molarity (pM)")
+        ws = wb.create_sheet("User_copy")
+        for c, v in enumerate(
+                ["GECF fastq ID (msidxxxx) (0)", "GECF experiment code (0)",
+                 "tube label (0)", "Sample name (0)"], 1):
+            ws.cell(row=7, column=c, value=v)
+        for i, (fid, name) in enumerate(
+                [("mhid00491", "c9_1H"), ("mhid00492", "c9_2V"),
+                 ("mhid00493", "c9_3H")]):
+            ws.cell(row=8 + i, column=1, value=fid)
+            ws.cell(row=8 + i, column=4, value=name)
+        for i in range(3):  # QC "0" grid rows (present in real MSH workbooks)
+            ws.cell(row=11 + i, column=1, value="0")
+            ws.cell(row=11 + i, column=4, value="0")
+        ws = wb.create_sheet("Option Index")  # index-assignment view: real rows
+        for c, v in enumerate(
+                ["GECF fastq ID (msidxxxx)", "Library tube label",
+                 "Sample name", "User name", "Index1 (i7)"], 1):
+            ws.cell(row=6, column=c, value=v)
+        for i, (fid, tube) in enumerate(
+                [("mhid00491", "c9_1H"), ("mhid00492", "c9_2V"),
+                 ("mhid00493", "c9_3H")]):
+            ws.cell(row=8 + i, column=1, value=fid)
+            ws.cell(row=8 + i, column=2, value=tube)
+            ws.cell(row=8 + i, column=3, value=tube)
+        ws.cell(row=11, column=3, value="PhiX")  # control row, no fastq ID
+        ws = wb.create_sheet("Index table 08.26")  # legend: must never be data
+        for r, (a, b) in enumerate(
+                [("Index", "Bases in primer"),
+                 ("PhiX_i7", "GGGGGGGG"), ("PhiX_i5", "TGATCTCG"),
+                 ("i5_backbone", "AGATCTAG"), ("Ad1noMX", "GTGTAGAT")], 1):
+            ws.cell(row=r, column=1, value=a)
+            ws.cell(row=r, column=2, value=b)
+        wb.save(os.path.join(msh_dir, "MSH0099_Bing_copy.xlsx"))
+
+        atac_gen = os.path.join(
+            REPO, "cellranger_pipelines/atac/generate_cellranger_template_atac.py")
+        # The fixture's Design sheet names run MSH0099 — the generalized
+        # intake must pick it up for EVERY sequencer code (ROADMAP item 2)
+        # and name the generated script after the detected run, not the
+        # AVT0000 placeholder.
+        msh_gens = [
+            ("atac", atac_gen, "cellranger-atac_MSH0099.sh"),
+            ("arc", arc_gen, "cellranger-arc_MSH0099.sh"),
+            ("gex", gex_gen, "cellranger-count_MSH0099.sh"),
+        ]
+        for tag, genpath, outsh in msh_gens:
+            p = subprocess.run(
+                [sys.executable, genpath, "MSH0099_Bing_copy.xlsx", "-n"],
+                capture_output=True, text=True, timeout=60, cwd=msh_dir)
+            sh_txt = ""
+            cand = os.path.join(msh_dir, outsh)
+            if os.path.isfile(cand):
+                sh_txt = open(cand).read()
+                os.remove(cand)
+            blob = (p.stdout or "") + (p.stderr or "") + sh_txt
+            check(f"{tag}: MSH mhid rows parse (no legend contamination)",
+                  p.returncode == 0
+                  and all(i in (p.stdout or "")
+                          for i in ("mhid00491", "mhid00492", "mhid00493"))
+                  and all(i in sh_txt
+                          for i in ("mhid00491", "mhid00492", "mhid00493"))
+                  and "Sample 4" not in sh_txt
+                  and not any(leg in sh_txt
+                              for leg in ("PhiX", "i5_backbone", "Ad1noMX")),
+                  f"rc={p.returncode} out={(p.stdout or '')[-300:]!r}")
+            check(f"{tag}: '0' QC grid adds no rows and no per-row warnings",
+                  "sample '0'" not in (p.stdout or "")
+                  and "has only one of" not in (p.stdout or "")
+                  and "Sample 4" not in sh_txt,
+                  f"stdout={(p.stdout or '')[-300:]!r}")
+            check(f"{tag}: MSH0099 run name detected, script named after it",
+                  "MSH0099" in (p.stdout or "")
+                  and outsh in (p.stdout or ""),
+                  f"stdout={(p.stdout or '')[-300:]!r}")
+
+        # ── run-LESS workbook: the AVT0000 placeholder contract ─────────────
+        # No AVT/MSH/MSQ/NVQ code anywhere in the workbook or file name →
+        # the script is still generated, under the placeholder run name,
+        # with a loud warning pointing at the variable(s) to fix.
+        nocode = os.path.join(msh_dir, "NOCODE_runless.xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.worksheets[0]
+        ws.title = "User_copy"
+        for c, v in enumerate(["Sample name", "GECF fastq ID (msidxxxx)"], 1):
+            ws.cell(row=1, column=c, value=v)
+        for i, (fid, name) in enumerate(
+                [("mhid00491", "c9_1H"), ("mhid00492", "c9_2V")]):
+            ws.cell(row=2 + i, column=1, value=name)
+            ws.cell(row=2 + i, column=2, value=fid)
+        wb.create_sheet("Design")["A1"] = "Basic table"  # no run code visible
+        wb.save(nocode)
+        nocode_gens = [
+            ("atac", atac_gen, "cellranger-atac_AVT0000.sh"),
+            ("arc", arc_gen, "cellranger-arc_AVT0000.sh"),
+            ("gex", gex_gen, "cellranger-count_AVT0000.sh"),
+        ]
+        for tag, genpath, outsh in nocode_gens:
+            p = subprocess.run(
+                [sys.executable, genpath, "NOCODE_runless.xlsx", "-n"],
+                capture_output=True, text=True, timeout=60, cwd=msh_dir)
+            sh_txt = ""
+            cand = os.path.join(msh_dir, outsh)
+            if os.path.isfile(cand):
+                sh_txt = open(cand).read()
+                os.remove(cand)
+            blob = (p.stdout or "") + (p.stderr or "")
+            check(f"{tag}: run-less workbook → loud AVT0000 placeholder",
+                  p.returncode == 0
+                  and outsh in (p.stdout or "")
+                  and "no run name detected" in blob
+                  and "AVT0000" in blob
+                  and (not sh_txt or "AVT0000" in sh_txt),
+                  f"rc={p.returncode} out={(p.stdout or '')[-300:]!r}")
+    finally:
+        shutil.rmtree(msh_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------ BRBseq
     print("\n== 6. BRBseq pipeline (Alithea / MERCURIUS 3) ==")

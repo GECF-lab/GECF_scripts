@@ -37,7 +37,7 @@
 <main>
   <h1>ARC (Multiome) pipeline: How to use it</h1>
   <p class="subtitle">Generate the script from your Excel file, adjust any settings you need, then run it.</p>
-  <p>ARC counts both a <strong>GEX</strong> (RNA) leg and an <strong>ATAC</strong> (chromatin) leg for each sample in a single <code>cellranger-arc count</code> run; the script handles that per-sample pairing for you.</p>
+  <p>ARC counts both a <strong>GEX</strong> (RNA) leg and an <strong>ATAC</strong> (chromatin) leg for each sample in a single <code>cellranger-arc count</code> run; the script handles that per-sample pairing for you. The pairing is name-driven, which matters in two places below: how sample names are written in the Excel sheet, and how sheet-less samples are added at the prompt.</p>
 
   <h2>Step 1: Generate the script</h2>
   <p>Run the generator with your run's Excel file (the one named after the run, e.g. <code>AVT0571_Arianna_GECF Copy.xlsx</code>):</p>
@@ -49,13 +49,33 @@
   <p>Each sample's output folder is prefixed with its number in sample order (<code>01_Name_of_sample</code>, <code>02_…</code>, <code>03_…</code>), so the folders always appear in the order of your samples, even when the names themselves are not alphabetical (from 10 samples up the numbers continue 10, 11, …). If you prefer bare sample names without the number, add <code>--no-number-prefix</code> to the command:</p>
   <pre><code>python3 generate_cellranger_template_arc.py --no-number-prefix "AVT0571_Arianna_GECF Copy.xlsx"</code></pre>
 
+  <h3>Sample naming: how the GEX and ATAC legs are paired</h3>
+  <p>The leg of every FASTQ is decided by the <strong>suffix of its sample name</strong> (case-insensitive):</p>
+  <ol>
+    <li><code>Name_ATAC</code> (or <code>name_atac</code>) → chromatin (ATAC) leg.</li>
+    <li><code>Name_GEX</code> → RNA (GEX) leg.</li>
+    <li>Any other name → counted as a <strong>GEX</strong> leg, by default.</li>
+  </ol>
+  <p>Legs that share the same base name are grouped into one biologic sample and counted in a single <code>cellranger-arc count</code>: <code>Sample1_GEX</code> + <code>Sample1_ATAC</code> become one sample, <code>Sample1</code>. GEX-only and ATAC-only samples (a single leg) run the same way. The base name — the name without the leg suffix — is the sample name used everywhere in the outputs (output folder, libraries CSV, stats sheet): the suffix is a classification tag, never part of the result name.</p>
+  <div class="warn"><strong>Check the summary table.</strong> Right after the Samples question, the generator prints a <em>Biologic samples</em> table with a GEX count and an ATAC count per sample. A GEX+ATAC pair must show <code>1</code> and <code>1</code>. If a multiome sample shows <code>2 GEX, 0 ATAC</code>, its ATAC name is missing the <code>_ATAC</code> suffix and both legs will be processed as RNA — fix the name and regenerate before running the script.</div>
+
   <p>It asks up to four questions, each answered by typing a number (or a path, or yes/no) and pressing enter. Not every run needs every question: the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
   <ol>
     <li><strong>AVT run name:</strong> only when some samples have no detected run name. Confirm the detected value, or type the correct <code>AVT0XXX</code>.</li>
-    <li><strong>Samples.</strong> Detected samples are listed. Keep the ones to run; a sample missing from the list can be added by its full data-folder path. Ends with a summary of the final sample list.</li>
+    <li><strong>Samples.</strong> Detected samples are listed. Keep the ones to run, drop others, and add samples that are missing from the sheet. How to answer each of its sub-prompts and how to leave it is detailed in <em>How the Samples question works</em> below.</li>
     <li><strong>Data folder:</strong> shown only when a sample name exists in more than one run folder. Pick the correct one by number; a single match is used automatically.</li>
     <li><strong>Genome:</strong> 1 human, 2 mouse (there is no combined reference for ARC). You can also type a full path to any other reference genome directory to use a custom one. The exact genome file/folder name inside each reference is resolved automatically, so no need to specify it.</li>
   </ol>
+
+  <h3>How the Samples question works</h3>
+  <p>The detected samples are listed with numbers; a GEX+ATAC pair appears as <strong>one</strong> entry (both legs folded together). Then:</p>
+  <ol>
+    <li><strong>"Keep which samples?"</strong> — answer with numbers (<code>1 3</code>), exact sample names, or just press Enter to keep everything. <code>s</code> lists the FASTQ behind each entry.</li>
+    <li><strong>"Confirm this sample set? [y/N]"</strong> — <code>y</code> = the keep selection is final and you continue; <code>N</code> = answer the previous question again.</li>
+    <li><strong>"Add another sample that is not in the Excel sheet? [y/N]"</strong> — <code>n</code> = nothing more to add: this ends the Samples question and the generator moves on to the next one (data folder, then genome). With <code>y</code>, type the sample name, then the full path(s) of its FASTQ folder(s) — a lone Enter finishes that sample's folder list — and the same question comes back; keep answering it until you are done and close it with <code>n</code>.</li>
+  </ol>
+  <p>In short: the selection <strong>ends</strong> when you answer <code>y</code> at "Confirm this sample set?" and <code>n</code> at "Add another sample?"; everything after that (the <em>Biologic samples</em> summary table, the data-folder question, the genome question) just continues on. <code>N</code> anywhere means "one step back, answer again".</p>
+  <p>A GEX+ATAC pair that is missing from the Excel must therefore be added <strong>twice</strong>: once as <code>Sample1_GEX</code> with the GEX folder, once as <code>Sample1_ATAC</code> with the ATAC folder. One name with both folders would make both legs GEX — the name suffix is the only thing that tells the two legs apart (see the naming rule above).</p>
 
   <p>On success it writes <code>cellranger-arc_AVT0XXX.sh</code> in the current directory. That file is your pipeline.</p>
 
