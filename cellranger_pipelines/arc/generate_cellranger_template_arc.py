@@ -114,7 +114,25 @@ from common.intake import (
 #         labeled <NN_sample>__<avid>.
 # 1.3.4 = archive root moved off the sequencer folder: results now deploy
 #         to the shared, sequencer-agnostic /mnt/PTEGraw/AA/NGSruns/ZZ_10XG/.
-SCRIPT_VERSION = "1.3.4"
+# 1.3.5 = dropped the redundant run-name confirm prompt (GEX parity): the
+#         representative run is only the fallback for rows that name no run
+#         (those get the dedicated 'needs_avt' prompt); if every row carries
+#         its own run, nothing run-related is asked.
+# 1.3.6 = also dropped the 'Run name: <representative>' summary line: when
+#         rows carry their own runs no representative is chosen, so there is
+#         nothing to announce (per-row runs + the avt_run tag are the truth).
+# 1.3.7 = run-less rows are now asked PER SAMPLE (name + FASTQ id shown)
+#         instead of one batched question for all of them (shared
+#         resolve_unassigned_avt() in common/intake.py, also in ATAC/GEX).
+# 1.3.8 = the per-sample run-name question is now asked in ALL cases —
+#         including when NO run is detected anywhere (GEX behaviour) —
+#         instead of one global 'Enter run name' up front; any_avt stays a
+#         pure fallback derived from the rows afterwards.
+# 1.3.9 = the run-name question now opens with a one-line WHY (the run
+#         folder is where the sample's FASTQ files are stored, so the
+#         script can find them) — text lives in common/intake.py, all
+#         three generators affected.
+SCRIPT_VERSION = "1.3.9"
 
 NGSruns_ARCHIVE_DIR = "/mnt/PTEGraw/AA/NGSruns/ZZ_10XG/arc"
 
@@ -251,15 +269,13 @@ DELETE_FALLBACK = (
 # per sample at the top of the generated .sh (mirrors gex._PER_SAMPLE_PARAMS,
 # restricted to cellranger-arc's knobs: no include_introns/chemistry/
 # expect_cells/force_cells/r1_length/r2_length).
-#   * create_bam            : true | false — emit aligned fastq BAM
 #   * cell_annotation_model : auto | <model name>, or blank (=auto)
 #   * custom_options        : extra flags as-is, e.g. --nosecondary --localvmem=300
 # A blank value ("") drops that flag for that sample.
-# CPU/memory limits are NOT per-sample: localcores / localmem are run-wide
-# parameters (see the RUN-WIDE PARAMETERS block in build_script).
+# CPU/memory limits and BAM output are NOT per-sample: localcores / localmem /
+# create_bam are run-wide parameters (see the RUN-WIDE PARAMETERS block in
+# build_script).
 _ARC_PER_SAMPLE_PARAMS = (
-    ("create_bam",            "true",
-     "true = emit aligned BAM (default); false = faster + smaller output"),
     ("cell_annotation_model", "auto",
      "auto | <cellranger-arc annotation model name>; blank = auto (default)"),
     ("custom_options",        "",
@@ -776,7 +792,7 @@ def build_stats_block(groups, fid_avt, avt_run, reference_genome):
     L.append("  [ -n \"${_v}\" ] && _ARC_VERSION=\"v${_v}\"")
     L.append("fi")
     L.append("[ -z \"${_ARC_VERSION}\" ] && _ARC_VERSION=\"%s\"" % (gen_arc or ""))
-    L.append("_GENOME_ASSEMBLY=\"$(basename \"${REFPATH}\" 2>/dev/null)\"")
+    L.append("_GENOME_ASSEMBLY=\"$(basename \"${reference_genome}\" 2>/dev/null)\"")
     L.append("[ -z \"${_GENOME_ASSEMBLY}\" ] && _GENOME_ASSEMBLY=\"%s\"" % (gen_genome or ""))
     L.append("_INTRON_FLAGS=\"\"")
     _intr_line = '  if [ -n "${gex_exclude_introns_%d:-}" ]; then _INTRON_FLAGS="${_INTRON_FLAGS}n"; else _INTRON_FLAGS="${_INTRON_FLAGS}y"; fi'
@@ -786,11 +802,11 @@ def build_stats_block(groups, fid_avt, avt_run, reference_genome):
     # ---- write the workbook (xlsx preferred; CSV fallback) --------------------------------
     L.append("if command -v python3 >/dev/null 2>&1; then")
     L.append('  echo "STATS: building ${STATS_OUT} ..."')
-    L.append("  python3 - \"${Server_folder}/.stats_gex.tsv\" \"${Server_folder}/.stats_atac.tsv\" \"${_GENOME_ASSEMBLY}\" \"${_ARC_VERSION}\" \"${_INTRON_FLAGS}\" \"${STATS_OUT}\" <<'STATS_PY_EOF' || echo \"  [warn] STATS: could not write the stats workbook (see above); run continues.\" >&2")
+    L.append("  python3 - \"${Server_folder}/.stats_gex.tsv\" \"${Server_folder}/.stats_atac.tsv\" \"${_GENOME_ASSEMBLY}\" \"${_ARC_VERSION}\" \"${_INTRON_FLAGS}\" \"${STATS_OUT}\" <<'STATS_PY_EOF' || echo \"WARNING: could not write the stats workbook (see above); run continues.\" >&2")
     L.extend(_PY_STATS)
     L.append("STATS_PY_EOF")
     L.append("else")
-    L.append("  echo '  [warn] STATS: python3 not found on this host - the stats workbook' >&2")
+    L.append("  echo 'WARNING: python3 not found on this host - the stats workbook' >&2")
     L.append("  echo '         was not generated.  Install python3 + openpyxl on the analysis server.' >&2")
     L.append("fi")
 
@@ -824,12 +840,12 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
 
     Layout (top -> bottom) — items 5–8 of the arc/GEX parity list:
       1.  Header / constants (timestamp, reference, source files, requester,
-          scriptversion stamp, REFPATH, avt_run, user).
+          scriptversion stamp, reference_genome, avt_run, user).
       2.  RUN-WIDE PARAMETERS (editable at the top): keepdata, max_parallel,
-          localcores, localmem, scratch_root, server_folder_name,
+          localcores, localmem, create_bam, scratch_root, server_folder_name,
           NGSruns_archive, then all FASTQ path variables (resolved at
           generation time).
-      3.  PER-SAMPLE PARAMETERS (item 5 — one block per sample): create_bam,
+      3.  PER-SAMPLE PARAMETERS (item 5 — one block per sample):
           cell_annotation_model, custom_options, gex_exclude_introns;
           blank a value to drop that flag for that sample.
           All user-editable blocks (2 + 3) stay contiguous at the top of the
@@ -881,7 +897,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("scriptversion=" + SCRIPT_VERSION)
     L.append("")
     L.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
-    L.append('REFPATH="' + reference_genome + '"')
+    L.append('reference_genome="' + reference_genome + '"')
     L.append(f"avt_run='{avt_run}'")
     # Item 12: the requester string (datasheet ``User:`` cell) is not
     # validated; clean it to a CIFS-/URL-safe path segment HERE at generation
@@ -911,6 +927,9 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append('#   so all three must fit within the server\'s resources together.')
     L.append(f'localcores="{LOCAL_CORES}"')
     L.append(f'localmem="{LOCAL_MEM}"')
+    L.append('#   create_bam : "true" = also write the aligned BAM (default);')
+    L.append('#                "false" = do not write it (faster + smaller output).  Applies to ALL samples.')
+    L.append('create_bam="true"')
     L.append('#   scratch_root : root on the analysis server where cellranger-arc output is written')
     L.append('#                  (fixed convention — change only if the mount differs on your server).')
     L.append('scratch_root="' + SCRATCH_ROOT + '"')
@@ -925,8 +944,9 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("# ============================================================")
     L.append("# FASTQ PATHS  (one per sample library — resolved at generation time)")
     L.append("# ----------------------------------------------------------------")
-    L.append('#   If a variable is set to the empty string (""), the generator could not')
-    L.append('#   resolve the leaf directory — set the real path by hand before running.')
+    L.append('#   If a variable is set to the empty string (") or has a FIXME_LOCATE_')
+    L.append('#   marker, the generator could not resolve the leaf directory — set the')
+    L.append('#   real path by hand before running.')
     any_missing = False
     for idx, (base, libs) in enumerate(groups.items(), start=1):
         ordered = sorted(libs, key=lambda t: 0 if t[2] == _GEX else 1)
@@ -934,8 +954,10 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append(f"# --- Sample {idx}: {base}  ({len(ordered)} library(ies)) ---")
         for full, fid, modality in ordered:
             if not fid:
-                var = f"fastq_{idx}_{modality.replace(' ', '_')}"
-                L.append(f'{var}=""   # (no fastq ID parsed — set the leaf path by hand)')
+                modality_key = modality.replace(' ', '_')
+                var = f"fastq_{idx}_{modality_key}"
+                L.append(f'{var}=""   # FIXME_LOCATE_{modality_key}: leaf not resolved '
+                         f'(no fastq ID parsed) — set by hand before running')
                 any_missing = True
                 continue
             var = f"fastq_{idx}_{fid}"
@@ -943,14 +965,12 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             if leaf:
                 L.append(f'{var}="{leaf}"')
             else:
-                L.append(f'{var}=""   # FIXME: leaf for \'{full}\' (fid {fid}) — set by hand before running')
+                L.append(f'{var}=""   # FIXME_LOCATE_{fid}: leaf not resolved — set by hand before running')
                 any_missing = True
     if any_missing:
-        L.append("")
-        L.append("# NOTE: at least one fastq variable is empty — set it before running.")
         print("  Warning: some fastq leaves could not be resolved at generation time.",
               file=sys.stderr)
-        print("  The flagged fastq_<idx>_<fid> variables must be set before running.",
+        print("  The flagged fastq_<idx>_<fid> variables (FIXME_LOCATE_ markers) must be set before running.",
               file=sys.stderr)
     L.append("")
 
@@ -959,7 +979,6 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("# PER-SAMPLE PARAMETERS  (one block per sample — edit values in place)")
     L.append("# ----------------------------------------------------------------")
     L.append('#   * blank a value ( value="" )  -> that flag is DROPPED for that sample')
-    L.append("#   * create_bam             : true | false")
     L.append("#   * cell_annotation_model  : auto | <model name>, or blank (=auto)")
     L.append("#   * custom_options         : extra flags as-is, e.g. --nosecondary --localvmem=300")
     L.append("#   * gex_exclude_introns    : any value adds --gex-exclude-introns (skip GEX introns);")
@@ -977,7 +996,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     # Emitted BELOW all editable blocks (RUN-WIDE / FASTQ / PER-SAMPLE) so the
     # user-facing "edit here" region stays contiguous at the top of the
     # script.  The reference-genome check fails fast BEFORE any mkdir, so a
-    # bad REFPATH leaves no stray directories behind.  A banner marks the
+    # bad reference_genome leaves no stray directories behind.  A banner marks the
     # user/code boundary unambiguously.
     L.append("")
     L.append("# " + "=" * 73)
@@ -992,8 +1011,8 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("# PIPELINE PLUMBING  (derived from the parameters above)")
     # Reference genome existence check (MUST run before any side effects)
     L.append("# Check that the reference genome directory exists")
-    L.append('if [[ ! -d "${REFPATH}" ]]; then')
-    L.append('    echo "Reference genome ${REFPATH} does not exist. Aborting." >&2')
+    L.append('if [[ ! -d "${reference_genome}" ]]; then')
+    L.append('    echo "Reference genome ${reference_genome} does not exist. Aborting." >&2')
     L.append("    exit 1")
     L.append("fi")
     L.append("")
@@ -1060,7 +1079,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             'cellranger-arc count',
             f'    --id={run_name}',
             f'    --description={desc}',
-            '    --reference="${REFPATH}"',
+            '    --reference="${reference_genome}"',
             # absolute --libraries path (the CSV is written into Server_folder
             # just above this command) — no cd needed
             f'    --libraries="${{Server_folder}}/{csv_name}"',
@@ -1068,9 +1087,11 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             # invocation used to produce (run root = Server_folder/<id>),
             # without ever moving the main shell's CWD
             f'    --output-dir="${{Server_folder}}/{run_name}"',
-            # CPU/memory caps are run-wide (localcores / localmem), not per-sample
+            # CPU/memory + BAM output are run-wide (localcores / localmem /
+            # create_bam), not per-sample knobs
             '    ${localcores:+--localcores=$localcores}',
             '    ${localmem:+--localmem=$localmem}',
+            '    ${create_bam:+--create-bam=$create_bam}',
         ]
         for suffix, _default, _comment in _ARC_PER_SAMPLE_PARAMS:
             v = f"{suffix}_{idx}"
@@ -1087,7 +1108,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         # (one readable line).  A single bash array (_cmd) is built from the
         # SAME flag_lines list the execution line uses, so the log can never
         # drift from what actually runs: `echo "${_cmd[@]}"` expands
-        # ${REFPATH}, ${localcores:+--localcores=$localcores},
+        # ${reference_genome}, ${localcores:+--localcores=$localcores},
         # ${localmem:+--localmem=$localmem} and the per-sample flag values
         # exactly as the execution sees them.
         # (The old version printf'd a Python-repr()'d string — a
@@ -1108,7 +1129,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append(f'    find "${{Server_folder}}/{run_name}" -mindepth 2 -maxdepth 2 '
                  f'-type d -name "tmp" -print 2>/dev/null > "${{_err_log}}"')
         L.append('    if [ -s "${_err_log}" ]; then')
-        L.append(f'        echo "Error: cellranger-arc count for {base} did not complete '
+        L.append(f'        echo -e "Error: cellranger-arc count for {base} did not complete '
                  f'(leftover tmp folders detected).\\nSee ${{Server_folder}}/{run_name}_error_log.txt" >&2')
         L.append('    else')
         L.append('        rm -f "${_err_log}"')
@@ -1128,7 +1149,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append(f'        cp "${{Server_folder}}/{run_name}/outs/metrics_summary.csv" '
                  f'"${{metrics_folder}}/{run_name}_summary.csv"')
         L.append('    else')
-        L.append(f'        echo "  [warn] no summary.csv/metrics_summary.csv for {base}" >&2')
+        L.append(f'        echo "WARNING: no summary.csv/metrics_summary.csv for {base}" >&2')
         L.append('    fi')
         L.append(f'    if [ -f "${{Server_folder}}/{run_name}/outs/cell_types/web_summary_cell_types.html" ]; then')
         L.append(f'        cp "${{Server_folder}}/{run_name}/outs/cell_types/web_summary_cell_types.html" '
@@ -1140,7 +1161,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append('    if [ -n "${_gex_web}" ]; then')
         L.append(f'        cp "${{_gex_web}}" "${{metrics_folder}}/GEX_only/{run_name}_web_summary.html"')
         L.append('    else')
-        L.append(f'        echo "  [warn] no GEX-only web summary for {base}" >&2')
+        L.append(f'        echo "WARNING: no GEX-only web summary for {base}" >&2')
         L.append('    fi')
         # ATAC-only web summary (from the CS tree)
         L.append(f'    _atac_web=$(find "${{Server_folder}}/{run_name}/SC_ATAC_GEX_COUNTER_CS/SC_ATAC_GEX_COUNTER/_SC_ATAC_REPORTER/CREATE_WEBSUMMARY" \\')
@@ -1148,7 +1169,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
         L.append('    if [ -n "${_atac_web}" ]; then')
         L.append(f'        cp "${{_atac_web}}" "${{metrics_folder}}/ATAC_only/{run_name}_web_summary.html"')
         L.append('    else')
-        L.append(f'        echo "  [warn] no ATAC-only web summary for {base}" >&2')
+        L.append(f'        echo "WARNING: no ATAC-only web summary for {base}" >&2')
         L.append('    fi')
         L.append("")
 
@@ -1200,7 +1221,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
                 L.append(f'        _tso_part="${{Server_folder}}/tso_report_parts/{_tso_tags}.txt"')
                 L.append('        tso_percent "${_tso_fq}" "${_tso_tags}" | tee "${_tso_part}"')
                 L.append("    else")
-                L.append(f'        echo "tso: no Read-2 fastq near {_tso_var}; TSO% step skipped ({fid})." >&2')
+                L.append(f'        echo "WARNING: no Read-2 fastq found near {_tso_var}; TSO% step skipped ({fid})." >&2')
                 L.append("    fi")
         else:
             L.append("")
@@ -1231,7 +1252,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append("fi")
     L.append("# Cap max_parallel at NSAMPLES (no point requesting more slots than samples)")
     L.append('if [ "${max_parallel}" -gt "${NSAMPLES}" ]; then')
-    L.append('    echo "Note: only ${NSAMPLES} sample(s) — capping max_parallel ${max_parallel} -> ${NSAMPLES}." >&2')
+    L.append('    echo "Note: ${NSAMPLES} sample(s) only — capping max_parallel ${max_parallel} -> ${NSAMPLES}." >&2')
     L.append("    max_parallel=${NSAMPLES}")
     L.append("fi")
     L.append("")
@@ -1336,12 +1357,12 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
             L.append('        echo ""')
             L.append("    else")
             L.append('        echo "### Sample %d: %s — %s (TSO%%) ###"' % (idx, base, _fid))
-            L.append('        echo "[no TSO%% report — no Read-2 fastq found or tso_percent skipped]"')
+            L.append('        echo "[no TSO% report — no Read-2 fastq found or tso_percent skipped]"')
             L.append('        echo ""')
             L.append("    fi")
     L.append('} > "${_tso_out}"')
     L.append('rm -rf "${Server_folder}/tso_report_parts"')
-    L.append('echo "TSO%% report (single file): ${_tso_out}"')
+    L.append('echo "TSO% report (single file): ${_tso_out}"')
     L.append('if command -v rsync >/dev/null 2>&1; then rsync -avh "${_tso_out}" "${archive_dir}/" 2>/dev/null || true; fi')
     L.append("")
 
@@ -1375,7 +1396,7 @@ def build_script(reference_genome, groups, avt_run, user, run_dir,
     L.append('    if command -v rsync >/dev/null 2>&1; then rsync -avh "${SM_OUT}" "${archive_dir}/" 2>/dev/null || true; fi')
     L.append("else")
     L.append('    rm -f "${SM_TMP}"')
-    L.append('    echo "  [warn] no per-sample summary.csv found; summary_metrics.csv not created" >&2')
+    L.append('    echo "WARNING: no per-sample summary.csv found; summary_metrics.csv not created" >&2')
     L.append("fi")
     L.append("")
 
@@ -1543,6 +1564,8 @@ def main():
             # Per-file run inheritance (GEX parity): rows that name no run
             # take the run THIS FILE names (row-level names win).
             all_rows.extend(inherit_file_avt(rows, avt))
+        else:
+            print(f"Warning: no sample/fastq ID pairs found in '{path}' — skipping.")
         if avt:
             detected_avts.append(avt)
         if not any_user:
@@ -1550,29 +1573,31 @@ def main():
             any_user = read_user_field(path)
 
     if not all_rows:
-        sys.exit("Error: no sample rows could be parsed from the provided file(s).")
+        sys.exit("Error: no sample/fastq ID pairs could be parsed from the provided file(s).")
 
     groups = group_libraries(all_rows)
     print()
     print_groups_table(groups)
     print()
 
-    any_avt = latest_avt(detected_avts)
-    if not any_avt:
-        any_avt = ask_avt_run(None)
-    else:
-        any_avt = ask_avt_run(any_avt)
+    # GEX-parity run-name questions: EVERY row without a run gets its OWN
+    # question (resolve_unassigned_avt, shared helper) — sample name + FASTQ
+    # id shown, hint = the first run named by another row when one is known,
+    # plain 'Enter run name' when nothing is detected anywhere; -n keeps the
+    # AVT0000 placeholder + WARNING contract.  Rows that already carry a run
+    # (stamped per-file by inherit_file_avt() or named on the row) are left
+    # untouched; the per-row runs are the source of truth.
+    resolve_unassigned_avt(all_rows)
+
+    # any_avt from here on is a pure fallback value (defensive
+    # 'or any_avt' sites and the empty-name guard): the run named by the
+    # input files when detected, else the run just assigned to the first
+    # row.  The script/folder NAME still comes from the combined per-row
+    # tag (avt_run_tag) further down.
+    any_avt = latest_avt(detected_avts) or next(
+        (r[2] for r in all_rows if len(r) > 2 and r[2]), "")
     if not any_avt:
         sys.exit("Error: run name cannot be empty.")
-
-    # GEX parity (shared helper): rows whose file named no run get ONE
-    # explicit prompt (hint = first detected run) instead of silently
-    # inheriting the representative run.  Rows that already carry a run —
-    # stamped per-file by inherit_file_avt() or named on the row — are
-    # left untouched.  Skipped when NO run is detected anywhere: any_avt
-    # above already holds the answer and the 'or any_avt' fallbacks cover
-    # these rows (single prompt, like GEX in that case).
-    resolve_unassigned_avt(all_rows)
 
     # ── Parity item 3: sample selection (keep/drop + add sheet-less) ───
     # Same shared helper + prompt as the GEX generator.  ``ask_sample_selection``
@@ -1609,7 +1634,7 @@ def main():
             # implied by the folder the operator typed (parity item 11).
             all_rows.append((name, os.path.basename(p), None))
     if not all_rows:
-        sys.exit("Error: no samples selected — nothing to generate.")
+        sys.exit("Error: no samples to add to the script.")
 
     # ── Parity item 11: per-row AVT — resolve each FASTQ under its own run tree ──
     # Each sample's FASTQ is resolved under the AVT run named on its own sheet
@@ -1662,7 +1687,7 @@ def main():
             if chosen:
                 chosen_dirs[base] = chosen
     if chosen_dirs:
-        print(f"  Run-folder disambiguation pinned {len(chosen_dirs)} sample(s).")
+        print(f"  Run-folder disambiguation picked for {len(chosen_dirs)} sample(s).")
 
     # Emission-time resolver: build_script calls resolve(base, fid).  Each
     # FASTQ walks the run tree of the AVT run named on its own row (parity
@@ -1697,9 +1722,13 @@ def main():
         f.write(script)
     os.chmod(out_script, 0o755)
     print(f"Generated: {out_script}")
-    if "/PATH/TO/" in script:
-        print("Note: some fastq leaves could not be resolved here — "
-              "replace the /PATH/TO/... placeholders in the script before running.")
+    # Count only flagged variable lines (fastq_*="" # FIXME_LOCATE_), which is
+    # what the generator emits when a leaf could not be resolved.
+    n_unresolved = len(re.findall(r'fastq_\d+\w+=""\s*#\s*FIXME_LOCATE_', script))
+    if n_unresolved:
+        print(f"Note: {n_unresolved} FASTQ path(s) could not be resolved — "
+              "set the flagged fastq_* variable(s) (FIXME_LOCATE_ markers) "
+              "before running.")
 
 
 if __name__ == "__main__":

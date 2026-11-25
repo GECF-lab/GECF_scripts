@@ -375,23 +375,47 @@ def inherit_file_avt(rows, file_avt):
     return out
 
 
-def resolve_unassigned_avt(rows, require_known=True):
+def print_pairs_table(pairs):
+    """The pre-prompt sample summary table (shared by GEX/ATAC/ARC so the
+    look stays identical): one line per sample with its FASTQ id, sample
+    name, and the run named on it — ``(none)`` when the row and its file
+    name no run, i.e. 'this row will get its own question below'.
+    Print the ``Total: N sample(s) from M Excel file(s):`` header first.
+
+    ``pairs``: list of (sample, fastq_id, avt_or_None); 2-tuples accepted
+    (the run cell prints as blank).
+    """
+    if not pairs:
+        return
+    fastq_hdr, sample_hdr, avt_hdr = "Fastq ID", "Sample name", "AVT run"
+    fw = max(len(fastq_hdr), max(len(p[1] or "") for p in pairs))
+    sw = max(len(sample_hdr), max(len(p[0] or "") for p in pairs))
+    aw = max(len(avt_hdr), max(len((p[2] if len(p) > 2 and p[2] else "") or "(none)")
+                               for p in pairs))
+    sep = f"+{'-' * (fw + 2)}+{'-' * (sw + 2)}+{'-' * (aw + 2)}+"
+    print(sep)
+    print(f"| {fastq_hdr:<{fw}} | {sample_hdr:<{sw}} | {avt_hdr:<{aw}} |")
+    print(sep)
+    for sample_name, fastq_id, *rest in pairs:
+        avt = rest[0] if rest else None
+        print(f"| {fastq_id:<{fw}} | {sample_name:<{sw}} | {(avt or '(none)'):<{aw}} |")
+    print(sep)
+
+
+def resolve_unassigned_avt(rows):
     """Give every row whose run name could not be detected an explicit run —
-    the shared GEX 'needs_avt' prompt (parity across all three generators).
+    the shared 'needs_avt' prompt (parity across all three generators).
 
     * rows that name a run are left untouched;
-    * rows without a run get ONE user decision for all of them:
-      interactive mode asks once (the first detected run is the default
-      hint — 'Y' confirms, typing replaces);  non-interactive (``-n``)
-      keeps the ``ask_avt_run()`` contract (returned 'AVT0000' placeholder
-      / loud WARNING when no run name is detected anywhere).
-
-    ``require_known=True`` (ATAC/ARC): when NO run is detected in any file,
-    the caller's own run-name answer (main_avt / any_avt) already covers
-    these rows via its existing fallback — no second prompt (matches the
-    GEX single-prompt result in that case).
-    ``require_known=False`` (GEX): always prompt (GEX has no separate
-    run-name confirmation, and the prompt also fills main_avt).
+    * EACH row without a run gets its OWN question: the sample name and
+      FASTQ id are printed, then the usual ``ask_avt_run()`` exchange
+      (when other rows name runs, the first one is the default hint —
+      'Y' confirms, typing replaces; when NO file/row names a run each
+      sample is simply asked);  non-interactive (``-n``) keeps the
+      ``ask_avt_run()`` contract (returned 'AVT0000' placeholder / loud
+      WARNING when no run name is detected anywhere).  Per-row prompting
+      lets one run-less workbook keep two samples on two different runs
+      instead of forcing one answer on every gap.
 
     ``rows``: list of (sample, fastq_id, avt_or_None); mutated in place.
     Returns the number of rows backfilled.
@@ -401,17 +425,24 @@ def resolve_unassigned_avt(rows, require_known=True):
     if not unassigned:
         return 0
     known = [r[2] for r in rows if len(r) > 2 and r[2]]
-    if require_known and not known:
-        return 0
     hint = known[0] if known else None
-    print(f"{len(unassigned)} sample(s) have no run name assigned.")
-    run = ask_avt_run(hint)
-    if not run:
-        raise SystemExit("Error: run name cannot be empty.")
+    print(
+        "  Why the run name is needed: it is the folder this sample's FASTQ\n"
+        "  files are stored under (e.g. /mnt/PTEGraw/AA/NGSruns/<sequencer>/"
+        "<flowcell>/<run>/; <sequencer> = AVT, MSH, MSQ or NVQ), so the"
+        " generated script knows where to find them."
+    )
     for i in unassigned:
         r = list(rows[i])
         while len(r) < 3:
             r.append(None)
+        who = r[1]
+        if r[0]:
+            who = f"{r[0]} ({r[1]})"
+        print(f"  Sample {who}: no run name assigned.")
+        run = ask_avt_run(hint)
+        if not run:
+            raise SystemExit("Error: run name cannot be empty.")
         r[2] = run
         rows[i] = r
     return len(unassigned)

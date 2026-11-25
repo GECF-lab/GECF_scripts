@@ -70,6 +70,7 @@
     <tr><td><code>max_parallel</code></td><td>Number of samples counted simultaneously. <code>1</code> is serial. Default <code>3</code> suits a large server (like ptegsrv3); lower it for a smaller box or when other heavy jobs are running.</td></tr>
     <tr><td><code>localcores</code></td><td>Maximum CPU cores per sample (applies to all samples). Default 32.</td></tr>
     <tr><td><code>localmem</code></td><td>Maximum memory in GB per sample (applies to all samples). Default 126.</td></tr>
+    <tr><td><code>create_bam</code></td><td><code>true</code> (default) also writes an aligned BAM for every sample. Set <code>false</code> to skip it for all samples (faster, smaller output).</td></tr>
     <tr><td><code>scratch_root</code></td><td>Where <code>cellranger count</code> writes its working output (fixed convention on the analysis server; change it only if the mount differs on your box).</td></tr>
     <tr><td><code>reference_genome_used</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
     <tr><td><code>server_folder_name</code></td><td>Output folder name, prefilled with run + user + timestamp. Leave as is unless renaming is wanted.</td></tr>
@@ -86,7 +87,6 @@
     <tr><td><code>expect_cells_&lt;#&gt;</code></td><td>Approximate expected cell count, if known.</td></tr>
     <tr><td><code>force_cells_&lt;#&gt;</code></td><td>Exact cell count to force. See the note below before setting this or <code>expect_cells</code>.</td></tr>
     <tr><td><code>chemistry_&lt;#&gt;</code></td><td>Kit chemistry, if known. Blank lets cellranger decide.</td></tr>
-    <tr><td><code>create_bam_&lt;#&gt;</code></td><td><code>true</code> (default) also writes an aligned BAM for this sample. Set <code>false</code> to skip it (faster, smaller output).</td></tr>
     <tr><td><code>include_introns_&lt;#&gt;</code></td><td><code>true</code> (default) counts intronic reads. Set <code>false</code> to count exonic reads only, if that's what your experiment requires.</td></tr>
     <tr><td><code>r1_length_&lt;#&gt;</code></td><td>Trim Read 1 to this length in bases. Blank (default) uses the full read.</td></tr>
     <tr><td><code>r2_length_&lt;#&gt;</code></td><td>Trim Read 2 to this length in bases. Blank (default) uses the full read.</td></tr>

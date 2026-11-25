@@ -67,6 +67,7 @@ from common.intake import (
     NGS_RUNS_ROOT,          # prefill root for the add-sample prompt
     choose_sample_dir,      # sample-level run-folder disambiguation (AVT0551)
     list_sample_dirs,       # ... list every candidate sample dir for an AVT
+    print_pairs_table,      # shared pre-prompt sample summary table
 )
 
 # Reference-genome root.  The genome folder inside each ``current_*``
@@ -151,7 +152,16 @@ SCRATCH_ROOT = "/mnt/data/CellRangerCountOutput"
 #         <NN_sample>__<avid>.
 # 1.1.7 = archive root moved off the sequencer folder: results now deploy
 #         to the shared, sequencer-agnostic /mnt/PTEGraw/AA/NGSruns/ZZ_10XG/.
-SCRIPT_VERSION = "1.1.7"
+# 1.1.8 = run-less rows are now asked PER SAMPLE (name + FASTQ id shown)
+#         instead of one batched question for all of them (shared
+#         resolve_unassigned_avt() in common/intake.py, also in ATAC/ARC).
+# 1.1.9 = the sample summary table before the run-name questions is now the
+#         SHARED common/intake.print_pairs_table() (same look in
+#         GEX/ATAC/ARC) — no change to the GEX output itself.
+# 1.1.10 = the run-name question now opens with a one-line WHY (the run
+#          folder is where the sample's FASTQ files are stored, so the
+#          script can find them) — text lives in common/intake.py.
+SCRIPT_VERSION = "1.1.10"
 
 # ---------------------------------------------------------------------------
 # TSO% library-quality helper (cellranger_pipelines/common/TSO_percent.sh)
@@ -374,22 +384,6 @@ def parse_xlsx(path):
     return pairs, avt_found
 
 
-def print_pairs_table(pairs):
-    if not pairs:
-        return
-    fastq_hdr, sample_hdr, avt_hdr = "Fastq ID", "Sample name", "AVT run"
-    fw = max(len(fastq_hdr), max(len(f) for _, f, _ in pairs))
-    sw = max(len(sample_hdr), max(len(s) for s, _, _ in pairs))
-    aw = max(len(avt_hdr), max(len(a or "(none)") for _, _, a in pairs))
-    sep = f"+{'-' * (fw + 2)}+{'-' * (sw + 2)}+{'-' * (aw + 2)}+"
-    print(sep)
-    print(f"| {fastq_hdr:<{fw}} | {sample_hdr:<{sw}} | {avt_hdr:<{aw}} |")
-    print(sep)
-    for sample_name, fastq_id, avt in pairs:
-        print(f"| {fastq_id:<{fw}} | {sample_name:<{sw}} | {(avt or '(none)'):<{aw}} |")
-    print(sep)
-
-
 def find_fastq_path(avt_run, fastq_id, preferred_sample_dir=None):
     """Search under the run base dir for a directory named ``fastq_id``.
 
@@ -417,8 +411,6 @@ def find_fastq_path(avt_run, fastq_id, preferred_sample_dir=None):
 _PER_SAMPLE_PARAMS = (
     ("include_introns", "true",
      "true = count intronic reads (default); false = exonic reads only"),
-    ("create_bam",      "true",
-     "true = emit aligned BAM to outs/ (default); false = faster + smaller output"),
     ("chemistry",       "",
      "blank = auto-detect (default); see header for explicit values"),
     ("expect_cells",    "",
@@ -534,7 +526,7 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
       1. Header / constants (timestamp, reference genome, scriptversion,
          the source files list, the requester).
       2. RUN-WIDE PARAMETERS — one editable block at the top of the script:
-         keepdata, max_parallel, localcores, localmem, scratch_root,
+         keepdata, max_parallel, localcores, localmem, create_bam, scratch_root,
          server_folder_name, NGSruns_archive, and the per-sample FASTQ
          path_* variables (resolved at generation time).
       3. Per-sample parameter variables (one block per sample),
@@ -623,7 +615,18 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append(f"# Requester: {user or 'n/a'}")
     lines.append("")
     lines.append("TIMESTAMP=$(date +%Y%m%d_%H%M%S)")
-    lines.append(f"reference_genome_used={reference_genome}")
+    lines.append(f"reference_genome={reference_genome}")
+    # Identity of the working/archive folder (combined multi-run tag
+    # AVT0001_AVT0002 when the inputs span several runs, else the
+    # representative AVT) emitted as a shell constant so the
+    # server_folder_name below stays uniform with the cellranger-arc and
+    # cellranger-atac scripts.
+    lines.append(f"avt_run='{folder_avt}'")
+    # Requester tag reduced to a CIFS-/URL-safe path segment (accented names
+    # like "Cèsar" -> "Cesar") at generation time; if the result is blank,
+    # the ``${user:+_${user}}`` conditional below simply omits the
+    # ``_<user>`` segment.
+    lines.append("user='" + folder_safe(user or "") + "'")
     lines.append(
         # Provenance stamp in the kept .sh (copied into the run folder +
         # archive): which GENERATOR produced this script.  The generator
@@ -634,11 +637,6 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("")
 
     # ---- 2) run-wide parameters (defaults, editable at the top) ----
-    # Requester tag, reduced to a safe path-segment (accented names like
-    # "Cèsar" -> "Cesar").  Empty/sanitized-blank requester -> the whole
-    # "_<user>" segment is omitted so we never emit a stray underscore.
-    folder_user = folder_safe(user)
-    user_tag = "_" + folder_user if folder_user else ""
     lines.append("# ============================================================")
     lines.append("# RUN-WIDE PARAMETERS  (defaults — edit here)")
     lines.append("# ----------------------------------------------------------------")
@@ -657,23 +655,28 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append('max_parallel=3')
     lines.append(f'localcores="{LOCAL_CORES}"')
     lines.append(f'localmem="{LOCAL_MEM}"')
+    lines.append('#   create_bam : "true" = also write the aligned BAM to outs/ (default);')
+    lines.append('#                "false" = do not write it (faster + smaller output).  Applies to ALL samples.')
+    lines.append('create_bam="true"')
     lines.append("#   scratch_root : root on the analysis server where cellranger count")
     lines.append("#                  output is written (fixed convention — change only if")
     lines.append("#                  the mount point differs on your server).")
     lines.append(f'scratch_root="{SCRATCH_ROOT}"')
     lines.append("#   server_folder_name : working + archive leaf folder name.")
-    lines.append("#                  default is <AVT>[_user]_<timestamp>; change only if needed.")
-    lines.append(f'server_folder_name="{folder_avt}{user_tag}_$TIMESTAMP"')
+    lines.append("#                  default is <AVT>[_user]_<TIMESTAMP>; change only if needed.")
+    lines.append('server_folder_name="${avt_run}${user:+_${user}}_$TIMESTAMP"')
     lines.append("#   NGSruns_archive  : central archive destination (fixed target).")
     lines.append(f'NGSruns_archive="{NGSruns_ARCHIVE_DIR}"')
-    lines.append("#   FASTQ paths : one per (sample, FASTQ) pair, resolved by the generator")
-    lines.append("#                  at generation time under the AVT run tree.")
-    lines.append("#                  If a sample name exists in SEVERAL run sub-folders,")
-    lines.append("#                  the generator asks which folder to use before")
-    lines.append("#                  resolving — the FASTQ then lands inside the chosen")
-    lines.append("#                  folder (e.g. corrected indexes vs other folders).")
-    lines.append("#                  FIXME_LOCATE_ markers mean the generator could not find")
-    lines.append("#                  the folder — set that path_* variable by hand.")
+    lines.append("# ============================================================")
+    lines.append("# FASTQ PATHS  (one per sample FASTQ — resolved at generation time)")
+    lines.append("# ----------------------------------------------------------------")
+    lines.append("#   One per (sample, FASTQ) pair, under the AVT run tree.")
+    lines.append("#   If a sample name exists in SEVERAL run sub-folders, the")
+    lines.append("#   generator asks which folder to use before resolving — the")
+    lines.append("#   FASTQ then lands inside the chosen folder (e.g. corrected")
+    lines.append("#   indexes vs other folders).")
+    lines.append("#   FIXME_LOCATE_ markers mean the generator could not find the")
+    lines.append("#   folder — set that path_* variable by hand.")
 
     any_missing = False
     per_sample_dir = {sn: chosen_sample_dirs.get(sn)
@@ -681,7 +684,7 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     for idx, sn in enumerate(unique_samples, start=1):
         fastqs = samples_to_fastqs[sn]
         lines.append("")
-        lines.append(f"# --- FASTQ paths — Sample {idx}: {sn} ({len(fastqs)} FASTQ(s)) ---")
+        lines.append(f"# --- Sample {idx}: {sn}  ({len(fastqs)} FASTQ) ---")
         for fq, avt in fastqs:
             run_part = avt or main_avt
             base_dir = run_base_dir(run_part)
@@ -724,7 +727,6 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("#       - leave a default as-is to keep it")
     lines.append("#   * Allowed values (chemistry is the only one with a fixed list):")
     lines.append("#     include_introns: true | false")
-    lines.append("#     create_bam     : true | false")
     lines.append("#     chemistry      : threeprime | fiveprime | SC3Pv1 | SC3Pv2 | SC3Pv3 |")
     lines.append("#                     SC3Pv4 | SC3Pv3HT | SC5P-PE | SC5P-PE-v3 | SC5P-R2 |")
     lines.append("#                     SC5P-R2-v3 | SC-FB | ARC-v1, or blank (auto-detect)")
@@ -740,7 +742,7 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("# ============================================================")
     for idx, sn in enumerate(unique_samples, start=1):
         lines.append("")
-        lines.append(f"# --- Sample {idx}: {sn} ---")
+        lines.append(f"# Sample {idx}: {sn}")
         for suffix, default, comment in _PER_SAMPLE_PARAMS:
             base = f'{suffix}_{idx}="{default}"'
             pad = max(1, 60 - len(base))
@@ -761,7 +763,9 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("")
 
     # ---- 4) validation (MUST run before any side effects) ----
-    lines.append("# ===== VALIDATION: --expect-cells vs --force-cells are mutually exclusive =====")
+    lines.append("# ============================================================")
+    lines.append("# VALIDATION: --expect-cells vs --force-cells are mutually exclusive")
+    lines.append("# ============================================================")
     lines.append("_vfail=0")
     for i in range(1, n + 1):
         lines.append(f'if [[ -n "${{expect_cells_{i}:-}}" && -n "${{force_cells_{i}:-}}" ]]; then')
@@ -790,8 +794,8 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     SFR = "${Server_folder}"
     lines.append("")
     lines.append("# Check that the reference genome directory exists")
-    lines.append('if [[ ! -d "${reference_genome_used}" ]]; then')
-    lines.append('    echo "Reference genome ${reference_genome_used} does not exist. Aborting." >&2')
+    lines.append('if [[ ! -d "${reference_genome}" ]]; then')
+    lines.append('    echo "Reference genome ${reference_genome} does not exist. Aborting." >&2')
     lines.append("    exit 1")
     lines.append("fi")
     lines.append("")
@@ -840,14 +844,16 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
             'cellranger count --id="' + sn + '"',
             '    --sample="' + sn + '"',
             '    --description="' + fq_list_str + '"',
-            '    --transcriptome="${reference_genome_used}"',
+            '    --transcriptome="${reference_genome}"',
             '    --fastqs="' + fq_paths + '"',
             '    --cell-annotation-model=auto',
             '    --tenx-cloud-token-path="/home/gecf/.config/txg/credentials"',
             '    --output-dir="' + SFR + '/' + numbered_dir + '"',
-            # CPU/memory caps are run-wide (localcores / localmem), not per-sample
+            # CPU/memory + BAM output are run-wide (localcores / localmem /
+            # create_bam), not per-sample knobs
             '    ${localcores:+--localcores=$localcores}',
             '    ${localmem:+--localmem=$localmem}',
+            '    ${create_bam:+--create-bam=$create_bam}',
         ]
         # Per-sample conditional knobs. Blank value -> flag omitted for this
         # sample only. custom_options is deliberately UNQUOTED on the last
@@ -861,7 +867,7 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
                 flag_lines.append(f"    ${{{v}:+{flag}=${v}}}")
 
         lines.append("")
-        lines.append(f"# --- Run sample {idx}: {sn} ---")
+        lines.append(f"# --- count_sample_{idx}() — Sample {idx}: {sn}  ({len(fastqs)} FASTQ) ---")
         lines.append("function count_sample_" + str(idx) + "() {")
         # Emit the command for execution, line-continuation formatted,
         # from the SAME flag_lines list (so what runs is exactly what
@@ -886,8 +892,9 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
         )
         lines.append('if [ -s "' + SFR + '/' + numbered_dir + '_error_log.txt" ]; then')
         lines.append(
-            '    echo "Error: CR count didn'"'"'t complete for sample '
-            + sn + '"' + ' >&2'
+            '    echo -e \"Error: cellranger count for '
+            + sn + ' did not complete (leftover tmp folders detected).\\n'
+            + 'See ' + SFR + '/' + numbered_dir + '_error_log.txt\" >&2'
         )
         lines.append("else")
         lines.append('    rm -f "' + SFR + '/' + numbered_dir + '_error_log.txt"')
@@ -928,15 +935,14 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
             lines.append('    _tso_part="' + SFR + '/tso_report_parts/' + tag + '.txt"')
             lines.append('    tso_percent "${_fq}" "${_TAGS}" | tee "${_tso_part}"')
             lines.append("else")
-            lines.append(f'    echo "tso: no Read-2 fastq found near ${{{_fq_var}}}; TSO% step skipped ({_tso_fq})." >&2')
+            lines.append(f'    echo "WARNING: no Read-2 fastq found near ${{{_fq_var}}}; TSO% step skipped ({_tso_fq})." >&2')
             lines.append("fi")
         lines.append("}")
         lines.append("")
 
     # ---- 6b) DISPATCH + per-sample status report ----
     _N = len(unique_samples)
-    _DASH = "# --------------------------------------------------------"
-    lines.append(_DASH)
+    lines.append("# ============================================================")
     lines.append("# DISPATCH  (run count_sample_1 .. count_sample_" + str(_N) + ")")
     lines.append("#   max_parallel=1 : serial, one sample after another (previous behaviour)")
     lines.append("#   max_parallel=N : rolling pool of N concurrent cellranger counts; the")
@@ -944,7 +950,7 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("#   Resource caps are run-wide (localcores / localmem), so")
     lines.append("#   max_parallel=3 @ defaults (32 cores / 126 GB) tops out at 96 cores /")
     lines.append("#   378 GB - within the 128-core / ~500 GB analysis box.")
-    lines.append(_DASH)
+    lines.append("# ============================================================")
     lines.append("NSAMPLES=" + str(_N))
     lines.append('case "${max_parallel}" in')
     lines.append("    ''|*[!0-9]*)")
@@ -1017,7 +1023,12 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     # Per-sample status report - each sample's own completion markers:
     #   *_error_log.txt non-empty    -> cellranger left a "tmp" dir behind on failure
     #   no outs/metrics_summary.csv  -> cellranger count never completed
-    lines.append("# Per-sample status report (from each sample's own completion markers)")
+    lines.append("# ============================================================")
+    lines.append("# PER-SAMPLE STATUS REPORT")
+    lines.append("#   Each sample's own completion markers determine the outcome:")
+    lines.append('#     *_error_log.txt non-empty  -> cellranger count left a "tmp" dir on failure')
+    lines.append("#     no outs/metrics_summary.csv  -> cellranger count did not complete")
+    lines.append("# ============================================================")
     lines.append("_overall_rc=0")
     _dirs_bash = " ".join('"' + d + '"' for d in dir_names)
     lines.append("for _d in " + _dirs_bash + "; do")
@@ -1039,9 +1050,11 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     # tso_report.txt and rsync that one file to the archive.  The working
     # copy is removed (the archive copy is the deliverable; with
     # keepdata=no the whole working dir is deleted below anyway).
-    lines.append("# ------------------------------------ TSO% REPORT (SINGLE FILE) ------------------------------------ #")
+    lines.append("# ============================================================")
+    lines.append("# TSO% REPORT  (SINGLE FILE)")
     lines.append("#   Centralized TSO% report: one tso_report.txt gathering every")
     lines.append("#   (sample, avid) section (from tso_report_parts/), in sample order then avid order.")
+    lines.append("# ============================================================")
     lines.append('_tso_out="' + SFR + '/tso_report.txt"')
     lines.append("{")
     lines.append('    echo "TSO% library-quality report — one section per (sample, avid)"')
@@ -1076,7 +1089,11 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     # — must match the per-sample dir names used in the cellranger count
     # section above (01_, 02_, … or bare names with --no-number-prefix).
     _sample_list = " ".join(dir_names)
-    lines.append("# ------------------------------------ EXTRACT SUMMARY METRICS ------------------------------------ #")
+    lines.append("# ============================================================")
+    lines.append("# MERGED SUMMARY METRICS  (one summary_metrics.csv, Samplename column first)")
+    lines.append("#   Harvests each sample's web/metrics outputs (raw_metrics_folder) and")
+    lines.append("#   gathers each sample's metrics row into one summary_metrics.csv.")
+    lines.append("# ============================================================")
     lines.append("")
     lines.append('metrics_folder="' + SFR + '/raw_metrics_folder"')
     lines.append('mkdir -p "${metrics_folder}"')
@@ -1126,6 +1143,7 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("# Promote the full merged table (Samplename + all metric columns, none filtered).")
     lines.append('if [ -f "${SM_TMP}" ]; then')
     lines.append('    mv "${SM_TMP}" "${SM_OUT}"')
+    lines.append('    echo "Merged summary metrics: ${SM_OUT}"')
     lines.append('else')
     lines.append('    echo "WARNING: no per-sample metrics_summary.csv found; summary_metrics.csv not created" >&2')
     lines.append('fi')
@@ -1133,10 +1151,35 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append('rsync -avh "${SM_OUT}" "${NGSruns_folder}"')
     lines.append("")
 
-    # ---- 7b) copy the generating .sh into the project folders ----
+    # ---- 7b) single md5 checksums file for the ENTIRE run folder -------
+    # One md5sums.txt covering every file under ${Server_folder} (sample dirs,
+    # logs, TSO report, summary metrics — the whole tree), with paths relative
+    # to the folder.  Computed after every artifact is in place and rsync'd to
+    # the archive.  Placed BEFORE KEEP A COPY OF THIS SCRIPT, so the .sh copy
+    # itself is NOT part of md5sums.txt; still before LOCAL WORKDIR CLEANUP so
+    # the local files exist for the checksum to be computed from.
+    lines.append("# ============================================================")
+    lines.append("# MD5 CHECKSUMS  (WHOLE FOLDER)")
+    lines.append("#   One md5sums.txt covering every file under ${Server_folder},")
+    lines.append("#   relative ./ paths.")
+    lines.append("# ============================================================")
+    lines.append("#   One md5sums.txt covering the ENTIRE run folder (every file,")
+    lines.append("#   relative ./ paths).  Replace the old per-sample *_md5_checksums.txt files.")
+    lines.append('_md5_out="' + SFR + '/md5sums.txt"')
+    lines.append('( cd "' + SFR + '" && find . -type f ! -name "md5sums.txt" | sort | xargs md5sum > "md5sums.txt" )')
+    lines.append('echo "MD5 checksums (whole folder): ${_md5_out}"')
+    lines.append('rsync -avh "${_md5_out}" "${NGSruns_folder}" 2>/dev/null || true')
+    lines.append("")
+    lines.append("")
+    # ---- 7c) copy the generating .sh into the project folders ----
     # Save a copy in the local project folder AND the central archive,
     # which both live under paths that outlive the caller's cwd.
-    lines.append("# ------------------------------------ KEEP A COPY OF THIS SCRIPT ------------------------------------ #")
+    lines.append("# ============================================================")
+    lines.append("# KEEP A COPY OF THIS SCRIPT")
+    lines.append("#   Copy the .sh used to generate this project into the project folders")
+    lines.append("#   (local working dir + central archive) so the exact pipeline is")
+    lines.append("#   preserved with the results.")
+    lines.append("# ============================================================")
     lines.append("#   Copy the .sh used to generate this project into the project folders")
     lines.append("#   (local working dir + central archive) so the exact pipeline is")
     lines.append("#   preserved with the results.")
@@ -1157,24 +1200,12 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     lines.append("fi")
     lines.append("")
     lines.append("")
-    # ---- 7d) single md5 checksums file for the ENTIRE run folder -------
-    # One md5sums.txt covering every file under ${Server_folder} (sample dirs,
-    # logs, TSO report, summary metrics, the .sh copy — the whole tree), with
-    # paths relative to the folder.  Computed after every artifact is in
-    # place and rsync'd to the archive.  Placed after KEEP A COPY OF THIS
-    # SCRIPT so the .sh is included too; before LOCAL WORKDIR CLEANUP so
-    # the local files still exist for the checksum to be computed from.
-    lines.append("# ------------------------------------ MD5 CHECKSUMS (WHOLE FOLDER) ------------------------------------ #")
-    lines.append("#   One md5sums.txt covering the ENTIRE run folder (every file,")
-    lines.append("#   relative ./ paths).  Replace the old per-sample *_md5_checksums.txt files.")
-    lines.append('_md5_out="' + SFR + '/md5sums.txt"')
-    lines.append('( cd "' + SFR + '" && find . -type f ! -name "md5sums.txt" | sort | xargs md5sum > "md5sums.txt" )')
-    lines.append('echo "MD5 checksums (whole folder): ${_md5_out}"')
-    lines.append('rsync -avh "${_md5_out}" "${NGSruns_folder}" 2>/dev/null || true')
-    lines.append("")
-    lines.append("")
     # ---- 8) keepdata cleanup ----
-    lines.append("# ------------------------------------ LOCAL WORKDIR CLEANUP ------------------------------------ #")
+    lines.append("# ============================================================")
+    lines.append("# LOCAL WORKDIR CLEANUP")
+    lines.append("#   After deploy to the archive, the local working folder is deleted")
+    lines.append('#   UNLESS keepdata="yes".  (MD5 checksums and the .sh copy are done first.)')
+    lines.append("# ============================================================")
     lines.append('#   After deploy to the archive, the local working folder is deleted')
     lines.append('#   UNLESS keepdata="yes".')
     lines.append('if [[ "${keepdata}" != "yes" ]]; then')
@@ -1187,13 +1218,15 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
     # the target is created only as a side effect of the mv, and we fall
     # back to the CRcount_GEXonly destination if Daniel's CR_pipelines
     # tree is absent.
-    lines.append("# ------------------------------------ DATASHEET CLEANUP ------------------------------------ #")
+    lines.append("# ============================================================")
+    lines.append("# DATASHEET CLEANUP")
     lines.append("#   Park the Excel datasheets USED TO GENERATE THIS SCRIPT here for later")
     lines.append("#   deletion — only these exact files; any other .xlsx in the working dir")
     lines.append("#   is left untouched.  Absolute paths (captured at generation time), so")
     lines.append("#   this works no matter where the script is launched from.")
     lines.append(f"#   Primary: {DELETE_PRIMARY}")
     lines.append(f"#   Fallback: {DELETE_FALLBACK}")
+    lines.append("# ============================================================")
     lines.append(f'if [ -d "{DELETE_PRIMARY}" ]; then _delfolder="{DELETE_PRIMARY}"')
     lines.append(f'elif [ -d "{DELETE_FALLBACK}" ]; then _delfolder="{DELETE_FALLBACK}"')
     lines.append("fi")
@@ -1207,6 +1240,9 @@ def build_script_full(reference_genome, pairs, user="", avt_tag=None,
         # `${_delfolder}` must survive the f-string as literal bash:
         # doubled braces `${{_delfolder}}` -> `${_delfolder}`.
         lines.append(f'    mv "{_s}" "${{_delfolder}}" 2>/dev/null || true')
+    if not _srcs:
+        # bash rejects an empty `then ... fi` body — keep one (no-op) command
+        lines.append('    :   # (no source datasheets to park)')
     lines.append("fi")
     lines.append("")
 
@@ -1302,12 +1338,11 @@ def main():
     print_pairs_table(all_pairs)
     print()
 
-    # GEX-parity prompt for run-less rows (shared helper): one question for
-    # ALL unassigned rows (hint = first detected run); 'Y' confirms, typing
-    # replaces; -n keeps the AVT0000-placeholder contract.
-    # require_known=False: GEX has no separate run-name confirmation, and
-    # the answer also feeds the main_avt pick below.
-    resolve_unassigned_avt(all_pairs, require_known=False)
+    # Shared per-row prompt: ONE question PER unassigned row (its name +
+    # FASTQ id are shown; hint = first run named by another row); 'Y'
+    # confirms, typing replaces; -n keeps the AVT0000-placeholder contract.
+    # The answers also feed the main_avt pick below.
+    resolve_unassigned_avt(all_pairs)
 
     main_avt = (Counter(avt for _, _, avt in all_pairs if avt is not None)
                 .most_common(1)[0][0] if any(a for _, _, a in all_pairs) else "MIXED_runs")

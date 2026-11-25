@@ -89,6 +89,7 @@
     <tr><td><code>max_parallel</code></td><td>Number of samples counted simultaneously. <code>1</code> is serial. Default <code>3</code> suits a large server (like ptegsrv3); lower it for a smaller box or when other heavy jobs are running.</td></tr>
     <tr><td><code>localcores</code></td><td>Maximum CPU cores per sample (applies to all samples). Default 32.</td></tr>
     <tr><td><code>localmem</code></td><td>Maximum memory in GB per sample (applies to all samples). Default 126.</td></tr>
+    <tr><td><code>create_bam</code></td><td><code>true</code> (default) also writes an aligned BAM for every sample. Set <code>false</code> to skip it for all samples (faster, smaller output).</td></tr>
     <tr><td><code>scratch_root</code></td><td>Where <code>cellranger-arc count</code> writes its working output (fixed convention on the analysis server; change it only if the mount differs on your box).</td></tr>
     <tr><td><code>REFPATH</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
     <tr><td><code>server_folder_name</code></td><td>Output folder name, prefilled with run + user + timestamp. Leave as is unless renaming is wanted.</td></tr>
@@ -102,7 +103,6 @@
   <p>Leave a value blank to use the built-in default. The <code>_&lt;#&gt;</code> matches the sample to change.</p>
   <table>
     <tr><th>Setting</th><th>Meaning</th></tr>
-    <tr><td><code>create_bam_&lt;#&gt;</code></td><td><code>true</code> (default) also writes an aligned BAM for this sample. Set <code>false</code> to skip it (faster, smaller output).</td></tr>
     <tr><td><code>gex_exclude_introns_&lt;#&gt;</code></td><td>Blank (default) keeps the cellranger-arc behaviour, so intronic GEX reads are counted too. Any value (e.g. <code>true</code>) adds <code>--gex-exclude-introns</code> for this sample, counting only exonic GEX reads. Feeds the "Include introns?" column of the stats sheet.</td></tr>
     <tr><td><code>cell_annotation_model_&lt;#&gt;</code></td><td><code>auto</code> (default) lets cellranger-arc choose the cell-annotation model. Name a specific model, or leave blank, if you have one in mind.</td></tr>
     <tr><td><code>custom_options_&lt;#&gt;</code></td><td>Additional flags for this sample, written in full inside the quotes (e.g. <code>--nosecondary --localvmem=300</code>).</td></tr>

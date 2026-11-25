@@ -78,7 +78,7 @@ cellranger-atac_AVT0001_AVT0002.sh), top to bottom:
     5.  DISPATCH: serial (max_parallel=1) or a rolling pool of max_parallel
         concurrent counts (default 3).
     6.  Per-sample STATUS SWEEP: [OK]/[FAIL] per sample, ``_overall_rc``.
-    7.  MERGED SUMMARY: ``all_summary.csv`` (Samplename column first).
+    7.  MERGED SUMMARY: ``summary_metrics.csv`` (Samplename column first).
     8.  rsync of the working folder to the central archive.
     9.  WHOLE-FOLDER ``md5sums.txt`` + rsync of the single checksums file.
     10. A copy of the .sh used to generate the project is kept in the work
@@ -151,6 +151,7 @@ from common.intake import (
     list_sample_dirs,            # candidate dirs for one (AVT, sample)
     choose_sample_dir,           # pick ONE when >1 candidate
     find_fastq_path_with_pref,   # resolve an avid id honouring the pick
+    print_pairs_table,           # shared pre-prompt sample summary table
 )
 
 # The central archive where every ATAC run's folder is kept.
@@ -179,7 +180,27 @@ DELETE_FALLBACK = (
 # tells you which one produced it.  Bump on any change to the generator.
 # 1.3.5 = archive root moved off the sequencer folder: results now deploy
 #         to the shared, sequencer-agnostic /mnt/PTEGraw/AA/NGSruns/ZZ_10XG/.
-SCRIPT_VERSION = "1.3.5"
+# 1.3.6 = dropped the redundant run-name confirm prompt (GEX parity): the
+#         representative run is only the fallback for rows that name no run
+#         (those get the dedicated 'needs_avt' prompt); if every row carries
+#         its own run, nothing run-related is asked.
+# 1.3.7 = also dropped the 'Run name: <representative>' summary line: when
+#         rows carry their own runs no representative is chosen, so there is
+#         nothing to announce (per-row runs + the avt_run tag are the truth).
+# 1.3.8 = run-less rows are now asked PER SAMPLE (name + FASTQ id shown)
+#         instead of one batched question for all of them (shared
+#         resolve_unassigned_avt() in common/intake.py, also in ARC/GEX).
+# 1.3.9 = GEX-look parity: the sample summary is now the shared
+#         'Total: N sample(s) from M Excel file(s):' table (Fastq ID /
+#         Sample name / AVT run, '(none)' for rows that will be asked),
+#         and the per-sample run-name question is asked in ALL cases —
+#         including when NO run is detected anywhere (GEX behaviour) —
+#         instead of one global 'Enter run name' up front.
+# 1.3.10 = the run-name question now opens with a one-line WHY (the run
+#          folder is where the sample's FASTQ files are stored, so the
+#          script can find them) — text lives in common/intake.py, all
+#          three generators affected.
+SCRIPT_VERSION = "1.3.10"
 
 # ---------------------------------------------------------------------------
 # Reference genomes (auto-detected from the live filesystem, GEX/ARC pattern)
@@ -276,7 +297,7 @@ def latest_avt(avt_names):
 # into the generated script from the shared imports below.
 _ATAC_PER_SAMPLE_PARAMS = (
     ("custom_options", "",
-     "extra flags as-is, e.g. --chemistry=ARC-v1  --peaks=/refs/peaks.bed"),
+     "extra flags as-is, e.g. --peaks=/refs/peaks.bed"),
 )
 
 
@@ -573,19 +594,6 @@ def parse_xlsx(path: str):
     return _parse_positional(wb)
 
 
-def print_pairs_table(pairs):
-    """Human-readable preview: one line per (sample, fastq) pair."""
-    if not pairs:
-        return
-    print("")
-    print("Detected samples (one `cellranger-atac count` per sample):")
-    shown = OrderedDict()
-    for sample, fastq, _avt in pairs:
-        shown.setdefault(sample, []).append(fastq)
-    for i, (sample, fqs) in enumerate(shown.items(), start=1):
-        print(f"  {i}. {sample}:  " + ", ".join(f for f in fqs if f))
-
-
 # ---------------------------------------------------------------------------
 # FASTQ leaf resolution (classic full-tree walk — unchanged behaviour)
 # ---------------------------------------------------------------------------
@@ -728,8 +736,8 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
           concurrent atac samples (default 3).
       6.  Per-sample status sweep: [OK]/[FAIL] per sample,
           ``_overall_rc`` accumulator.
-      7.  Merged summary metrics: one ``all_summary.csv`` with a Samplename
-          column first (``<AVT>_Summaries/all_summary.csv``).
+      7.  Merged summary metrics: one ``summary_metrics.csv`` with a Samplename
+          column first (``<AVT>_Summaries/summary_metrics.csv``).
       8.  rsync of the whole working folder to the central archive.
       9.  Whole-folder ``md5sums.txt`` + rsync of the single checksums file.
       10. ``.sh`` copy to work folder + archive (provenance).
@@ -959,7 +967,7 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
         L.append(f'    find "${{Server_folder}}/{run_name}" -mindepth 2 -maxdepth 2 '
                  f'-type d -name "tmp" -print 2>/dev/null > "${{_err_log}}"')
         L.append('    if [ -s "${_err_log}" ]; then')
-        L.append(f'        echo "Error: cellranger-atac count for {sample} did not complete '
+        L.append(f'        echo -e "Error: cellranger-atac count for {sample} did not complete '
                  f'(leftover tmp folders detected).\\nSee ${{Server_folder}}/{run_name}_error_log.txt" >&2')
         L.append('    else')
         L.append('        rm -f "${_err_log}"')
@@ -975,7 +983,7 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
         L.append(f'        cp "${{Server_folder}}/{run_name}/outs/web_summary.html" '
                  f'"${{Web_summaries}}/{run_name}_WebSummary.html"')
         L.append('    else')
-        L.append(f'        echo "  [warn] no web summary for {sample}" >&2')
+        L.append(f'        echo "WARNING: no web summary for {sample}" >&2')
         L.append('    fi')
 
         L.append("}")
@@ -1002,7 +1010,7 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append("fi")
     L.append("# Cap max_parallel at NSAMPLES (no point requesting more slots than samples)")
     L.append('if [ "${max_parallel}" -gt "${NSAMPLES}" ]; then')
-    L.append('    echo "Note: only ${NSAMPLES} sample(s) — capping max_parallel ${max_parallel} -> ${NSAMPLES}." >&2')
+    L.append('    echo "Note: ${NSAMPLES} sample(s) only — capping max_parallel ${max_parallel} -> ${NSAMPLES}." >&2')
     L.append("    max_parallel=${NSAMPLES}")
     L.append("fi")
     L.append("")
@@ -1078,15 +1086,15 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append("done")
     L.append("")
 
-    # ---- 7) merged summary metrics (one all_summary.csv, Samplename column first) --------------
+    # ---- 7) merged summary metrics (one summary_metrics.csv, Samplename column first) --------------
     L.append("# ============================================================")
-    L.append("# MERGED SUMMARY METRICS  (one all_summary.csv, Samplename column first)")
+    L.append("# MERGED SUMMARY METRICS  (one summary_metrics.csv, Samplename column first)")
     L.append("#   Gathers each sample's outs/summary.csv into a single CSV so all")
     L.append("#   samples' key metrics can be read in one table.")
     L.append("#   (created BEFORE the archive rsync so it lands in the central copy too)")
     L.append("# ============================================================")
-    L.append('SM_TMP="${Summaries_folder}/all_summary_tmp.csv"')
-    L.append('SM_OUT="${Summaries_folder}/all_summary.csv"')
+    L.append('SM_TMP="${Summaries_folder}/summary_metrics_tmp.csv"')
+    L.append('SM_OUT="${Summaries_folder}/summary_metrics.csv"')
     L.append(': > "${SM_TMP}"')
     L.append('_sm_hdr_written=0')
     for _i, _s in enumerate(samples, 1):
@@ -1108,7 +1116,7 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     L.append('    echo "Merged summary metrics: ${SM_OUT}"')
     L.append("else")
     L.append('    rm -f "${SM_TMP}"')
-    L.append('    echo "  [warn] no per-sample summary.csv found; all_summary.csv not created" >&2')
+    L.append('    echo "WARNING: no per-sample summary.csv found; summary_metrics.csv not created" >&2')
     L.append("fi")
     L.append("")
 
@@ -1185,6 +1193,9 @@ def build_script_full(reference_genome, pairs, user="", main_avt=None,
     _srcs_abs = list(dict.fromkeys(os.path.abspath(s) for s in (source_files or [])))
     for _s in _srcs_abs:
         L.append(f'    mv "{_s}" "${{_delfolder}}" 2>/dev/null || true')
+    if not _srcs_abs:
+        # bash rejects an empty `then ... fi` body — keep one (no-op) command
+        L.append('    :   # (no source datasheets to park)')
     L.append("fi")
     L.append("")
 
@@ -1274,13 +1285,15 @@ def main():
             # Row order of the samples in this datasheet — feeds the
             # cross-file order merge in merge_sample_order() below.
             per_file_orders.append([si for si, _, _ in rows])
+        else:
+            print(f"Warning: no sample/fastq ID pairs found in '{path}' — skipping.")
         if avt:
             detected_avts.append(avt)
         if not any_user:
             any_user = read_user_field(path)
 
     if not all_pairs:
-        sys.exit("Error: no sample rows could be parsed from the provided file(s).")
+        sys.exit("Error: no sample/fastq ID pairs could be parsed from the provided file(s).")
 
     # Cross-file sample order: the common order of all files when they
     # agree, else the FIRST file's order (later files' new samples are
@@ -1288,26 +1301,28 @@ def main():
     merged_sample_order = merge_sample_order(per_file_orders)
 
     print()
+    print(f"Total: {len(all_pairs)} sample(s) from {len(source_files)} Excel file(s):")
     print_pairs_table(all_pairs)
     print()
 
-    # Run name (largest numeric suffix wins; prompt to confirm/override)
-    main_avt = latest_avt(detected_avts)
-    if not main_avt:
-        main_avt = ask_avt_run(None)
-    else:
-        main_avt = ask_avt_run(main_avt)
+    # GEX-parity run-name questions: EVERY row without a run gets its OWN
+    # question (resolve_unassigned_avt, shared helper) — sample name + FASTQ
+    # id shown, hint = the first run named by another row when one is known,
+    # plain 'Enter run name' when nothing is detected anywhere; -n keeps the
+    # AVT0000 placeholder + WARNING contract.  Rows that already carry a run
+    # (stamped per-file by inherit_file_avt() or named on the row) are left
+    # untouched; the per-row runs are the source of truth.
+    resolve_unassigned_avt(all_pairs)
+
+    # main_avt from here on is a pure fallback value (defensive
+    # 'or main_avt' sites and the empty-name guard): the run named by the
+    # input files when detected, else the run just assigned to the first
+    # row.  The script/folder NAME still comes from the combined per-row
+    # tag (avt_run_tag) further down.
+    main_avt = latest_avt(detected_avts) or next(
+        (r[2] for r in all_pairs if len(r) > 2 and r[2]), "")
     if not main_avt:
         sys.exit("Error: run name cannot be empty.")
-
-    # GEX parity (shared helper): rows whose file named no run get ONE
-    # explicit prompt (hint = first detected run) instead of silently
-    # inheriting the representative run.  Rows that already carry a run —
-    # stamped per-file by inherit_file_avt() or named on the row — are
-    # left untouched.  Skipped when NO run is detected anywhere: main_avt
-    # above already holds the answer and the 'or main_avt' fallbacks cover
-    # these rows (single prompt, like GEX in that case).
-    resolve_unassigned_avt(all_pairs)
 
     # ── Parity item 3: sample selection (keep/drop + add sheet-less) ────────
     # Same shared helper + prompt as the GEX/ARC generators.
@@ -1337,7 +1352,7 @@ def main():
             # implied by the folder the operator typed.
             all_pairs.append((name, os.path.basename(p), None))
     if not all_pairs:
-        sys.exit("Error: no samples selected — nothing to generate.")
+        sys.exit("Error: no samples to add to the script.")
 
     # ── Per-row AVT — resolve each FASTQ under its own run tree ─────────────
     # Each sample's FASTQ is resolved under the AVT run named on its own sheet
@@ -1387,7 +1402,7 @@ def main():
             if chosen:
                 chosen_dirs[sn] = chosen
     if chosen_dirs:
-        print(f"  Run-folder disambiguation pinned {len(chosen_dirs)} sample(s).")
+        print(f"  Run-folder disambiguation picked for {len(chosen_dirs)} sample(s).")
 
     # Emission-time resolver: build_script_full calls resolve(sample, fid).
     # Added-by-path samples come back verbatim; the rest honour the chosen
@@ -1429,9 +1444,9 @@ def main():
     n_unresolved = len(re.findall(
         r'fastq_\d+_\d+=""\s*#\s*FIXME_LOCATE_', script))
     if n_unresolved:
-        print(f"Note: {n_unresolved} fastq leaf(s) could not be resolved here — "
-              "replace the empty fastq_<idx>_<j> variables flagged "
-              "FIXME_LOCATE_ in the script before running.")
+        print(f"Note: {n_unresolved} FASTQ path(s) could not be resolved — "
+              "set the flagged fastq_* variable(s) (FIXME_LOCATE_ markers) "
+              "before running.")
 
 
 if __name__ == "__main__":
