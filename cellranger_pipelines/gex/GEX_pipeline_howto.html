@@ -50,9 +50,9 @@
 
   <p><strong>Combining several Excel files:</strong> the numbering follows the sample order from your files. If all files list the samples in the same order, that order is used. If the files list them differently, the order of the <em>first</em> file (the one listed first on the command) is used, and samples that only appear in the later files are added at the end.</p>
 
-  <p>It asks up to four questions, each answered by typing a number (or a path) and pressing enter. Not every run needs every question: the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
+  <p>It asks up to four questions, each answered by typing a number (or a path) and pressing enter. Not every run needs every question: the AVT ones only appear for samples without an auto-detected run name, and the data-folder one only appears if a sample name is ambiguous:</p>
   <ol>
-    <li><strong>AVT run name:</strong> only when some samples have no detected run name. Confirm the detected value, or type the correct <code>AVT0XXX</code>.</li>
+    <li><strong>AVT run name:</strong> one question per sample without a detected run name — the prompt shows the sample name and its FASTQ folder. Confirm the suggested value if one is shown, or type the correct <code>AVT0XXX</code>.</li>
     <li><strong>Samples.</strong> Detected samples are listed. Keep the ones to run; a sample missing from the list can be added by its full data-folder path. Ends with a summary of the final sample list.</li>
     <li><strong>Data folder:</strong> shown only when a sample name exists in more than one run folder. Pick the correct one by number; a single match is used automatically.</li>
     <li><strong>Genome:</strong> 1 human, 2 mouse, 3 the combined human + mouse reference. You can also type a full path to any other reference genome directory to use a custom one. The exact genome file/folder name inside each reference is resolved automatically, so no need to specify it.</li>
@@ -72,7 +72,7 @@
     <tr><td><code>localmem</code></td><td>Maximum memory in GB per sample (applies to all samples). Default 126.</td></tr>
     <tr><td><code>create_bam</code></td><td><code>true</code> (default) also writes an aligned BAM for every sample. Set <code>false</code> to skip it for all samples (faster, smaller output).</td></tr>
     <tr><td><code>scratch_root</code></td><td>Where <code>cellranger count</code> writes its working output (fixed convention on the analysis server; change it only if the mount differs on your box).</td></tr>
-    <tr><td><code>reference_genome_used</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
+    <tr><td><code>reference_genome</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
     <tr><td><code>server_folder_name</code></td><td>Output folder name, prefilled with run + user + timestamp. Leave as is unless renaming is wanted.</td></tr>
     <tr><td><code>NGSruns_archive</code></td><td>Central archive the results are copied to at the end (fixed shared target; leave as is).</td></tr>
     <tr><td><code>path_&lt;#&gt;_&lt;avid&gt;</code></td><td>Data location per sample, prefilled. A <code>FIXME_LOCATE_</code> marker instead of a real path means it could not be resolved; set the real folder there before running.</td></tr>
@@ -101,7 +101,7 @@
   <p>The <code>./</code> prefix is required to run a script from the current directory. To run it in the background and capture output to a log:</p>
   <pre><code>nohup bash cellranger-count_AVT0571.sh &gt; AVT0571.log</code></pre>
 
-  <p>It validates the settings, then counts each sample in groups of <code>max_parallel</code> (default 3). It measures the TSO% library-quality metric on the Read 2 of every avid run in the workbook — one section per avid run in the central <code>tso_report.txt</code>. Finally it merges each sample's results table into one and copies the results, including <code>tso_report.txt</code>, to the shared archive; with <code>keepdata="no"</code> the local working folder is then removed, which is normal.</p>
+  <p>It validates the settings, then counts each sample in groups of <code>max_parallel</code> (default 3). It measures the TSO% library-quality metric on the Read 2 of every avid run in the workbook — one section per avid run in the central <code>tso_report.txt</code>. Finally it merges each sample's results table into one <code>summary_metrics.csv</code> and copies the results, including <code>tso_report.txt</code>, to the shared archive; with <code>keepdata="no"</code> the local working folder is then removed, which is normal.</p>
   <p>Follow progress directly in the terminal, or via <code>AVT0571.log</code> if it is running in the background.</p>
 </main>
 </body>

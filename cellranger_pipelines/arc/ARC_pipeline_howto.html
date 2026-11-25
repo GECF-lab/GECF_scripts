@@ -59,9 +59,9 @@
   <p>Legs that share the same base name are grouped into one biologic sample and counted in a single <code>cellranger-arc count</code>: <code>Sample1_GEX</code> + <code>Sample1_ATAC</code> become one sample, <code>Sample1</code>. GEX-only and ATAC-only samples (a single leg) run the same way. The base name — the name without the leg suffix — is the sample name used everywhere in the outputs (output folder, libraries CSV, stats sheet): the suffix is a classification tag, never part of the result name.</p>
   <div class="warn"><strong>Check the summary table.</strong> Right after the Samples question, the generator prints a <em>Biologic samples</em> table with a GEX count and an ATAC count per sample. A GEX+ATAC pair must show <code>1</code> and <code>1</code>. If a multiome sample shows <code>2 GEX, 0 ATAC</code>, its ATAC name is missing the <code>_ATAC</code> suffix and both legs will be processed as RNA — fix the name and regenerate before running the script.</div>
 
-  <p>It asks up to four questions, each answered by typing a number (or a path, or yes/no) and pressing enter. Not every run needs every question: the AVT one only appears if some samples couldn't have their run name auto-detected, and the data-folder one only appears if a sample name is ambiguous:</p>
+  <p>It asks up to four questions, each answered by typing a number (or a path, or yes/no) and pressing enter. Not every run needs every question: the AVT ones only appear for samples without an auto-detected run name, and the data-folder one only appears if a sample name is ambiguous:</p>
   <ol>
-    <li><strong>AVT run name:</strong> only when some samples have no detected run name. Confirm the detected value, or type the correct <code>AVT0XXX</code>.</li>
+    <li><strong>AVT run name:</strong> one question per sample without a detected run name — the prompt shows the sample name and its FASTQ folder. Confirm the suggested value if one is shown, or type the correct <code>AVT0XXX</code>.</li>
     <li><strong>Samples.</strong> Detected samples are listed. Keep the ones to run, drop others, and add samples that are missing from the sheet. How to answer each of its sub-prompts and how to leave it is detailed in <em>How the Samples question works</em> below.</li>
     <li><strong>Data folder:</strong> shown only when a sample name exists in more than one run folder. Pick the correct one by number; a single match is used automatically.</li>
     <li><strong>Genome:</strong> 1 human, 2 mouse (there is no combined reference for ARC). You can also type a full path to any other reference genome directory to use a custom one. The exact genome file/folder name inside each reference is resolved automatically, so no need to specify it.</li>
@@ -91,10 +91,10 @@
     <tr><td><code>localmem</code></td><td>Maximum memory in GB per sample (applies to all samples). Default 126.</td></tr>
     <tr><td><code>create_bam</code></td><td><code>true</code> (default) also writes an aligned BAM for every sample. Set <code>false</code> to skip it for all samples (faster, smaller output).</td></tr>
     <tr><td><code>scratch_root</code></td><td>Where <code>cellranger-arc count</code> writes its working output (fixed convention on the analysis server; change it only if the mount differs on your box).</td></tr>
-    <tr><td><code>REFPATH</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
+    <tr><td><code>reference_genome</code></td><td>The reference picked in Step 1. Change only if the wrong one was selected.</td></tr>
     <tr><td><code>server_folder_name</code></td><td>Output folder name, prefilled with run + user + timestamp. Leave as is unless renaming is wanted.</td></tr>
     <tr><td><code>NGSruns_archive</code></td><td>Central archive the results are copied to at the end (fixed shared target; leave as is).</td></tr>
-    <tr><td><code>fastq_&lt;#&gt;_&lt;library&gt;</code></td><td>Data location per sample leg (the GEX fastq and the ATAC fastq), prefilled. A <code>FIXME</code> marker instead of a real path means that leaf folder could not be resolved; set the real folder there before running.</td></tr>
+    <tr><td><code>fastq_&lt;#&gt;_&lt;library&gt;</code></td><td>Data location per sample leg (the GEX fastq and the ATAC fastq), prefilled. A <code>FIXME_LOCATE_</code> marker instead of a real path means that leaf folder could not be resolved; set the real folder there before running.</td></tr>
   </table>
 
   <div class="warn"><strong>Note.</strong> <code>localcores</code> and <code>localmem</code> apply to every sample, and up to <code>max_parallel</code> samples run at the same time, so the box effectively needs <code>max_parallel × (cores, memory)</code>. Example: at the defaults, 3 concurrent samples × 32 cores / 126 GB needs roughly 96 cores / 378 GB of free space. If the run is bigger than that, lower <code>max_parallel</code> or the cores/memory values.</div>
