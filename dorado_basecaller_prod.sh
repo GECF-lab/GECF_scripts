@@ -609,9 +609,9 @@ cd -
 
 echo ">>>>>>>>>>> STATS & METRICS <<<<<<<<<<<" | tee -a "$log"
 echo "" | tee -a "$log"
-echo "--- All reads ---" | tee -a "$log"
+echo "--- All reads: ${temp_all_reads} ---" | tee -a "$log"
 bash "$(dirname "$0")/get_stats.sh" "$temp_all_reads" | tee -a "$log"
-echo "--- Pass reads ---" | tee -a "$log"
+echo "--- Pass reads: ${ubam_folder}/${run_name}.pass.bam ---" | tee -a "$log"
 bash "$(dirname "$0")/get_stats.sh" "${ubam_folder}/${run_name}.pass.bam" | tee -a "$log"
 
 ############## CLEAN FILES AND END LOG FILE ##############

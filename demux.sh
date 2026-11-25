@@ -853,8 +853,11 @@ if [[ $simplex_only == false ]]; then
         echo "$false_duplex false positive duplex reads detected and removed. ${n_parent_reads} duplex parent reads reintroduced as simplex reads." | tee -a "$log"
 fi
 
+echo "Statistics source file: ${temp_all_bam} (all reads)" | tee -a "$log"
 bash "$(dirname "$0")/get_stats.sh" "$temp_all_bam" | tee -a "$log"
+echo "" | tee -a "$log"
 
+echo "Statistics source file: ${temp_pass_bam} (pass reads, qscore >= ${qscore})" | tee -a "$log"
 bash "$(dirname "$0")/get_stats.sh" "$temp_pass_bam" | tee -a "$log"
 
 ############################################################################
